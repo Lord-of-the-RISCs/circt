@@ -1337,11 +1337,6 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
 }
 
 void ChainingCyclicSimplexScheduler::exportCriticalPath() {
-  llvm::outs() << "Final tableau:\n";
-  dumpTableau();
-  llvm::outs() << "Optimal solution found with II = " << parameterT
-               << " and start time of last operation = "
-               << -getParametricConstant(0) << '\n';
   unsigned int constrainingRow = 0;
   double constrainingII = 0.0;
   for (unsigned int row = firstConstraintRow; row < nRows; ++row) {
