@@ -327,6 +327,10 @@ saveProblem(ProblemT &prob, std::tuple<OperationPropertyTs...> opProps,
   auto instOp = b.create<InstanceOp>(
       builder.getStringAttr(ProblemT::PROBLEM_NAME),
       saveInstanceProperties<ProblemT, InstancePropertyTs...>(prob, b));
+  for (auto &&attr : prob.getContainingOp()->getAttrs()) {
+    if (attr.getName().strref().starts_with("SpecHLS"))
+      instOp->setAttr(attr.getName(), attr.getValue());
+  }
   if (auto instName = prob.getInstanceName())
     instOp.setSymNameAttr(instName);
 
@@ -409,6 +413,10 @@ saveProblem(ProblemT &prob, std::tuple<OperationPropertyTs...> opProps,
     auto opOp =
         b.create<OperationOp>(op->getNumResults(), v.get(op->getOperands()),
                               opNames.lookup(op), dependences, properties);
+    for (auto &&attr : op->getAttrs()) {
+      if (attr.getName().strref().starts_with("SpecHLS"))
+        opOp->setAttr(attr.getName(), attr.getValue());
+    }
     v.set(op->getResults(), opOp->getResults());
   }
 

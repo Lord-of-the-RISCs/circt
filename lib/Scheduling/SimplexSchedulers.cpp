@@ -16,6 +16,7 @@
 
 #include "mlir/IR/Operation.h"
 
+#include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
@@ -121,6 +122,8 @@ protected:
   /// Non-basic variables can be "frozen" to a specific value, which prevents
   /// them from being pivoted into basis again.
   DenseMap<unsigned, unsigned> frozenVariables;
+
+  DenseMap<Problem::Dependence, unsigned> dependencesMap;
 
   /// Number of rows in the tableau = |obj| + |deps|.
   unsigned nRows;
@@ -312,6 +315,8 @@ public:
                                  float cycleTime)
       : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
   LogicalResult schedule() override;
+
+  void exportCriticalPath();
 };
 
 } // anonymous namespace
@@ -396,6 +401,7 @@ void SimplexSchedulerBase::buildTableau() {
       auto &consRowVec = addRow();
       fillConstraintRow(consRowVec, dep);
       basicVariables.push_back(var);
+      dependencesMap[dep] = var;
       ++var;
     }
   }
@@ -403,6 +409,7 @@ void SimplexSchedulerBase::buildTableau() {
     auto &consRowVec = addRow();
     fillAdditionalConstraintRow(consRowVec, dep);
     basicVariables.push_back(var);
+    dependencesMap[dep] = var;
     ++var;
   }
 
@@ -1305,7 +1312,6 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
   parameterS = 0;
   parameterT = 1;
   buildTableau();
-
   LLVM_DEBUG(dbgs() << "Initial tableau:\n"; dumpTableau());
 
   if (failed(solveTableau()))
@@ -1324,7 +1330,65 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
   assert(succeeded(filledIn));
   (void)filledIn;
 
+  exportCriticalPath();
+
   return success();
+}
+
+void ChainingCyclicSimplexScheduler::exportCriticalPath() {
+  unsigned int constrainingRow = 0;
+  double constrainingII = 0.0;
+  for (unsigned int row = firstConstraintRow; row < nRows; ++row) {
+    if (tableau[row][parameterTColumn] == 0)
+      continue;
+
+    bool candidateRow = true;
+    for (unsigned int column = firstNonBasicVariableColumn;
+         (column < nColumns) && candidateRow; ++column) {
+      candidateRow = (tableau[row][column] != -1);
+    }
+
+    if (!candidateRow)
+      continue;
+
+    double rowII = -(tableau[row][parameter1Column] +
+                     tableau[row][parameterSColumn] * parameterS) /
+                   static_cast<double>(tableau[row][parameterTColumn]);
+    if (rowII > constrainingII) {
+      constrainingII = rowII;
+      constrainingRow = row;
+    }
+  }
+  // II flottant ici variable=constrainingII
+  prob.getContainingOp()->setAttr(
+      "SpecHLS.II",
+      mlir::FloatAttr::get(
+          mlir::FloatType::getF32(prob.getContainingOp()->getContext()),
+          constrainingII));
+  llvm::SmallVector<unsigned int> criticalPath;
+  criticalPath.push_back(basicVariables[constrainingRow - firstConstraintRow]);
+  for (unsigned int column = firstNonBasicVariableColumn; column < nColumns;
+       ++column) {
+    if (tableau[constrainingRow][column] == 1) {
+      criticalPath.push_back(
+          nonBasicVariables[column - firstNonBasicVariableColumn]);
+    }
+  }
+  for (auto pair : dependencesMap) {
+    auto dep = pair.first;
+    auto var = pair.second;
+    bool isInCriticalPath = false;
+    for (unsigned int variable : criticalPath) {
+      if (variable == var) {
+        isInCriticalPath = true;
+        break;
+      }
+    }
+    if (isInCriticalPath) {
+      dep.getSource()->setAttr("SpecHLS.criticalPath",
+                               dep.getDestination()->getAttr("sym_name"));
+    }
+  }
 }
 
 //===----------------------------------------------------------------------===//
