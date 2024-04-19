@@ -180,6 +180,11 @@ protected:
 
   void dumpTableau();
 
+  double doubleII = 0.0;
+  llvm::SmallVector<unsigned int> criticalPath;
+  void computeCriticalPath();
+  void exportCriticalPath();
+
 public:
   explicit SimplexSchedulerBase(Operation *lastOp) : lastOp(lastOp) {}
   virtual ~SimplexSchedulerBase() = default;
@@ -315,8 +320,6 @@ public:
                                  float cycleTime)
       : SimplexSchedulerBase(lastOp), prob(prob), cycleTime(cycleTime) {}
   LogicalResult schedule() override;
-
-  void exportCriticalPath();
 };
 
 } // anonymous namespace
@@ -601,6 +604,8 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
       continue;
     }
 
+    computeCriticalPath();
+
     // If we did not find a pivot column, then the entire row contained only
     // positive entries, and the problem is in principle infeasible. However, if
     // the entry in the `parameterTColumn` is positive, we can try to make the
@@ -621,10 +626,11 @@ LogicalResult SimplexSchedulerBase::solveTableau() {
       }
     }
 
+    exportCriticalPath();
     // Otherwise, the linear program is infeasible.
     return failure();
   }
-
+  exportCriticalPath();
   // Optimal solution found!
   return success();
 }
@@ -1329,14 +1335,10 @@ LogicalResult ChainingCyclicSimplexScheduler::schedule() {
   auto filledIn = computeStartTimesInCycle(prob);
   assert(succeeded(filledIn));
   (void)filledIn;
-
-  if (parameterT > 1)
-    exportCriticalPath();
-
   return success();
 }
 
-void ChainingCyclicSimplexScheduler::exportCriticalPath() {
+void SimplexSchedulerBase::computeCriticalPath() {
   unsigned int constrainingRow = 0;
   double constrainingII = 0.0;
   for (unsigned int row = firstConstraintRow; row < nRows; ++row) {
@@ -1351,7 +1353,6 @@ void ChainingCyclicSimplexScheduler::exportCriticalPath() {
 
     if (!candidateRow)
       continue;
-
     double rowII = -(tableau[row][parameter1Column] +
                      tableau[row][parameterSColumn] * parameterS) /
                    static_cast<double>(tableau[row][parameterTColumn]);
@@ -1360,13 +1361,12 @@ void ChainingCyclicSimplexScheduler::exportCriticalPath() {
       constrainingRow = row;
     }
   }
+  if (constrainingRow < firstConstraintRow)
+    return;
   // II flottant ici variable=constrainingII
-  prob.getContainingOp()->setAttr(
-      "SpecHLS.II",
-      mlir::FloatAttr::get(
-          mlir::FloatType::getF32(prob.getContainingOp()->getContext()),
-          constrainingII));
-  llvm::SmallVector<unsigned int> criticalPath;
+  doubleII = constrainingII;
+
+  criticalPath.clear();
   criticalPath.push_back(basicVariables[constrainingRow - firstConstraintRow]);
   for (unsigned int column = firstNonBasicVariableColumn; column < nColumns;
        ++column) {
@@ -1375,6 +1375,14 @@ void ChainingCyclicSimplexScheduler::exportCriticalPath() {
           nonBasicVariables[column - firstNonBasicVariableColumn]);
     }
   }
+}
+
+void SimplexSchedulerBase::exportCriticalPath() {
+  getProblem().getContainingOp()->setAttr(
+      "SpecHLS.II",
+      mlir::FloatAttr::get(
+          mlir::FloatType::getF32(getProblem().getContainingOp()->getContext()),
+          doubleII));
   for (auto pair : dependencesMap) {
     auto dep = pair.first;
     auto var = pair.second;
