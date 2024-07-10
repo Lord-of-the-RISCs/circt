@@ -5,6 +5,8 @@ add_circt_library(CIRCTTransforms
   MaximizeSSA.cpp
   InsertMergeBlocks.cpp
 
+  SHARED
+
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Transforms
 

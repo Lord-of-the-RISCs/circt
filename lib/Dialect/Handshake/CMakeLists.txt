@@ -7,6 +7,8 @@ set(HANDSHAKE_SRCS
 add_circt_dialect_library(CIRCTHandshake
   ${HANDSHAKE_SRCS}
 
+  SHARED
+  
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_BINARY_DIR}/include

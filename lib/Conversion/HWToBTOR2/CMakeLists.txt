@@ -1,6 +1,8 @@
 add_circt_conversion_library(CIRCTHWToBTOR2
   HWToBTOR2.cpp
 
+  SHARED
+  
   DEPENDS
   CIRCTConversionPassIncGen
 

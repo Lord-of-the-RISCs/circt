@@ -31,6 +31,8 @@ endif ()
 add_circt_translation_library(CIRCTImportVerilog
   ImportVerilog.cpp
 
+  SHARED
+
   DEPENDS
   slang_slang
 

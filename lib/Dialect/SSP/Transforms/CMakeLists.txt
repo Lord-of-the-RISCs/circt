@@ -3,6 +3,8 @@ add_circt_dialect_library(CIRCTSSPTransforms
   Roundtrip.cpp
   Schedule.cpp
 
+  SHARED
+  
   DEPENDS
   CIRCTSSPTransformsIncGen
 

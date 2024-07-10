@@ -1,5 +1,7 @@
 add_circt_conversion_library(CIRCTVerifToSV
   VerifToSV.cpp
+  SHARED
+  
 
   DEPENDS
   CIRCTConversionPassIncGen

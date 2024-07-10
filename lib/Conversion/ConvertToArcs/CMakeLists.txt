@@ -1,5 +1,7 @@
 add_circt_conversion_library(CIRCTConvertToArcs
   ConvertToArcs.cpp
+  SHARED
+  
 
   DEPENDS
   CIRCTConversionPassIncGen

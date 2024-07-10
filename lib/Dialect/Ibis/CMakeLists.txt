@@ -3,6 +3,8 @@ add_circt_dialect_library(CIRCTIbis
   IbisOps.cpp
   IbisTypes.cpp
 
+  SHARED
+  
   DEPENDS
   MLIRIbisIncGen
 

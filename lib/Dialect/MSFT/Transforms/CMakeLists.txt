@@ -4,6 +4,8 @@ add_circt_dialect_library(CIRCTMSFTTransforms
   MSFTLowerConstructs.cpp
   PassCommon.cpp
 
+  SHARED
+  
   DEPENDS
   CIRCTMSFTTransformsIncGen
 

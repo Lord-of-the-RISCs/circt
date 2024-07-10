@@ -8,6 +8,8 @@ add_circt_dialect_library(CIRCTCalyx
   CalyxDialect.cpp
   CalyxOps.cpp
 
+  SHARED
+  
   DEPENDS
   MLIRCalyxEnumsIncGen
   MLIRCalyxInterfacesIncGen

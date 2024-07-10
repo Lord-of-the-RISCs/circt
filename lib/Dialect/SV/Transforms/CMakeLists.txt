@@ -9,6 +9,8 @@ add_circt_dialect_library(CIRCTSVTransforms
   SVTraceIVerilog.cpp
   HWEliminateInOutPorts.cpp
 
+  SHARED
+  
   DEPENDS
   CIRCTSVTransformsIncGen
 

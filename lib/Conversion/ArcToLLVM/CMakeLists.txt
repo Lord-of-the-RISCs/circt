@@ -1,5 +1,7 @@
 add_circt_conversion_library(CIRCTArcToLLVM
   LowerArcToLLVM.cpp
+  SHARED
+  
 
   DEPENDS
   CIRCTConversionPassIncGen

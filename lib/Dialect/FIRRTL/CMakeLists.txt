@@ -30,6 +30,8 @@ add_circt_dialect_library(CIRCTFIRRTL
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/FIRRTL
 
+  SHARED
+  
   DEPENDS
   MLIRFIRRTLIncGen
   CIRCTFIRRTLEnumsIncGen
@@ -51,6 +53,8 @@ add_circt_dialect_library(CIRCTFIRRTL
 
 add_circt_library(CIRCTFIRRTLReductions
   FIRRTLReductions.cpp
+
+  SHARED
 
   LINK_LIBS PUBLIC
   CIRCTReduceLib

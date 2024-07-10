@@ -14,6 +14,8 @@ add_circt_dialect_library(CIRCTMSFT
   MSFTOps.cpp
   ExportQuartusTcl.cpp
 
+  SHARED
+  
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/MSFT
 

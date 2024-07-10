@@ -3,6 +3,8 @@ add_circt_translation_library(CIRCTTargetDebugInfo
   EmitHGLDD.cpp
   TranslateRegistration.cpp
 
+  SHARED
+
   LINK_COMPONENTS
   Core
 

@@ -1,6 +1,8 @@
 add_circt_library(CIRCTHandshakeToDC
     HandshakeToDC.cpp
 
+    SHARED
+
     ADDITIONAL_HEADER_DIRS
     ${MLIR_MAIN_INCLUDE_DIR}/mlir/Conversion/HandshakeToDC
 

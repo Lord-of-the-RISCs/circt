@@ -24,6 +24,7 @@ add_circt_library(CIRCTSupport
   InstanceGraph.cpp
   "${VERSION_CPP}"
 
+  SHARED
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRTransforms

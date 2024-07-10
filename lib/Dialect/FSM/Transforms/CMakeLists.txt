@@ -1,6 +1,8 @@
 add_circt_dialect_library(CIRCTFSMTransforms
   PrintFSMGraph.cpp
 
+  SHARED
+  
   DEPENDS
   CIRCTFSMTransformsIncGen
 

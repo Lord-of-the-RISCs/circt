@@ -1,6 +1,8 @@
 add_circt_library(CIRCTAffineToLoopSchedule
   AffineToLoopSchedule.cpp
 
+  SHARED
+
   DEPENDS
   CIRCTConversionPassIncGen
   MLIRArithDialect

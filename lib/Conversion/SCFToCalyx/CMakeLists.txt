@@ -1,5 +1,7 @@
 add_circt_conversion_library(CIRCTSCFToCalyx
   SCFToCalyx.cpp
+  SHARED
+  
 
   DEPENDS
   CIRCTConversionPassIncGen

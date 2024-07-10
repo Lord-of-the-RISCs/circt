@@ -4,6 +4,8 @@ add_circt_translation_library(CIRCTImportFIRFile
   FIRParser.cpp
   FIRParserAsserts.cpp
 
+  SHARED
+
   ADDITIONAL_HEADER_DIRS
 
   LINK_LIBS PUBLIC

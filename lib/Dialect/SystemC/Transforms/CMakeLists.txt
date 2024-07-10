@@ -1,6 +1,8 @@
 add_circt_dialect_library(CIRCTSystemCTransforms
   SystemCLowerInstanceInterop.cpp
 
+  SHARED
+  
   DEPENDS
   CIRCTSystemCTransformsIncGen
 

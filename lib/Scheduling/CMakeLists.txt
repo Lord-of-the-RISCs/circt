@@ -30,6 +30,7 @@ endif()
 add_circt_library(CIRCTScheduling
   ${SCHEDULING_SOURCES}
 
+  SHARED
   LINK_LIBS PUBLIC
   ${SCHEDULING_LIBS}
   )

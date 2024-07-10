@@ -4,6 +4,8 @@ add_circt_dialect_library(CIRCTFSM
   FSMOps.cpp
   FSMTypes.cpp
 
+  SHARED
+  
   DEPENDS
   MLIRArithDialect
   MLIRFSMIncGen

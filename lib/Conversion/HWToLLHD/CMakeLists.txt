@@ -1,5 +1,7 @@
 add_circt_conversion_library(CIRCTHWToLLHD
   HWToLLHD.cpp
+  SHARED
+  
 
   DEPENDS
   CIRCTConversionPassIncGen

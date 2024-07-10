@@ -3,6 +3,8 @@ add_circt_dialect_library(CIRCTLLHD
   LLHDOps.cpp
   LLHDTypes.cpp
 
+  SHARED
+  
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/Dialect/LLHD
 

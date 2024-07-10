@@ -13,6 +13,8 @@ add_circt_dialect_library(CIRCTSim
   SimDialect.cpp
   SimOps.cpp
 
+  SHARED
+  
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/Sim
 

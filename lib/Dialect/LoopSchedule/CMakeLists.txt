@@ -7,6 +7,8 @@ set(LLVM_OPTIONAL_SOURCES
 add_circt_dialect_library(CIRCTLoopSchedule
   LoopScheduleOps.cpp
 
+  SHARED
+  
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include
   ${PROJECT_BINARY_DIR}/include
