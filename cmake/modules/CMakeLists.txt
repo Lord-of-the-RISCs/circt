@@ -49,6 +49,13 @@ set(CIRCT_CONFIG_TOOLS_DIR)
 set(CIRCT_CONFIG_INCLUDE_EXPORTS)
 set(CIRCT_CONFIG_INCLUDE_DIRS)
 
+# Copy AddCIRCT to the build tree.
+configure_file(
+  ${CMAKE_CURRENT_SOURCE_DIR}/AddCIRCT.cmake
+  ${circt_cmake_builddir}/AddCIRCT.cmake
+  COPYONLY
+)
+
 # Generate CIRCTConfig.cmake for the install tree.
 set(CIRCT_CONFIG_CODE "
 # Compute the installation prefix from this CIRCTConfig.cmake file location.
