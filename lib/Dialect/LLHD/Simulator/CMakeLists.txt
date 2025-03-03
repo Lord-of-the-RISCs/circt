@@ -7,14 +7,10 @@ set(LLVM_OPTIONAL_SOURCES
 
 add_circt_library(CIRCTLLHDSimState
     State.cpp
-
-    SHARED
 )
 
 add_circt_library(CIRCTLLHDSimTrace
     Trace.cpp
-
-    SHARED
 
     LINK_LIBS PUBLIC
     CIRCTLLHDSimState
@@ -22,8 +18,6 @@ add_circt_library(CIRCTLLHDSimTrace
 
 add_circt_library(circt-llhd-signals-runtime-wrappers SHARED
     signals-runtime-wrappers.cpp
-
-    SHARED
 
     LINK_LIBS PUBLIC
     CIRCTLLHDSimState
@@ -33,8 +27,6 @@ set_target_properties(circt-llhd-signals-runtime-wrappers
 
 add_circt_library(CIRCTLLHDSimEngine
     Engine.cpp
-
-    SHARED
 
     LINK_LIBS PUBLIC
     CIRCTLLHD

@@ -1,7 +1,5 @@
 add_circt_conversion_library(CIRCTFIRRTLToHW
   LowerToHW.cpp
-  SHARED
-  
 
   DEPENDS
   CIRCTConversionPassIncGen

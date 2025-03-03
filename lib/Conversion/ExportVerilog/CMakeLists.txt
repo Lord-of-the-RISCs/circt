@@ -8,8 +8,6 @@ add_circt_translation_library(CIRCTExportVerilog
   PrepareForEmission.cpp
   PruneZeroValuedLogic.cpp
 
-  SHARED
-
   ADDITIONAL_HEADER_DIRS
 
   DEPENDS

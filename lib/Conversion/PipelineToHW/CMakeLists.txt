@@ -1,8 +1,6 @@
 add_circt_library(CIRCTPipelineToHW
   PipelineToHW.cpp
 
-  SHARED
-
   DEPENDS
   CIRCTConversionPassIncGen
 

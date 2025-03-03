@@ -15,8 +15,6 @@ add_circt_dialect_library(CIRCTIbisTransforms
   IbisMethodsToContainers.cpp
   IbisAddOperatorLibrary.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTIbisTransformsIncGen
 

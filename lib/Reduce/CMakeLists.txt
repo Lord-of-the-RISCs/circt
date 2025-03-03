@@ -4,7 +4,6 @@ add_circt_library(CIRCTReduceLib
   ReductionUtils.cpp
   Tester.cpp
 
-  SHARED
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRSupport

@@ -24,8 +24,6 @@ set(LLVM_OPTIONAL_SOURCES
 add_circt_dialect_library(CIRCTHW
   ${CIRCT_HW_Sources}
 
-  SHARED
-
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/HW
 
@@ -45,8 +43,6 @@ add_circt_dialect_library(CIRCTHW
 
 add_circt_library(CIRCTHWReductions
   HWReductions.cpp
-
-  SHARED
 
   LINK_LIBS PUBLIC
   CIRCTReduceLib

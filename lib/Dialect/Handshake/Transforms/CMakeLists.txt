@@ -7,8 +7,6 @@ add_circt_dialect_library(CIRCTHandshakeTransforms
   LowerExtmemToHW.cpp
   LegalizeMemrefs.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTHandshakeTransformsIncGen
   MLIRArithDialect

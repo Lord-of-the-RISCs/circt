@@ -56,8 +56,6 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   Vectorization.cpp
   WireDFT.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTFIRRTLTransformsIncGen
   MLIROMIncGen

@@ -10,8 +10,6 @@ set(srcs
 
 add_circt_dialect_library(CIRCTExportCalyx
   ${srcs}
-  SHARED
-  
   LINK_LIBS PUBLIC
   CIRCTCalyx
   MLIRTranslateLib

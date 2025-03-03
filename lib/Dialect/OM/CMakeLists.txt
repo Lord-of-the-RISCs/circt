@@ -9,8 +9,6 @@
 add_circt_dialect_library(
   CIRCTOM
 
-  SHARED
-  
   OMAttributes.cpp
   OMDialect.cpp
   OMOpInterfaces.cpp

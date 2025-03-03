@@ -1,8 +1,6 @@
 add_circt_conversion_library(CIRCTLLHDToLLVM
   LLHDToLLVM.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTConversionPassIncGen
   MLIRArithDialect

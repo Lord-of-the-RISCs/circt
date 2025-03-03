@@ -6,8 +6,6 @@ add_circt_translation_library(CIRCTExportSystemC
   Patterns/HWEmissionPatterns.cpp
   Patterns/SystemCEmissionPatterns.cpp
 
-  SHARED
-
   ADDITIONAL_HEADER_DIRS
 
   LINK_COMPONENTS

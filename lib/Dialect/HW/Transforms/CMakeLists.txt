@@ -5,8 +5,6 @@ add_circt_dialect_library(CIRCTHWTransforms
   FlattenIO.cpp
   VerifyInnerRefNamespace.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTHWTransformsIncGen
 

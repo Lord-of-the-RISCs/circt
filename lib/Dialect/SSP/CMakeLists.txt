@@ -24,8 +24,6 @@ set(SSP_Deps
 add_circt_dialect_library(CIRCTSSP
   ${SSP_Srcs}
 
-  SHARED
-  
   DEPENDS
   ${SSP_Deps}
 

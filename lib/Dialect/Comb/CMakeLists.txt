@@ -4,8 +4,6 @@ add_circt_dialect_library(CIRCTComb
   CombAnalysis.cpp
   CombDialect.cpp
 
-  SHARED
-  
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/Comb
 

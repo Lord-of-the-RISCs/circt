@@ -10,8 +10,6 @@ add_circt_library(CIRCTDebugAnalysis
   DebugAnalysis.cpp
   DebugInfo.cpp
 
-  SHARED
-
   LINK_LIBS PUBLIC
   CIRCTComb
   CIRCTDebug
@@ -22,8 +20,6 @@ add_circt_library(CIRCTDebugAnalysis
 add_circt_library(CIRCTDependenceAnalysis
   DependenceAnalysis.cpp
 
-  SHARED
-
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRAffineUtils
@@ -32,8 +28,6 @@ add_circt_library(CIRCTDependenceAnalysis
 
 add_circt_library(CIRCTSchedulingAnalysis
   SchedulingAnalysis.cpp
-
-  SHARED
 
   LINK_LIBS PUBLIC
   MLIRAffineDialect
@@ -44,8 +38,6 @@ add_circt_library(CIRCTSchedulingAnalysis
 
 add_circt_library(CIRCTAnalysisTestPasses
   TestPasses.cpp
-
-  SHARED
 
   LINK_LIBS PUBLIC
   CIRCTDebugAnalysis

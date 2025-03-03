@@ -16,8 +16,6 @@ add_circt_dialect_library(CIRCTSeq
   SeqOps.cpp
   SeqTypes.cpp
 
-  SHARED
-  
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/Seq
 

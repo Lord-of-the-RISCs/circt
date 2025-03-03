@@ -3,8 +3,6 @@ add_circt_conversion_library(CIRCTSeqToSV
   FirRegLowering.cpp
   SeqToSV.cpp
   LowerFirMem.cpp
-  SHARED
-  
 
   DEPENDS
   CIRCTConversionPassIncGen

@@ -50,8 +50,6 @@ set(ESI_Deps
 add_circt_dialect_library(CIRCTESI
   ${srcs}
 
-  SHARED
-  
   DEPENDS
   MLIRESITransformsIncGen
   MLIRESIEnumsIncGen

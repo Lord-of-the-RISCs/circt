@@ -1,7 +1,5 @@
 add_circt_conversion_library(CIRCTLoopScheduleToCalyx
   LoopScheduleToCalyx.cpp
-  SHARED
-  
 
   DEPENDS
   CIRCTConversionPassIncGen

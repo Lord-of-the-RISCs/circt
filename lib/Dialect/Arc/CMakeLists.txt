@@ -17,8 +17,6 @@ add_circt_dialect_library(CIRCTArc
   ADDITIONAL_HEADER_DIRS
   ${CIRCT_MAIN_INCLUDE_DIR}/circt/Dialect/Arc
 
-  SHARED
-
   DEPENDS
   CIRCTArcEnumsIncGen
   CIRCTArcInterfacesIncGen
@@ -37,8 +35,6 @@ add_circt_dialect_library(CIRCTArc
 
 add_circt_library(CIRCTArcReductions
   ArcReductions.cpp
-
-  SHARED
 
   LINK_LIBS PUBLIC
   CIRCTReduceLib

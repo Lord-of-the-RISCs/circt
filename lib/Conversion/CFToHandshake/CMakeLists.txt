@@ -1,8 +1,6 @@
 add_circt_library(CIRCTCFToHandshake
   CFToHandshake.cpp
 
-  SHARED
-
   ADDITIONAL_HEADER_DIRS
   ${MLIR_MAIN_INCLUDE_DIR}/mlir/Conversion/CFToHandshake
 

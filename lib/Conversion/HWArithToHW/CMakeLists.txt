@@ -1,7 +1,5 @@
 add_circt_conversion_library(CIRCTHWArithToHW
   HWArithToHW.cpp
-  SHARED
-  
 
   DEPENDS
   CIRCTConversionPassIncGen

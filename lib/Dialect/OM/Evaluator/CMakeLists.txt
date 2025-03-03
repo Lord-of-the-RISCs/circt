@@ -1,8 +1,6 @@
 add_circt_library(CIRCTOMEvaluator
   Evaluator.cpp
 
-  SHARED
-
   DEPENDS
   MLIROMIncGen
   MLIROMAttrIncGen

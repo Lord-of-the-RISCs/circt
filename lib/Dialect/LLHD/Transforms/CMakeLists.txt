@@ -6,8 +6,6 @@ add_circt_dialect_library(CIRCTLLHDTransforms
   MemoryToBlockArgumentPass.cpp
   EarlyCodeMotionPass.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTLLHDTransformsIncGen
 

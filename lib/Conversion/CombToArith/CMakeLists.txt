@@ -1,7 +1,5 @@
 add_circt_conversion_library(CIRCTCombToArith
   CombToArith.cpp
-  SHARED
-  
 
   DEPENDS
   CIRCTConversionPassIncGen

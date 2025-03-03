@@ -1,8 +1,6 @@
 add_circt_conversion_library(CIRCTFSMToSV
     FSMToSV.cpp
 
-  SHARED
-  
     DEPENDS
     CIRCTConversionPassIncGen
 

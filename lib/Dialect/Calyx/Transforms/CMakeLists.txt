@@ -8,8 +8,6 @@ add_circt_dialect_library(CIRCTCalyxTransforms
   CalyxHelpers.cpp
   CalyxLoweringUtils.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTCalyxTransformsIncGen
 

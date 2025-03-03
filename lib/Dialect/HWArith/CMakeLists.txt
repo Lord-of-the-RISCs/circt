@@ -13,8 +13,6 @@ set(srcs
 add_circt_dialect_library(CIRCTHWArith
     ${srcs}
 
-  SHARED
-  
     DEPENDS
     MLIRHWArithIncGen
     MLIRHWArithEnumsIncGen

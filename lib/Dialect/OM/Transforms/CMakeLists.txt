@@ -2,8 +2,6 @@ add_circt_dialect_library(CIRCTOMTransforms
   FreezePaths.cpp
   LinkModules.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTOMTransformsIncGen
 

@@ -22,8 +22,6 @@ add_circt_dialect_library(CIRCTArcTransforms
   SplitLoops.cpp
   StripSV.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTArcTransformsIncGen
 

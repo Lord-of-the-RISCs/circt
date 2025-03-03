@@ -2,8 +2,6 @@ add_circt_dialect_library(CIRCTPipelineTransforms
   ExplicitRegs.cpp
   ScheduleLinearPipeline.cpp
 
-  SHARED
-  
   DEPENDS
   CIRCTPipelineTransformsIncGen
 
