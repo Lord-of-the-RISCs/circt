@@ -3,9 +3,19 @@ if (MSVC)
 endif()
 
 get_property(circt_libs GLOBAL PROPERTY CIRCT_ALL_LIBS)
-get_property(mlir_llvm_link_components GLOBAL PROPERTY MLIR_LLVM_LINK_COMPONENTS)
 list(REMOVE_DUPLICATES circt_libs)
-list(REMOVE_DUPLICATES mlir_llvm_link_components)
+
+list(FILTER circt_libs EXCLUDE REGEX "obj\.*")
+
+foreach (lib ${circt_libs})
+  if(XCODE)
+    # Xcode doesn't support object libraries, so we have to trick it into
+    # linking the static libraries instead.
+    list(APPEND _DEPS "-force_load" ${lib})
+  else()
+    list(APPEND _OBJECTS $<TARGET_OBJECTS:obj.${lib}>)
+  endif()
+endforeach ()
 
 if(CIRCT_LINK_CIRCT_DYLIB)
   set(INSTALL_WITH_TOOLCHAIN INSTALL_WITH_TOOLCHAIN)
@@ -16,8 +26,9 @@ add_circt_library(
   SHARED
   ${INSTALL_WITH_TOOLCHAIN}
   circt-shlib.cpp
+  ${_OBJECTS}
   LINK_LIBS
-  ${circt_libs}
+  ${_DEPS}
   MLIR
   ${Z3_LIBRARIES}
 )
