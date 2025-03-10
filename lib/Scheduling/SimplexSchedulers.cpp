@@ -1381,7 +1381,7 @@ void SimplexSchedulerBase::exportCriticalPath() {
   getProblem().getContainingOp()->setAttr(
       "SpecHLS.II",
       mlir::FloatAttr::get(
-          mlir::FloatType::getF32(getProblem().getContainingOp()->getContext()),
+          mlir::Float32Type::get(getProblem().getContainingOp()->getContext()),
           doubleII));
   for (auto pair : dependencesMap) {
     auto dep = pair.first;
