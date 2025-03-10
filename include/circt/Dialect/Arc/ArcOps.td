@@ -10,9 +10,10 @@
 #define CIRCT_DIALECT_ARC_ARCOPS_TD
 
 include "circt/Dialect/Arc/ArcDialect.td"
-include "circt/Dialect/Arc/ArcTypes.td"
-include "circt/Dialect/Seq/SeqTypes.td"
 include "circt/Dialect/Arc/ArcInterfaces.td"
+include "circt/Dialect/Arc/ArcTypes.td"
+include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/Seq/SeqTypes.td"
 include "mlir/IR/EnumAttr.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
@@ -92,7 +93,7 @@ def DefineOp : ArcOp<"define", [
     /// an error if the attribute is invalid.
     mlir::LogicalResult verifyType() {
       auto type = getFunctionTypeAttr().getValue();
-      if (!type.isa<mlir::FunctionType>())
+      if (!llvm::isa<mlir::FunctionType>(type))
         return emitOpError("requires '") << getFunctionTypeAttrName() <<
                            "' attribute of function type";
       return mlir::success();
@@ -133,6 +134,9 @@ def StateOp : ArcOp<"state", [
   DeclareOpInterfaceMethods<SymbolUserOpInterface>,
   AttrSizedOperandSegments,
   DeclareOpInterfaceMethods<ClockedOpInterface>,
+  PredOpTrait<"types of initial arguments match result types",
+    CPred<[{getInitials().empty() ||
+              llvm::equal(getInitials().getType(), getResults().getType())}]>>
 ]> {
   let summary = "State transfer arc";
 
@@ -142,13 +146,15 @@ def StateOp : ArcOp<"state", [
     Optional<I1>:$enable,
     Optional<I1>:$reset,
     I32Attr:$latency,
-    Variadic<AnyType>:$inputs);
+    Variadic<AnyType>:$inputs,
+    Variadic<AnyType>:$initials);
   let results = (outs Variadic<AnyType>:$outputs);
 
   let assemblyFormat = [{
     $arc `(` $inputs `)` (`clock` $clock^)? (`enable` $enable^)?
-    (`reset` $reset^)? `latency` $latency attr-dict
-    `:` functional-type($inputs, results)
+    (`reset` $reset^)?
+    ( `initial` ` ` `(` $initials^ `:` type($initials) `)`)?
+    `latency` $latency attr-dict `:` functional-type($inputs, results)
   }];
 
   let hasFolder = 1;
@@ -156,21 +162,24 @@ def StateOp : ArcOp<"state", [
 
   let builders = [
     OpBuilder<(ins "DefineOp":$arc, "mlir::Value":$clock, "mlir::Value":$enable,
-      "unsigned":$latency, CArg<"mlir::ValueRange", "{}">:$inputs), [{
+      "unsigned":$latency, CArg<"mlir::ValueRange", "{}">:$inputs,
+      CArg<"mlir::ValueRange", "{}">:$initials), [{
       build($_builder, $_state, mlir::SymbolRefAttr::get(arc),
             arc.getFunctionType().getResults(), clock, enable, latency,
-            inputs);
+            inputs, initials);
     }]>,
     OpBuilder<(ins "mlir::SymbolRefAttr":$arc, "mlir::TypeRange":$results,
       "mlir::Value":$clock, "mlir::Value":$enable, "unsigned":$latency,
-      CArg<"mlir::ValueRange", "{}">:$inputs
+      CArg<"mlir::ValueRange", "{}">:$inputs,
+      CArg<"mlir::ValueRange", "{}">:$initials
     ), [{
       build($_builder, $_state, arc, results, clock, enable, Value(), latency,
-      inputs);
+      inputs, initials);
     }]>,
     OpBuilder<(ins "mlir::SymbolRefAttr":$arc, "mlir::TypeRange":$results,
       "mlir::Value":$clock, "mlir::Value":$enable, "mlir::Value":$reset,
-      "unsigned":$latency, CArg<"mlir::ValueRange", "{}">:$inputs
+      "unsigned":$latency, CArg<"mlir::ValueRange", "{}">:$inputs,
+      CArg<"mlir::ValueRange", "{}">:$initials
     ), [{
       if (clock)
         $_state.addOperands(clock);
@@ -179,6 +188,7 @@ def StateOp : ArcOp<"state", [
       if (reset)
         $_state.addOperands(reset);
       $_state.addOperands(inputs);
+      $_state.addOperands(initials);
       $_state.addAttribute("arc", arc);
       $_state.addAttribute("latency", $_builder.getI32IntegerAttr(latency));
       $_state.addAttribute(getOperandSegmentSizeAttr(),
@@ -186,23 +196,26 @@ def StateOp : ArcOp<"state", [
           clock ? 1 : 0,
           enable ? 1 : 0,
           reset ? 1 : 0,
-          static_cast<int32_t>(inputs.size())}));
+          static_cast<int32_t>(inputs.size()),
+          static_cast<int32_t>(initials.size())}));
       $_state.addTypes(results);
     }]>,
     OpBuilder<(ins "mlir::StringAttr":$arc, "mlir::TypeRange":$results,
       "mlir::Value":$clock, "mlir::Value":$enable, "unsigned":$latency,
-      CArg<"mlir::ValueRange", "{}">:$inputs
+      CArg<"mlir::ValueRange", "{}">:$inputs,
+      CArg<"mlir::ValueRange", "{}">:$initials
     ), [{
       build($_builder, $_state, mlir::SymbolRefAttr::get(arc), results, clock,
-            enable, latency, inputs);
+            enable, latency, inputs, initials);
     }]>,
     OpBuilder<(ins "mlir::StringRef":$arc, "mlir::TypeRange":$results,
       "mlir::Value":$clock, "mlir::Value":$enable, "unsigned":$latency,
-      CArg<"mlir::ValueRange", "{}">:$inputs
+      CArg<"mlir::ValueRange", "{}">:$inputs,
+      CArg<"mlir::ValueRange", "{}">:$initials
     ), [{
       build($_builder, $_state,
             mlir::StringAttr::get($_builder.getContext(), arc),
-            results, clock, enable, latency, inputs);
+            results, clock, enable, latency, inputs, initials);
     }]>
   ];
   let skipDefaultBuilders = 1;
@@ -222,8 +235,18 @@ def StateOp : ArcOp<"state", [
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
-      (*this)->setAttr(getArcAttrName(), callee.get<mlir::SymbolRefAttr>());
+      (*this)->setAttr(getArcAttrName(), llvm::cast<mlir::SymbolRefAttr>(callee));
     }
+
+    /// Stub implementations for ArgumentAttributesMethods. If desired,
+    /// implement these by defining arg_attrs and res_attrs as arguments to the
+    /// operation as OptionalAttr<DictArrayAttr>.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
   }];
 }
 
@@ -263,8 +286,18 @@ def CallOp : ArcOp<"call", [
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
-      (*this)->setAttr(getArcAttrName(), callee.get<mlir::SymbolRefAttr>());
+      (*this)->setAttr(getArcAttrName(), llvm::cast<mlir::SymbolRefAttr>(callee));
     }
+
+    /// Stub implementations for ArgumentAttributesMethods. If desired,
+    /// implement these by defining arg_attrs and res_attrs as arguments to the
+    /// operation as OptionalAttr<DictArrayAttr>.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
   }];
 }
 
@@ -276,10 +309,10 @@ def MemoryOp : ArcOp<"memory", [MemoryEffects<[MemAlloc]>]> {
 
 class MemoryAndDataTypesMatch<string mem, string data> : TypesMatchWith<
   "memory and data types must match", mem, data,
-  "$_self.cast<MemoryType>().getWordType()">;
+  "llvm::cast<MemoryType>($_self).getWordType()">;
 class MemoryAndAddressTypesMatch<string mem, string address> : TypesMatchWith<
   "memory and address types must match", mem, address,
-  "$_self.cast<MemoryType>().getAddressType()">;
+  "llvm::cast<MemoryType>($_self).getAddressType()">;
 
 def MemoryReadPortOp : ArcOp<"memory_read_port", [
   Pure,
@@ -352,8 +385,18 @@ def MemoryWritePortOp : ArcOp<"memory_write_port", [
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
-      (*this)->setAttr(getArcAttrName(), callee.get<mlir::SymbolRefAttr>());
+      (*this)->setAttr(getArcAttrName(), llvm::cast<mlir::SymbolRefAttr>(callee));
     }
+
+    /// Stub implementations for ArgumentAttributesMethods. If desired,
+    /// implement these by defining arg_attrs and res_attrs as arguments to the
+    /// operation as OptionalAttr<DictArrayAttr>.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
   }];
 }
 
@@ -362,13 +405,12 @@ def MemoryReadOp : ArcOp<"memory_read", [
   MemoryAndDataTypesMatch<"memory", "data">,
   MemoryAndAddressTypesMatch<"memory", "address">
 ]> {
-  let summary = "Read word from memory";
+  let summary = "Read a word from a memory";
   let arguments = (ins
     MemoryType:$memory,
     AnyInteger:$address
   );
   let results = (outs AnyInteger:$data);
-
   let assemblyFormat = [{
     $memory `[` $address `]` attr-dict `:` type($memory)
   }];
@@ -379,19 +421,17 @@ def MemoryWriteOp : ArcOp<"memory_write", [
   MemoryAndDataTypesMatch<"memory", "data">,
   MemoryAndAddressTypesMatch<"memory", "address">
 ]> {
-  let summary = "Write word to memory";
+  let summary = "Write a word to a memory";
   let arguments = (ins
     MemoryType:$memory,
     AnyInteger:$address,
     Optional<I1>:$enable,
     AnyInteger:$data
   );
-
   let assemblyFormat = [{
     $memory `[` $address `]` `,` $data (`if` $enable^)?
     attr-dict `:` type($memory)
   }];
-
   let hasFolder = 1;
   let hasCanonicalizeMethod = 1;
 }
@@ -428,26 +468,29 @@ def ClockDomainOp : ArcOp<"clock_domain", [
   let hasCanonicalizeMethod = 1;
 }
 
-def ClockTreeOp : ArcOp<"clock_tree", [NoTerminator, NoRegionArguments]> {
-  let summary = "A clock tree";
-  let arguments = (ins I1:$clock);
+//===----------------------------------------------------------------------===//
+// (Pseudo) Clock Trees
+//===----------------------------------------------------------------------===//
+
+class ClockTreeLikeOp<string mnemonic, list<Trait> traits = []>:
+  ArcOp<mnemonic, !listconcat(traits, [
+    RecursiveMemoryEffects, NoTerminator, NoRegionArguments, SingleBlock,
+    HasParent<"ModelOp">
+])> {
   let regions = (region SizedRegion<1>:$body);
-  let assemblyFormat = [{
-    $clock attr-dict-with-keyword $body
-  }];
-  let extraClassDeclaration = [{
-    mlir::Block &getBodyBlock() { return getBody().front(); }
-  }];
 }
 
-def PassThroughOp : ArcOp<"passthrough", [NoTerminator, NoRegionArguments]> {
-  let summary = "Clock-less logic that is on the pass-through path";
-  let regions = (region SizedRegion<1>:$body);
+def InitialOp : ClockTreeLikeOp<"initial"> {
+  let summary = "Region to be executed at the start of simulation";
   let assemblyFormat = [{
     attr-dict-with-keyword $body
   }];
-  let extraClassDeclaration = [{
-    mlir::Block &getBodyBlock() { return getBody().front(); }
+}
+
+def FinalOp : ClockTreeLikeOp<"final"> {
+  let summary = "Region to be executed at the end of simulation";
+  let assemblyFormat = [{
+    attr-dict-with-keyword $body
   }];
 }
 
@@ -527,13 +570,13 @@ def StorageGetOp : ArcOp<"storage.get", [Pure]> {
 
 class StateAndValueTypesMatch<string state, string value> : TypesMatchWith<
   "state and value types must match", state, value,
-  "$_self.cast<StateType>().getType()">;
+  "llvm::cast<StateType>($_self).getType()">;
 
 def StateReadOp : ArcOp<"state_read", [
   MemoryEffects<[MemRead]>,
-  StateAndValueTypesMatch<"state", "value">
+  StateAndValueTypesMatch<"state", "value">,
 ]> {
-  let summary = "Get a state's current value";
+  let summary = "Read a state's value";
   let arguments = (ins StateType:$state);
   let results = (outs AnyType:$value);
   let assemblyFormat = [{
@@ -543,27 +586,91 @@ def StateReadOp : ArcOp<"state_read", [
 
 def StateWriteOp : ArcOp<"state_write", [
   MemoryEffects<[MemWrite]>,
-  StateAndValueTypesMatch<"state", "value">
+  StateAndValueTypesMatch<"state", "value">,
 ]> {
   let summary = "Update a state's value";
-  let description = [{
-    Changes the value of a state. This operation is treated as a deferred
-    assignment by most transformation passes, which allows them to change the
-    order of `arc.state_read` and `arc.state_write` ops on the same state
-    without affecting the correctness of the model. The reads are always assumed
-    to produce the current value of the state and writes to be deferred until
-    all operations in the model have been executed for the current time step.
-
-    The only exceptions to this are the state update legalization pass, which
-    inserts the necessary temporary variables such that writes can be performed
-    immediately without affecting correctness. This allows later lowering passes
-    to treat `arc.state_write` as an immediate assignment (without defering).
-  }];
-  let arguments = (ins StateType:$state, AnyType:$value,
-                       Optional<I1>:$condition);
+  let arguments = (ins
+    StateType:$state,
+    AnyType:$value,
+    Optional<I1>:$condition
+  );
   let assemblyFormat = [{
     $state `=` $value (`if` $condition^)? attr-dict `:` type($state)
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// Simulation Orchestration
+//===----------------------------------------------------------------------===//
+
+def SimInstantiateOp : ArcOp<"sim.instantiate",
+  [MemoryEffects<[MemAlloc]>, NoTerminator,
+   DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Instantiates an Arc model for simulation";
+  let description = [{
+    Creates an instance of an Arc model in scope, in order to simulate it.
+    The model can be used from within the associated region, modelling its
+    lifetime.
+  }];
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasRegionVerifier = 1;
+  let hasCustomAssemblyFormat = 1;
+}
+
+def SimSetInputOp : ArcOp<"sim.set_input",
+  [MemoryEffects<[MemWrite]>,
+   DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Sets the value of an input of the model instance";
+  let description = [{
+    Sets the value of an input port in a specific instance of a model. The
+    provided input port must be of input type on the model and its type must
+    match the type of the value operand.
+  }];
+  let arguments = (ins SimModelInstance:$instance,
+                       StrAttr:$input,
+                       AnyType:$value);
+  let assemblyFormat =
+    [{ $instance `,` $input `=` $value attr-dict
+       `:` type($value) `,` qualified(type($instance)) }];
+}
+
+def SimGetPortOp : ArcOp<"sim.get_port",
+  [MemoryEffects<[MemRead]>, DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary = "Gets the value of a port of the model instance";
+  let description = [{
+    Gets the value of the given port in a specific instance of a model. The
+    provided port must be of the type of the expected value.
+  }];
+  let arguments = (ins SimModelInstance:$instance, StrAttr:$port);
+  let results = (outs AnyType:$value);
+  let assemblyFormat =
+    [{ $instance `,` $port attr-dict
+       `:` type($value) `,` qualified(type($instance)) }];
+}
+
+def SimStepOp : ArcOp<"sim.step",
+  [MemoryEffects<[MemRead, MemWrite]>,
+   DeclareOpInterfaceMethods<SymbolUserOpInterface>]> {
+  let summary =
+    "Evaluates one step of the simulation for the provided model instance";
+  let description = [{
+    Evaluates one step of the simulation for the provided model instance,
+    updating ports accordingly.
+  }];
+  let arguments = (ins SimModelInstance:$instance);
+  let assemblyFormat =
+    [{ $instance attr-dict `:` qualified(type($instance)) }];
+}
+
+def SimEmitValueOp : ArcOp<"sim.emit"> {
+  let summary = "Sends a value to the simulation driver";
+  let description = [{
+    Sends a named value to the simulation driver. This is notably useful
+    for printing values during simulation.
+  }];
+  let arguments = (ins StrAttr:$valueName, AnyType:$value);
+  let assemblyFormat = [{ $valueName `,` $value attr-dict `:` type($value) }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -572,24 +679,33 @@ def StateWriteOp : ArcOp<"state_write", [
 
 def TapOp : ArcOp<"tap"> {
   let summary = "A tracker op to observe a value under a given name";
-  let arguments = (ins AnySignlessInteger:$value, StrAttr:$name);
+  let arguments = (ins AnyType:$value, StrAttr:$name);
   let assemblyFormat = [{ $value attr-dict `:` type($value) }];
 }
 
-def ModelOp : ArcOp<"model", [RegionKindInterface, IsolatedFromAbove,
-                              NoTerminator]> {
+def ModelOp : ArcOp<"model", [
+  IsolatedFromAbove, NoTerminator, Symbol,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
   let summary = "A model with stratified clocks";
-  let arguments = (ins StrAttr:$name);
+  let description = [{
+    A model with stratified clocks. The `io` optional attribute
+    specifies the I/O of the module associated to this model.
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name,
+                       TypeAttrOf<ModuleType>:$io,
+                       OptionalAttr<FlatSymbolRefAttr>:$initialFn,
+                       OptionalAttr<FlatSymbolRefAttr>:$finalFn);
   let regions = (region SizedRegion<1>:$body);
 
   let assemblyFormat = [{
-    $name attr-dict-with-keyword $body
+    $sym_name `io` $io
+    (`initializer` $initialFn^)?
+    (`finalizer` $finalFn^)?
+    attr-dict-with-keyword $body
   }];
 
   let extraClassDeclaration = [{
-    static mlir::RegionKind getRegionKind(unsigned index) {
-      return mlir::RegionKind::Graph;
-    }
     mlir::Block &getBodyBlock() { return getBody().front(); }
   }];
 
@@ -677,7 +793,6 @@ def VectorizeOp : ArcOp<"vectorize", [
     vectorized each list will only contain a single SSA value of either vector
     type or an integer representing the concatenation of all original operands
     of that vector.
-    Only integer types can be vectorized, no arrays or structs are allowed.
 
     Example:
 
@@ -735,7 +850,7 @@ def VectorizeOp : ArcOp<"vectorize", [
     ```
     or SIMD vectors.
     ```mlir
-    %0:2 = arc.vectorize (%in0, %in1), (%in2, %in3) : 
+    %0:2 = arc.vectorize (%in0, %in1), (%in2, %in3) :
       (i1, i1, i1, i1) -> (i1, i1) {
     ^bb0(%arg0: vector<2xi1>, %arg1: vector<2xi1>):
       %1 = arith.and %arg0, %arg1 : vector<2xi1>
@@ -765,9 +880,9 @@ def VectorizeOp : ArcOp<"vectorize", [
   }];
 
   let arguments = (ins
-    VariadicOfVariadic<IntOr1DVectorOfInt, "inputOperandSegments">:$inputs,
+    VariadicOfVariadic<AnyType, "inputOperandSegments">:$inputs,
     DenseI32ArrayAttr:$inputOperandSegments);
-  let results = (outs Variadic<IntOr1DVectorOfInt>:$results);
+  let results = (outs Variadic<AnyType>:$results);
   let regions = (region SizedRegion<1>:$body);
 
   let assemblyFormat = [{
@@ -796,7 +911,7 @@ def VectorizeReturnOp : ArcOp<"vectorize.return", [
   HasParent<"VectorizeOp">, Pure, ReturnLike, Terminator
 ]> {
   let summary = "arc.vectorized terminator";
-  let arguments = (ins IntOr1DVectorOfInt:$value);
+  let arguments = (ins AnyType:$value);
   let assemblyFormat = "operands attr-dict `:` qualified(type(operands))";
 }
 

@@ -10,9 +10,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "../PassDetail.h"
 #include "circt/Conversion/FIRRTLToHW.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
@@ -21,7 +21,6 @@
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLVisitors.h"
 #include "circt/Dialect/FIRRTL/NLATable.h"
-#include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
@@ -38,13 +37,15 @@
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/Pass/Pass.h"
-#include "llvm/ADT/StringSet.h"
-#include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Support/FormatVariadic.h"
-#include "llvm/Support/Parallel.h"
+#include "llvm/Support/Mutex.h"
 
 #define DEBUG_TYPE "lower-to-hw"
+
+namespace circt {
+#define GEN_PASS_DEF_LOWERFIRRTLTOHW
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -142,7 +143,7 @@ static Value castToFIRRTLType(Value val, Type type,
 static Value castFromFIRRTLType(Value val, Type type,
                                 ImplicitLocOpBuilder &builder) {
 
-  if (hw::StructType structTy = type.dyn_cast<hw::StructType>()) {
+  if (hw::StructType structTy = dyn_cast<hw::StructType>(type)) {
     // Strip off Flip type if needed.
     val =
         builder
@@ -163,7 +164,7 @@ static Value castFromFIRRTLType(Value val, Type type,
 static void moveVerifAnno(ModuleOp top, AnnotationSet &annos,
                           StringRef annoClass, StringRef attrBase) {
   auto anno = annos.getAnnotation(annoClass);
-  auto ctx = top.getContext();
+  auto *ctx = top.getContext();
   if (!anno)
     return;
   if (auto dir = anno.getMember<StringAttr>("directory")) {
@@ -207,16 +208,17 @@ struct FIRRTLModuleLowering;
 
 /// This is state shared across the parallel module lowering logic.
 struct CircuitLoweringState {
-  std::atomic<bool> used_PRINTF_COND{false};
-  std::atomic<bool> used_ASSERT_VERBOSE_COND{false};
-  std::atomic<bool> used_STOP_COND{false};
+  // Flags indicating whether the circuit uses certain header fragments.
+  std::atomic<bool> usedPrintf{false};
+  std::atomic<bool> usedAssertVerboseCond{false};
+  std::atomic<bool> usedStopCond{false};
 
   CircuitLoweringState(CircuitOp circuitOp, bool enableAnnotationWarning,
-                       bool emitChiselAssertsAsSVA,
+                       firrtl::VerificationFlavor verificationFlavor,
                        InstanceGraph &instanceGraph, NLATable *nlaTable)
       : circuitOp(circuitOp), instanceGraph(instanceGraph),
         enableAnnotationWarning(enableAnnotationWarning),
-        emitChiselAssertsAsSVA(emitChiselAssertsAsSVA), nlaTable(nlaTable) {
+        verificationFlavor(verificationFlavor), nlaTable(nlaTable) {
     auto *context = circuitOp.getContext();
 
     // Get the testbench output directory.
@@ -243,11 +245,39 @@ struct CircuitLoweringState {
     } else if (dut == testHarness) {
       testHarness = nullptr;
     }
+
+    // Pre-populate the dutModules member with a list of all modules that are
+    // determined to be under the DUT.
+    auto inDUT = [&](igraph::ModuleOpInterface child) {
+      auto isBind = [](igraph::InstanceRecord *instRec) {
+        auto inst = instRec->getInstance();
+        if (auto *finst = dyn_cast<InstanceOp>(&inst))
+          return finst->getLowerToBind();
+        return false;
+      };
+      if (auto parent = dyn_cast<igraph::ModuleOpInterface>(*dut))
+        return getInstanceGraph().isAncestor(child, parent, isBind);
+      return dut == child;
+    };
+    circuitOp->walk([&](FModuleLike moduleOp) {
+      if (inDUT(moduleOp))
+        dutModules.insert(moduleOp);
+    });
   }
 
   Operation *getNewModule(Operation *oldModule) {
     auto it = oldToNewModuleMap.find(oldModule);
     return it != oldToNewModuleMap.end() ? it->second : nullptr;
+  }
+
+  Operation *getOldModule(Operation *newModule) {
+    auto it = newToOldModuleMap.find(newModule);
+    return it != newToOldModuleMap.end() ? it->second : nullptr;
+  }
+
+  void recordModuleMapping(Operation *oldFMod, Operation *newHWMod) {
+    oldToNewModuleMap[oldFMod] = newHWMod;
+    newToOldModuleMap[newHWMod] = oldFMod;
   }
 
   // Process remaining annotations and emit warnings on unprocessed annotations
@@ -280,11 +310,13 @@ struct CircuitLoweringState {
   FModuleLike getTestHarness() { return testHarness; }
 
   // Return true if this module is the DUT or is instantiated by the DUT.
-  // Returns false if the module is not instantiated by the DUT.
+  // Returns false if the module is not instantiated by the DUT or is
+  // instantiated under a bind.  This will accept either an old FIRRTL module or
+  // a new HW module.
   bool isInDUT(igraph::ModuleOpInterface child) {
-    if (auto parent = dyn_cast<igraph::ModuleOpInterface>(*dut))
-      return getInstanceGraph().isAncestor(child, parent);
-    return dut == child;
+    if (auto hwModule = dyn_cast<hw::HWModuleOp>(child.getOperation()))
+      child = cast<igraph::ModuleOpInterface>(getOldModule(hwModule));
+    return dutModules.contains(child);
   }
 
   hw::OutputFileAttr getTestBenchDirectory() { return testBenchDirectory; }
@@ -313,11 +345,22 @@ private:
   CircuitLoweringState(const CircuitLoweringState &) = delete;
   void operator=(const CircuitLoweringState &) = delete;
 
+  /// Mapping of FModuleOp to HWModuleOp
   DenseMap<Operation *, Operation *> oldToNewModuleMap;
+
+  /// Mapping of HWModuleOp to FModuleOp
+  DenseMap<Operation *, Operation *> newToOldModuleMap;
 
   /// Cache of module symbols.  We need to test hirarchy-based properties to
   /// lower annotaitons.
   InstanceGraph &instanceGraph;
+
+  /// The set of old FIRRTL modules that are instantiated under the DUT.  This
+  /// is precomputed as a module being under the DUT may rely on knowledge of
+  /// properties of the instance and is not suitable for querying in the
+  /// parallel execution region of this pass when the backing instances may
+  /// already be erased.
+  DenseSet<igraph::ModuleOpInterface> dutModules;
 
   // Record the set of remaining annotation classes. This is used to warn only
   // once about any annotation class.
@@ -325,7 +368,7 @@ private:
   const bool enableAnnotationWarning;
   std::mutex annotationPrintingMtx;
 
-  const bool emitChiselAssertsAsSVA;
+  const firrtl::VerificationFlavor verificationFlavor;
 
   // Records any sv::BindOps that are found during the course of execution.
   // This is unsafe to access directly and should only be used through addBind.
@@ -348,6 +391,26 @@ private:
   /// A mapping of instances to their forced instantiation names (if
   /// applicable).
   DenseMap<std::pair<Attribute, Attribute>, Attribute> instanceForceNames;
+
+  /// The set of guard macros to emit declarations for.
+  SetVector<StringAttr> macroDeclNames;
+  std::mutex macroDeclMutex;
+
+  void addMacroDecl(StringAttr name) {
+    std::unique_lock<std::mutex> lock(macroDeclMutex);
+    macroDeclNames.insert(name);
+  }
+
+  /// The list of fragments on which the modules rely. Must be set outside the
+  /// parallelized module lowering since module type reads access it.
+  DenseMap<hw::HWModuleOp, SetVector<Attribute>> fragments;
+  llvm::sys::SmartMutex<true> fragmentsMutex;
+
+  void addFragment(hw::HWModuleOp module, StringRef fragment) {
+    llvm::sys::SmartScopedLock<true> lock(fragmentsMutex);
+    fragments[module].insert(
+        FlatSymbolRefAttr::get(circuitOp.getContext(), fragment));
+  }
 
   /// Cached nla table analysis.
   NLATable *nlaTable = nullptr;
@@ -455,9 +518,8 @@ void CircuitLoweringState::processRemainingAnnotations(
             // The following are inspected (but not consumed) by FIRRTL/GCT
             // passes that have all run by now. Since no one is responsible for
             // consuming these, they will linger around and can be ignored.
-            scalaClassAnnoClass, dutAnnoClass, metadataDirectoryAttrName,
+            dutAnnoClass, metadataDirectoryAttrName,
             elaborationArtefactsDirectoryAnnoClass, testBenchDirAnnoClass,
-            subCircuitsTargetDirectoryAnnoClass,
             // This annotation is used to mark which external modules are
             // imported blackboxes from the BlackBoxReader pass.
             blackBoxAnnoClass,
@@ -481,11 +543,13 @@ void CircuitLoweringState::processRemainingAnnotations(
 } // end anonymous namespace
 
 namespace {
-struct FIRRTLModuleLowering : public LowerFIRRTLToHWBase<FIRRTLModuleLowering> {
+struct FIRRTLModuleLowering
+    : public circt::impl::LowerFIRRTLToHWBase<FIRRTLModuleLowering> {
 
   void runOnOperation() override;
   void setEnableAnnotationWarning() { enableAnnotationWarning = true; }
-  void setEmitChiselAssertAsSVA() { emitChiselAssertsAsSVA = true; }
+
+  using LowerFIRRTLToHWBase<FIRRTLModuleLowering>::verificationFlavor;
 
 private:
   void lowerFileHeader(CircuitOp op, CircuitLoweringState &loweringState);
@@ -509,19 +573,20 @@ private:
                               CircuitLoweringState &loweringState);
   LogicalResult lowerModuleOperations(hw::HWModuleOp module,
                                       CircuitLoweringState &loweringState);
+  LogicalResult lowerFormalBody(verif::FormalOp formalOp,
+                                CircuitLoweringState &loweringState);
 };
 
 } // end anonymous namespace
 
 /// This is the pass constructor.
-std::unique_ptr<mlir::Pass>
-circt::createLowerFIRRTLToHWPass(bool enableAnnotationWarning,
-                                 bool emitChiselAssertsAsSVA) {
+std::unique_ptr<mlir::Pass> circt::createLowerFIRRTLToHWPass(
+    bool enableAnnotationWarning,
+    firrtl::VerificationFlavor verificationFlavor) {
   auto pass = std::make_unique<FIRRTLModuleLowering>();
   if (enableAnnotationWarning)
     pass->setEnableAnnotationWarning();
-  if (emitChiselAssertsAsSVA)
-    pass->setEmitChiselAssertAsSVA();
+  pass->verificationFlavor = verificationFlavor;
   return pass;
 }
 
@@ -547,11 +612,12 @@ void FIRRTLModuleLowering::runOnOperation() {
 
   // Keep track of the mapping from old to new modules.  The result may be null
   // if lowering failed.
-  CircuitLoweringState state(
-      circuit, enableAnnotationWarning, emitChiselAssertsAsSVA,
-      getAnalysis<InstanceGraph>(), &getAnalysis<NLATable>());
+  CircuitLoweringState state(circuit, enableAnnotationWarning,
+                             verificationFlavor, getAnalysis<InstanceGraph>(),
+                             &getAnalysis<NLATable>());
 
   SmallVector<hw::HWModuleOp, 32> modulesToProcess;
+  SmallVector<verif::FormalOp> formalOpsToProcess;
 
   AnnotationSet circuitAnno(circuit);
   moveVerifAnno(getOperation(), circuitAnno, extractAssertAnnoClass,
@@ -574,7 +640,7 @@ void FIRRTLModuleLowering::runOnOperation() {
               if (!loweredMod)
                 return failure();
 
-              state.oldToNewModuleMap[&op] = loweredMod;
+              state.recordModuleMapping(&op, loweredMod);
               modulesToProcess.push_back(loweredMod);
               // Lower all the alias types.
               module.walk([&](Operation *op) {
@@ -591,7 +657,7 @@ void FIRRTLModuleLowering::runOnOperation() {
                   lowerExtModule(extModule, topLevelModule, state);
               if (!loweredMod)
                 return failure();
-              state.oldToNewModuleMap[&op] = loweredMod;
+              state.recordModuleMapping(&op, loweredMod);
               return success();
             })
             .Case<FMemModuleOp>([&](auto memModule) {
@@ -599,7 +665,17 @@ void FIRRTLModuleLowering::runOnOperation() {
                   lowerMemModule(memModule, topLevelModule, state);
               if (!loweredMod)
                 return failure();
-              state.oldToNewModuleMap[&op] = loweredMod;
+              state.recordModuleMapping(&op, loweredMod);
+              return success();
+            })
+            .Case<FormalOp>([&](auto oldFormalOp) {
+              auto builder = OpBuilder::atBlockEnd(topLevelModule);
+              auto newFormalOp = builder.create<verif::FormalOp>(
+                  oldFormalOp.getLoc(), oldFormalOp.getNameAttr(),
+                  oldFormalOp.getParametersAttr());
+              newFormalOp.getBody().emplaceBlock();
+              state.recordModuleMapping(oldFormalOp, newFormalOp);
+              formalOpsToProcess.push_back(newFormalOp);
               return success();
             })
             .Default([&](Operation *op) {
@@ -649,21 +725,26 @@ void FIRRTLModuleLowering::runOnOperation() {
   });
   // Attach the lowered form of these annotations.
   if (!dutHierarchyFiles.empty())
-    state.oldToNewModuleMap[state.getDut()]->setAttr(
-        moduleHierarchyFileAttrName,
-        ArrayAttr::get(&getContext(), dutHierarchyFiles));
+    state.getNewModule(state.getDut())
+        ->setAttr(moduleHierarchyFileAttrName,
+                  ArrayAttr::get(&getContext(), dutHierarchyFiles));
   if (!testHarnessHierarchyFiles.empty())
-    state.oldToNewModuleMap[state.getTestHarness()]->setAttr(
-        moduleHierarchyFileAttrName,
-        ArrayAttr::get(&getContext(), testHarnessHierarchyFiles));
+    state.getNewModule(state.getTestHarness())
+        ->setAttr(moduleHierarchyFileAttrName,
+                  ArrayAttr::get(&getContext(), testHarnessHierarchyFiles));
 
-  // Finally, lower all operations.
+  // Lower all module bodies.
   auto result = mlir::failableParallelForEachN(
       &getContext(), 0, modulesToProcess.size(), [&](auto index) {
         return lowerModuleOperations(modulesToProcess[index], state);
       });
+  if (failed(result))
+    return signalPassFailure();
 
-  // If any module bodies failed to lower, return early.
+  // Lower all formal op bodies.
+  result = mlir::failableParallelForEach(
+      &getContext(), formalOpsToProcess,
+      [&](auto op) { return lowerFormalBody(op, state); });
   if (failed(result))
     return signalPassFailure();
 
@@ -672,9 +753,21 @@ void FIRRTLModuleLowering::runOnOperation() {
     bind->moveBefore(bind->getParentOfType<hw::HWModuleOp>());
   }
 
+  // Fix up fragment attributes.
+  for (auto &[module, fragments] : state.fragments)
+    module->setAttr(emit::getFragmentsAttrName(),
+                    ArrayAttr::get(&getContext(), fragments.getArrayRef()));
+
   // Finally delete all the old modules.
   for (auto oldNew : state.oldToNewModuleMap)
     oldNew.first->erase();
+
+  if (!state.macroDeclNames.empty()) {
+    ImplicitLocOpBuilder b(UnknownLoc::get(&getContext()), circuit);
+    for (auto name : state.macroDeclNames) {
+      b.create<sv::MacroDeclOp>(name);
+    }
+  }
 
   // Emit all the macros and preprocessor gunk at the start of the file.
   lowerFileHeader(circuit, state);
@@ -686,28 +779,9 @@ void FIRRTLModuleLowering::runOnOperation() {
 /// Emit the file header that defines a bunch of macros.
 void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
                                            CircuitLoweringState &state) {
-  // If none of the macros are needed, then don't emit any header at all, not
-  // even the header comment.
-  if (!state.used_PRINTF_COND && !state.used_ASSERT_VERBOSE_COND &&
-      !state.used_STOP_COND)
-    return;
-
   // Intentionally pass an UnknownLoc here so we don't get line number
   // comments on the output of this boilerplate in generated Verilog.
   ImplicitLocOpBuilder b(UnknownLoc::get(&getContext()), op);
-
-  // TODO: We could have an operation for macros and uses of them, and
-  // even turn them into symbols so we can DCE unused macro definitions.
-  StringSet<> emittedDecls;
-  auto emitDefine = [&](StringRef name, StringRef body, ArrayAttr args = {}) {
-    if (!emittedDecls.count(name)) {
-      emittedDecls.insert(name);
-      OpBuilder::InsertionGuard guard(b);
-      b.setInsertionPointAfter(op);
-      b.create<sv::MacroDeclOp>(name, args, StringAttr());
-    }
-    b.create<sv::MacroDefOp>(name, body);
-  };
 
   // Helper function to emit a "#ifdef guard" with a `define in the then and
   // optionally in the else branch.
@@ -716,15 +790,16 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
                                StringRef defineFalse = StringRef()) {
     if (!defineFalse.data()) {
       assert(defineTrue.data() && "didn't define anything");
-      b.create<sv::IfDefOp>(guard, [&]() { emitDefine(defName, defineTrue); });
+      b.create<sv::IfDefOp>(
+          guard, [&]() { b.create<sv::MacroDefOp>(defName, defineTrue); });
     } else {
       b.create<sv::IfDefOp>(
           guard,
           [&]() {
             if (defineTrue.data())
-              emitDefine(defName, defineTrue);
+              b.create<sv::MacroDefOp>(defName, defineTrue);
           },
-          [&]() { emitDefine(defName, defineFalse); });
+          [&]() { b.create<sv::MacroDefOp>(defName, defineFalse); });
     }
   };
 
@@ -734,39 +809,57 @@ void FIRRTLModuleLowering::lowerFileHeader(CircuitOp op,
         guard, []() {}, body);
   };
 
-  b.create<sv::VerbatimOp>("// Standard header to adapt well known macros for "
-                           "prints and assertions.");
+  if (state.usedPrintf) {
+    b.create<sv::MacroDeclOp>("PRINTF_FD");
+    b.create<sv::MacroDeclOp>("PRINTF_FD_");
+    b.create<emit::FragmentOp>("PRINTF_FD_FRAGMENT", [&] {
+      b.create<sv::VerbatimOp>(
+          "\n// Users can define 'PRINTF_FD' to add a specified fd to "
+          "prints.");
+      emitGuard("PRINTF_FD_", [&]() {
+        emitGuardedDefine("PRINTF_FD", "PRINTF_FD_", "(`PRINTF_FD)",
+                          "32'h80000002");
+      });
+    });
 
-  if (state.used_PRINTF_COND) {
-    b.create<sv::VerbatimOp>(
-        "\n// Users can define 'PRINTF_COND' to add an extra gate to "
-        "prints.");
-    emitGuard("PRINTF_COND_", [&]() {
-      emitGuardedDefine("PRINTF_COND", "PRINTF_COND_", "(`PRINTF_COND)", "1");
+    b.create<sv::MacroDeclOp>("PRINTF_COND");
+    b.create<sv::MacroDeclOp>("PRINTF_COND_");
+    b.create<emit::FragmentOp>("PRINTF_COND_FRAGMENT", [&] {
+      b.create<sv::VerbatimOp>(
+          "\n// Users can define 'PRINTF_COND' to add an extra gate to "
+          "prints.");
+      emitGuard("PRINTF_COND_", [&]() {
+        emitGuardedDefine("PRINTF_COND", "PRINTF_COND_", "(`PRINTF_COND)", "1");
+      });
     });
   }
 
-  if (state.used_ASSERT_VERBOSE_COND) {
-    b.create<sv::VerbatimOp>(
-        "\n// Users can define 'ASSERT_VERBOSE_COND' to add an extra "
-        "gate to assert error printing.");
-    emitGuard("ASSERT_VERBOSE_COND_", [&]() {
-      emitGuardedDefine("ASSERT_VERBOSE_COND", "ASSERT_VERBOSE_COND_",
-                        "(`ASSERT_VERBOSE_COND)", "1");
+  if (state.usedAssertVerboseCond) {
+    b.create<sv::MacroDeclOp>("ASSERT_VERBOSE_COND");
+    b.create<sv::MacroDeclOp>("ASSERT_VERBOSE_COND_");
+    b.create<emit::FragmentOp>("ASSERT_VERBOSE_COND_FRAGMENT", [&] {
+      b.create<sv::VerbatimOp>(
+          "\n// Users can define 'ASSERT_VERBOSE_COND' to add an extra "
+          "gate to assert error printing.");
+      emitGuard("ASSERT_VERBOSE_COND_", [&]() {
+        emitGuardedDefine("ASSERT_VERBOSE_COND", "ASSERT_VERBOSE_COND_",
+                          "(`ASSERT_VERBOSE_COND)", "1");
+      });
     });
   }
 
-  if (state.used_STOP_COND) {
-    b.create<sv::VerbatimOp>(
-        "\n// Users can define 'STOP_COND' to add an extra gate "
-        "to stop conditions.");
-    emitGuard("STOP_COND_", [&]() {
-      emitGuardedDefine("STOP_COND", "STOP_COND_", "(`STOP_COND)", "1");
+  if (state.usedStopCond) {
+    b.create<sv::MacroDeclOp>("STOP_COND");
+    b.create<sv::MacroDeclOp>("STOP_COND_");
+    b.create<emit::FragmentOp>("STOP_COND_FRAGMENT", [&] {
+      b.create<sv::VerbatimOp>(
+          "\n// Users can define 'STOP_COND' to add an extra gate "
+          "to stop conditions.");
+      emitGuard("STOP_COND_", [&]() {
+        emitGuardedDefine("STOP_COND", "STOP_COND_", "(`STOP_COND)", "1");
+      });
     });
   }
-
-  // Blank line to separate the header from the modules.
-  b.create<sv::VerbatimOp>("");
 }
 
 LogicalResult
@@ -1030,7 +1123,7 @@ FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
   SmallVector<StringRef, 12> attrNames = {
       "annotations",   "convention",      "layers",
       "portNames",     "sym_name",        "portDirections",
-      "portTypes",     "portAnnotations", "portSyms",
+      "portTypes",     "portAnnotations", "portSymbols",
       "portLocations", "parameters",      SymbolTable::getVisibilityAttrName()};
 
   DenseSet<StringRef> attrSet(attrNames.begin(), attrNames.end());
@@ -1056,9 +1149,11 @@ FIRRTLModuleLowering::lowerModule(FModuleOp oldModule, Block *topLevelModule,
     newModule->setAttr("firrtl.extract.cover.extra", builder.getUnitAttr());
 
   // If this is in the test harness, make sure it goes to the test directory.
+  // Do not update output file information if it is already present.
   if (auto testBenchDir = loweringState.getTestBenchDirectory())
     if (loweringState.isInTestHarness(oldModule)) {
-      newModule->setAttr("output_file", testBenchDir);
+      if (!newModule->hasAttr("output_file"))
+        newModule->setAttr("output_file", testBenchDir);
       newModule->setAttr("firrtl.extract.do_not_extract",
                          builder.getUnitAttr());
       newModule.setCommentAttr(
@@ -1125,7 +1220,7 @@ tryEliminatingConnectsToValue(Value flipValue, Operation *insertPoint,
     // destination.
     if (use.getOperandNumber() != 0)
       return {};
-    if (!isa<ConnectOp, StrictConnectOp>(use.getOwner()))
+    if (!isa<ConnectOp, MatchingConnectOp>(use.getOwner()))
       return {};
 
     // We only support things with a single connect.
@@ -1152,7 +1247,7 @@ tryEliminatingConnectsToValue(Value flipValue, Operation *insertPoint,
   auto connectSrc = connectOp->getOperand(1);
 
   // Directly forward foreign types.
-  if (!connectSrc.getType().isa<FIRRTLType>()) {
+  if (!isa<FIRRTLType>(connectSrc.getType())) {
     connectOp->erase();
     return connectSrc;
   }
@@ -1228,14 +1323,13 @@ LogicalResult FIRRTLModuleLowering::lowerModulePortsAndMoveBody(
 
   // Insert argument casts, and re-vector users in the old body to use them.
   SmallVector<PortInfo> firrtlPorts = oldModule.getPorts();
-  SmallVector<hw::PortInfo> hwPorts = newModule.getPortList();
   assert(oldModule.getBody().getNumArguments() == firrtlPorts.size() &&
          "port count mismatch");
 
   SmallVector<Value, 4> outputs;
 
   // This is the terminator in the new module.
-  auto outputOp = newModule.getBodyBlock()->getTerminator();
+  auto *outputOp = newModule.getBodyBlock()->getTerminator();
   ImplicitLocOpBuilder outputBuilder(oldModule.getLoc(), outputOp);
 
   unsigned nextHWInputArg = 0;
@@ -1299,7 +1393,7 @@ LogicalResult FIRRTLModuleLowering::lowerModulePortsAndMoveBody(
       outputs.push_back(output);
 
       // If output port has symbol, move it to this wire.
-      if (auto sym = hwPorts[hwPortIndex].getSym()) {
+      if (auto sym = newModule.getPort(hwPortIndex).getSym()) {
         newArg.setInnerSymAttr(sym);
         newModule.setPortSymbolAttr(hwPortIndex, {});
       }
@@ -1318,6 +1412,38 @@ LogicalResult FIRRTLModuleLowering::lowerModulePortsAndMoveBody(
   // We are done with our cursor op.
   cursor.erase();
 
+  return success();
+}
+
+/// Run on each `verif.formal` to populate its body based on the original
+/// `firrtl.formal` operation.
+LogicalResult
+FIRRTLModuleLowering::lowerFormalBody(verif::FormalOp formalOp,
+                                      CircuitLoweringState &loweringState) {
+  auto builder = OpBuilder::atBlockEnd(&formalOp.getBody().front());
+
+  // Find the module targeted by the `firrtl.formal` operation. The `FormalOp`
+  // verifier guarantees the module exists and that it is an `FModuleOp`. This
+  // we can then translate to the corresponding `HWModuleOp`.
+  auto oldFormalOp = cast<FormalOp>(loweringState.getOldModule(formalOp));
+  auto moduleName = oldFormalOp.getModuleNameAttr().getAttr();
+  auto oldModule = cast<FModuleOp>(
+      loweringState.getInstanceGraph().lookup(moduleName)->getModule());
+  auto newModule =
+      dyn_cast_or_null<hw::HWModuleOp>(loweringState.getNewModule(oldModule));
+  if (!newModule)
+    return oldFormalOp->emitOpError()
+           << "could not find module " << oldModule.getSymNameAttr();
+
+  // Create a symbolic input for every input of the lowered module.
+  SmallVector<Value> symbolicInputs;
+  for (auto arg : newModule.getBody().getArguments())
+    symbolicInputs.push_back(
+        builder.create<verif::SymbolicValueOp>(arg.getLoc(), arg.getType()));
+
+  // Instantiate the module with the given symbolic inputs.
+  builder.create<hw::InstanceOp>(formalOp.getLoc(), newModule,
+                                 newModule.getNameAttr(), symbolicInputs);
   return success();
 }
 
@@ -1351,6 +1477,7 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   Value getLoweredNonClockValue(Value value);
   Value getLoweredAndExtendedValue(Value value, Type destType);
   Value getLoweredAndExtOrTruncValue(Value value, Type destType);
+  Value getLoweredFmtOperand(Value operand);
   LogicalResult setLowering(Value orig, Value result);
   LogicalResult setPossiblyFoldedLowering(Value orig, Value result);
   template <typename ResultOpType, typename... CtorArgTypes>
@@ -1388,7 +1515,7 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
     return attr;
   }
 
-  void runWithInsertionPointAtEndOfBlock(std::function<void(void)> fn,
+  void runWithInsertionPointAtEndOfBlock(const std::function<void(void)> &fn,
                                          Region &region);
 
   /// Return a read value for the specified inout value, auto-uniquing them.
@@ -1397,15 +1524,18 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   Value getNonClockValue(Value v);
 
   void addToAlwaysBlock(sv::EventControl clockEdge, Value clock,
-                        ::ResetType resetStyle, sv::EventControl resetEdge,
-                        Value reset, std::function<void(void)> body = {},
-                        std::function<void(void)> resetBody = {});
-  void addToAlwaysBlock(Value clock, std::function<void(void)> body = {}) {
-    addToAlwaysBlock(sv::EventControl::AtPosEdge, clock, ::ResetType(),
+                        sv::ResetType resetStyle, sv::EventControl resetEdge,
+                        Value reset, const std::function<void(void)> &body = {},
+                        const std::function<void(void)> &resetBody = {});
+  void addToAlwaysBlock(Value clock,
+                        const std::function<void(void)> &body = {}) {
+    addToAlwaysBlock(sv::EventControl::AtPosEdge, clock, sv::ResetType(),
                      sv::EventControl(), Value(), body,
                      std::function<void(void)>());
   }
 
+  LogicalResult emitGuards(Location loc, ArrayRef<Attribute> guards,
+                           std::function<void(void)> emit);
   void addToIfDefBlock(StringRef cond, std::function<void(void)> thenCtor,
                        std::function<void(void)> elseCtor = {});
   void addToInitialBlock(std::function<void(void)> body);
@@ -1436,7 +1566,11 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   LogicalResult visitExpr(IsTagOp op);
   LogicalResult visitExpr(SubtagOp op);
   LogicalResult visitUnhandledOp(Operation *op) { return failure(); }
-  LogicalResult visitInvalidOp(Operation *op) { return failure(); }
+  LogicalResult visitInvalidOp(Operation *op) {
+    if (auto castOp = dyn_cast<mlir::UnrealizedConversionCastOp>(op))
+      return visitUnrealizedConversionCast(castOp);
+    return failure();
+  }
 
   // Declarations.
   LogicalResult visitDecl(WireOp op);
@@ -1444,8 +1578,9 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
   LogicalResult visitDecl(RegOp op);
   LogicalResult visitDecl(RegResetOp op);
   LogicalResult visitDecl(MemOp op);
-  LogicalResult visitDecl(InstanceOp op);
+  LogicalResult visitDecl(InstanceOp oldInstance);
   LogicalResult visitDecl(VerbatimWireOp op);
+  LogicalResult visitDecl(ContractOp op);
 
   // Unary Ops.
   LogicalResult lowerNoopCast(Operation *op);
@@ -1456,7 +1591,8 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
 
   LogicalResult visitExpr(HWStructCastOp op);
   LogicalResult visitExpr(BitCastOp op);
-  LogicalResult visitExpr(mlir::UnrealizedConversionCastOp op);
+  LogicalResult
+  visitUnrealizedConversionCast(mlir::UnrealizedConversionCastOp op);
   LogicalResult visitExpr(CvtPrimOp op);
   LogicalResult visitExpr(NotPrimOp op);
   LogicalResult visitExpr(NegPrimOp op);
@@ -1533,27 +1669,38 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
     return lowerDivLikeOp<comb::ModSOp, comb::ModUOp>(op);
   }
 
-  // Verif Operations
+  // Intrinsic Operations
   LogicalResult visitExpr(IsXIntrinsicOp op);
   LogicalResult visitExpr(PlusArgsTestIntrinsicOp op);
   LogicalResult visitExpr(PlusArgsValueIntrinsicOp op);
-  LogicalResult visitExpr(FPGAProbeIntrinsicOp op);
+  LogicalResult visitStmt(FPGAProbeIntrinsicOp op);
   LogicalResult visitExpr(ClockInverterIntrinsicOp op);
+  LogicalResult visitExpr(ClockDividerIntrinsicOp op);
   LogicalResult visitExpr(SizeOfIntrinsicOp op);
   LogicalResult visitExpr(ClockGateIntrinsicOp op);
   LogicalResult visitExpr(LTLAndIntrinsicOp op);
   LogicalResult visitExpr(LTLOrIntrinsicOp op);
+  LogicalResult visitExpr(LTLIntersectIntrinsicOp op);
   LogicalResult visitExpr(LTLDelayIntrinsicOp op);
   LogicalResult visitExpr(LTLConcatIntrinsicOp op);
+  LogicalResult visitExpr(LTLRepeatIntrinsicOp op);
+  LogicalResult visitExpr(LTLGoToRepeatIntrinsicOp op);
+  LogicalResult visitExpr(LTLNonConsecutiveRepeatIntrinsicOp op);
   LogicalResult visitExpr(LTLNotIntrinsicOp op);
   LogicalResult visitExpr(LTLImplicationIntrinsicOp op);
+  LogicalResult visitExpr(LTLUntilIntrinsicOp op);
   LogicalResult visitExpr(LTLEventuallyIntrinsicOp op);
   LogicalResult visitExpr(LTLClockIntrinsicOp op);
-  LogicalResult visitExpr(LTLDisableIntrinsicOp op);
+
+  template <typename TargetOp, typename IntrinsicOp>
+  LogicalResult lowerVerifIntrinsicOp(IntrinsicOp op);
   LogicalResult visitStmt(VerifAssertIntrinsicOp op);
   LogicalResult visitStmt(VerifAssumeIntrinsicOp op);
   LogicalResult visitStmt(VerifCoverIntrinsicOp op);
+  LogicalResult visitStmt(VerifRequireIntrinsicOp op);
+  LogicalResult visitStmt(VerifEnsureIntrinsicOp op);
   LogicalResult visitExpr(HasBeenResetIntrinsicOp op);
+  LogicalResult visitStmt(UnclockedAssumeIntrinsicOp op);
 
   // Other Operations
   LogicalResult visitExpr(BitsPrimOp op);
@@ -1589,7 +1736,7 @@ struct FIRRTLLowering : public FIRRTLVisitor<FIRRTLLowering, LogicalResult> {
 
   FailureOr<bool> lowerConnect(Value dest, Value srcVal);
   LogicalResult visitStmt(ConnectOp op);
-  LogicalResult visitStmt(StrictConnectOp op);
+  LogicalResult visitStmt(MatchingConnectOp op);
   LogicalResult visitStmt(ForceOp op);
   LogicalResult visitStmt(PrintFOp op);
   LogicalResult visitStmt(StopOp op);
@@ -1650,7 +1797,7 @@ private:
   // We auto-unique graph-level blocks to reduce the amount of generated
   // code and ensure that side effects are properly ordered in FIRRTL.
   using AlwaysKeyType = std::tuple<Block *, sv::EventControl, Value,
-                                   ::ResetType, sv::EventControl, Value>;
+                                   sv::ResetType, sv::EventControl, Value>;
   llvm::SmallDenseMap<AlwaysKeyType, std::pair<sv::AlwaysOp, sv::IfOp>>
       alwaysBlocks;
   llvm::SmallDenseMap<std::pair<Block *, Attribute>, sv::IfDefOp> ifdefBlocks;
@@ -1691,6 +1838,19 @@ private:
   /// the LTL ops, which were necessary to go from the def-before-use FIRRTL
   /// dialect to the graph-like HW dialect.
   SetVector<Operation *> ltlOpFixupWorklist;
+
+  /// A worklist of operation ranges to be lowered. Parnet operations can push
+  /// their nested operations onto this worklist to be processed after the
+  /// parent operation has handled the region, blocks, and block arguments.
+  SmallVector<std::pair<Block::iterator, Block::iterator>> worklist;
+
+  void addToWorklist(Block &block) {
+    worklist.push_back({block.begin(), block.end()});
+  }
+  void addToWorklist(Region &region) {
+    for (auto &block : llvm::reverse(region))
+      addToWorklist(block);
+  }
 };
 } // end anonymous namespace
 
@@ -1701,28 +1861,39 @@ LogicalResult FIRRTLModuleLowering::lowerModuleOperations(
 
 // This is the main entrypoint for the lowering pass.
 LogicalResult FIRRTLLowering::run() {
-  // FIRRTL FModule is a single block because FIRRTL ops are a DAG.  Walk
-  // through each operation, lowering each in turn if we can, introducing
-  // casts if we cannot.
-  auto &body = theModule.getBody();
+  // Mark the module's block arguments are already lowered. This will allow
+  // `getLoweredValue` to return the block arguments as they are.
+  for (auto arg : theModule.getBodyBlock()->getArguments())
+    if (failed(setLowering(arg, arg)))
+      return failure();
 
+  // Add the operations in the body to the worklist and lower all operations
+  // until the worklist is empty. Operations may push their own nested
+  // operations onto the worklist to lower them in turn. The `builder` is
+  // positioned ahead of each operation as it is being lowered.
+  addToWorklist(theModule.getBody());
   SmallVector<Operation *, 16> opsToRemove;
 
-  // Iterate through each operation in the module body, attempting to lower
-  // each of them.  We maintain 'builder' for each invocation.
-  for (auto &op : body.front().getOperations()) {
-    builder.setInsertionPoint(&op);
-    builder.setLoc(op.getLoc());
-    auto done = succeeded(dispatchVisitor(&op));
-    circuitState.processRemainingAnnotations(&op, AnnotationSet(&op));
+  while (!worklist.empty()) {
+    auto &[opsIt, opsEnd] = worklist.back();
+    if (opsIt == opsEnd) {
+      worklist.pop_back();
+      continue;
+    }
+    Operation *op = &*opsIt++;
+
+    builder.setInsertionPoint(op);
+    builder.setLoc(op->getLoc());
+    auto done = succeeded(dispatchVisitor(op));
+    circuitState.processRemainingAnnotations(op, AnnotationSet(op));
     if (done)
-      opsToRemove.push_back(&op);
+      opsToRemove.push_back(op);
     else {
-      switch (handleUnloweredOp(&op)) {
+      switch (handleUnloweredOp(op)) {
       case AlreadyLowered:
         break;         // Something like hw.output, which is already lowered.
       case NowLowered: // Something handleUnloweredOp removed.
-        opsToRemove.push_back(&op);
+        opsToRemove.push_back(op);
         break;
       case LoweringFailure:
         backedgeBuilder.abandon();
@@ -1756,7 +1927,7 @@ LogicalResult FIRRTLLowering::run() {
         return failure();
       }
       // If the value is not another backedge, we have found the driver.
-      auto it = backedges.find(value);
+      auto *it = backedges.find(value);
       if (it == backedges.end())
         break;
       // Find what is driving the next backedge.
@@ -1783,7 +1954,7 @@ LogicalResult FIRRTLLowering::run() {
       if (!isZeroBitFIRRTLType(result.getType()))
         continue;
       if (!zeroI0) {
-        auto builder = OpBuilder::atBlockBegin(&body.front());
+        auto builder = OpBuilder::atBlockBegin(theModule.getBodyBlock());
         zeroI0 = builder.create<hw::ConstantOp>(op->getLoc(),
                                                 builder.getIntegerType(0), 0);
         maybeUnusedValues.insert(zeroI0);
@@ -1897,7 +2068,7 @@ Attribute FIRRTLLowering::getOrCreateAggregateConstantAttribute(Attribute value,
 /// helper function invokes the closure specified if the operand was actually
 /// zero bit, or returns failure() if it was some other kind of failure.
 static LogicalResult handleZeroBit(Value failedOperand,
-                                   std::function<LogicalResult()> fn) {
+                                   const std::function<LogicalResult()> &fn) {
   assert(failedOperand && "Should be called on the failed operand");
   if (!isZeroBitFIRRTLType(failedOperand.getType()))
     return failure();
@@ -1932,13 +2103,9 @@ Value FIRRTLLowering::getOrCreateZConstant(Type type) {
 /// unknown width integers.  This returns hw::inout type values if present, it
 /// does not implicitly read from them.
 Value FIRRTLLowering::getPossiblyInoutLoweredValue(Value value) {
-  // Block arguments are considered lowered.
-  if (value.isa<BlockArgument>())
-    return value;
-
   // If we lowered this value, then return the lowered value, otherwise fail.
   if (auto lowering = valueMapping.lookup(value)) {
-    assert(!lowering.getType().isa<FIRRTLType>() &&
+    assert(!isa<FIRRTLType>(lowering.getType()) &&
            "Lowered value should be a non-FIRRTL value");
     return lowering;
   }
@@ -1955,7 +2122,7 @@ Value FIRRTLLowering::getLoweredValue(Value value) {
 
   // If we got an inout value, implicitly read it.  FIRRTL allows direct use
   // of wires and other things that lower to inout type.
-  if (result.getType().isa<hw::InOutType>())
+  if (isa<hw::InOutType>(result.getType()))
     return getReadValue(result);
 
   return result;
@@ -2115,7 +2282,7 @@ Value FIRRTLLowering::getLoweredAndExtendedValue(Value value, Type destType) {
     }
   }
   // Aggregates values
-  if (result.getType().isa<hw::ArrayType, hw::StructType>()) {
+  if (isa<hw::ArrayType, hw::StructType>(result.getType())) {
     // Types already match.
     if (destType == value.getType())
       return result;
@@ -2126,7 +2293,7 @@ Value FIRRTLLowering::getLoweredAndExtendedValue(Value value, Type destType) {
         /* allowTruncate */ false);
   }
 
-  if (result.getType().isa<seq::ClockType>()) {
+  if (isa<seq::ClockType>(result.getType())) {
     // Types already match.
     if (destType == value.getType())
       return result;
@@ -2193,7 +2360,7 @@ Value FIRRTLLowering::getLoweredAndExtOrTruncValue(Value value, Type destType) {
   }
 
   // Aggregates values
-  if (result.getType().isa<hw::ArrayType, hw::StructType>()) {
+  if (isa<hw::ArrayType, hw::StructType>(result.getType())) {
     // Types already match.
     if (destType == value.getType())
       return result;
@@ -2226,6 +2393,28 @@ Value FIRRTLLowering::getLoweredAndExtOrTruncValue(Value value, Type destType) {
 
   auto zero = getOrCreateIntConstant(destWidth - srcWidth, 0);
   return builder.createOrFold<comb::ConcatOp>(zero, result);
+}
+
+/// Return a lowered version of 'operand' suitable for use with substitution /
+/// format strings. Zero bit operands are rewritten as one bit zeros and signed
+/// integers are wrapped in $signed().
+Value FIRRTLLowering::getLoweredFmtOperand(Value operand) {
+  auto loweredValue = getLoweredValue(operand);
+  if (!loweredValue) {
+    // If this is a zero bit operand, just pass a one bit zero.
+    if (!isZeroBitFIRRTLType(operand.getType()))
+      return nullptr;
+    loweredValue = getOrCreateIntConstant(1, 0);
+  }
+
+  // If the operand was an SInt, we want to give the user the option to print
+  // it as signed decimal and have to wrap it in $signed().
+  if (auto intTy = firrtl::type_cast<IntType>(operand.getType()))
+    if (intTy.isSigned())
+      loweredValue = builder.create<sv::SystemFunctionOp>(
+          loweredValue.getType(), "signed", loweredValue);
+
+  return loweredValue;
 }
 
 /// Set the lowered value of 'orig' to 'result', remembering this in a map.
@@ -2349,7 +2538,7 @@ bool FIRRTLLowering::updateIfBackedge(Value dest, Value src) {
 /// where the closure is null, but the caller needs to make sure the block
 /// exists.
 void FIRRTLLowering::runWithInsertionPointAtEndOfBlock(
-    std::function<void(void)> fn, Region &region) {
+    const std::function<void(void)> &fn, Region &region) {
   if (!fn)
     return;
 
@@ -2402,11 +2591,11 @@ Value FIRRTLLowering::getNonClockValue(Value v) {
   return it.first->second;
 }
 
-void FIRRTLLowering::addToAlwaysBlock(sv::EventControl clockEdge, Value clock,
-                                      ::ResetType resetStyle,
-                                      sv::EventControl resetEdge, Value reset,
-                                      std::function<void(void)> body,
-                                      std::function<void(void)> resetBody) {
+void FIRRTLLowering::addToAlwaysBlock(
+    sv::EventControl clockEdge, Value clock, sv::ResetType resetStyle,
+    sv::EventControl resetEdge, Value reset,
+    const std::function<void(void)> &body,
+    const std::function<void(void)> &resetBody) {
   AlwaysKeyType key{builder.getBlock(), clockEdge, clock,
                     resetStyle,         resetEdge, reset};
   sv::AlwaysOp alwaysOp;
@@ -2415,7 +2604,7 @@ void FIRRTLLowering::addToAlwaysBlock(sv::EventControl clockEdge, Value clock,
 
   if (!alwaysOp) {
     if (reset) {
-      assert(resetStyle != ::ResetType::NoReset);
+      assert(resetStyle != sv::ResetType::NoReset);
       // Here, we want to create the folloing structure with sv.always and
       // sv.if. If `reset` is async, we need to add `reset` to a sensitivity
       // list.
@@ -2434,7 +2623,7 @@ void FIRRTLLowering::addToAlwaysBlock(sv::EventControl clockEdge, Value clock,
         insideIfOp = builder.create<sv::IfOp>(
             reset, []() {}, []() {});
       };
-      if (resetStyle == ::ResetType::AsyncReset) {
+      if (resetStyle == sv::ResetType::AsyncReset) {
         sv::EventControl events[] = {clockEdge, resetEdge};
         Value clocks[] = {clock, reset};
 
@@ -2467,6 +2656,27 @@ void FIRRTLLowering::addToAlwaysBlock(sv::EventControl clockEdge, Value clock,
   // defined ahead of the uses, which leads to better generated Verilog.
   alwaysOp->moveBefore(builder.getInsertionBlock(),
                        builder.getInsertionPoint());
+}
+
+LogicalResult FIRRTLLowering::emitGuards(Location loc,
+                                         ArrayRef<Attribute> guards,
+                                         std::function<void(void)> emit) {
+  if (guards.empty()) {
+    emit();
+    return success();
+  }
+  auto guard = dyn_cast<StringAttr>(guards[0]);
+  if (!guard)
+    return mlir::emitError(loc,
+                           "elements in `guards` array must be `StringAttr`");
+
+  // Record the guard macro to emit a declaration for it.
+  circuitState.addMacroDecl(builder.getStringAttr(guard.getValue()));
+  LogicalResult result = LogicalResult::failure();
+  addToIfDefBlock(guard.getValue(), [&]() {
+    result = emitGuards(loc, guards.drop_front(), emit);
+  });
+  return result;
 }
 
 void FIRRTLLowering::addToIfDefBlock(StringRef cond,
@@ -2531,11 +2741,20 @@ void FIRRTLLowering::addIfProceduralBlock(Value cond,
 ///
 FIRRTLLowering::UnloweredOpResult
 FIRRTLLowering::handleUnloweredOp(Operation *op) {
+  // FIRRTL operations must explicitly handle their regions.
+  if (!op->getRegions().empty() && isa<FIRRTLDialect>(op->getDialect())) {
+    op->emitOpError("must explicitly handle its regions");
+    return LoweringFailure;
+  }
+
   // Simply pass through non-FIRRTL operations and consider them already
   // lowered. This allows us to handled partially lowered inputs, and also allow
   // other FIRRTL operations to spawn additional already-lowered operations,
   // like `hw.output`.
   if (!isa<FIRRTLDialect>(op->getDialect())) {
+    // Push nested operations onto the worklist such that they are lowered.
+    for (auto &region : op->getRegions())
+      addToWorklist(region);
     for (auto &operand : op->getOpOperands())
       if (auto lowered = getPossiblyInoutLoweredValue(operand.get()))
         operand.set(lowered);
@@ -2577,7 +2796,7 @@ LogicalResult FIRRTLLowering::visitExpr(ConstantOp op) {
 
 LogicalResult FIRRTLLowering::visitExpr(SpecialConstantOp op) {
   Value cst;
-  if (op.getType().isa<ClockType>()) {
+  if (isa<ClockType>(op.getType())) {
     cst = getOrCreateClockConstant(op.getValue() ? seq::ClockConst::High
                                                  : seq::ClockConst::Low);
   } else {
@@ -2596,11 +2815,12 @@ FailureOr<Value> FIRRTLLowering::lowerSubindex(SubindexOp op, Value input) {
   // If the input has an inout type, we need to lower to ArrayIndexInOutOp;
   // otherwise hw::ArrayGetOp.
   Value result;
-  if (input.getType().isa<sv::InOutType>())
+  if (isa<sv::InOutType>(input.getType()))
     result = builder.createOrFold<sv::ArrayIndexInOutOp>(input, iIdx);
   else
     result = builder.createOrFold<hw::ArrayGetOp>(input, iIdx);
-  tryCopyName(result.getDefiningOp(), op);
+  if (auto *definingOp = result.getDefiningOp())
+    tryCopyName(definingOp, op);
   return result;
 }
 
@@ -2619,11 +2839,12 @@ FailureOr<Value> FIRRTLLowering::lowerSubaccess(SubaccessOp op, Value input) {
   // If the input has an inout type, we need to lower to ArrayIndexInOutOp;
   // otherwise, lower the op to array indexing.
   Value result;
-  if (input.getType().isa<sv::InOutType>())
+  if (isa<sv::InOutType>(input.getType()))
     result = builder.createOrFold<sv::ArrayIndexInOutOp>(input, valueIdx);
   else
     result = createArrayIndexing(input, valueIdx);
-  tryCopyName(result.getDefiningOp(), op);
+  if (auto *definingOp = result.getDefiningOp())
+    tryCopyName(definingOp, op);
   return result;
 }
 
@@ -2639,11 +2860,12 @@ FailureOr<Value> FIRRTLLowering::lowerSubfield(SubfieldOp op, Value input) {
   auto field = firrtl::type_cast<BundleType>(op.getInput().getType())
                    .getElementName(op.getFieldIndex());
   Value result;
-  if (input.getType().isa<sv::InOutType>())
+  if (isa<sv::InOutType>(input.getType()))
     result = builder.createOrFold<sv::StructFieldInOutOp>(input, field);
   else
     result = builder.createOrFold<hw::StructExtractOp>(input, field);
-  tryCopyName(result.getDefiningOp(), op);
+  if (auto *definingOp = result.getDefiningOp())
+    tryCopyName(definingOp, op);
   return result;
 }
 
@@ -2790,8 +3012,12 @@ LogicalResult FIRRTLLowering::visitDecl(WireOp op) {
   if (!resultType)
     return failure();
 
-  if (resultType.isInteger(0))
+  if (resultType.isInteger(0)) {
+    if (op.getInnerSym())
+      return op.emitError("zero width wire is referenced by name [")
+             << *op.getInnerSym() << "] (e.g. in an XMR) but must be removed";
     return setLowering(op.getResult(), Value());
+  }
 
   // Name attr is required on sv.wire but optional on firrtl.wire.
   auto innerSym = lowerInnerSymbol(op);
@@ -2833,8 +3059,14 @@ LogicalResult FIRRTLLowering::visitDecl(VerbatimWireOp op) {
 LogicalResult FIRRTLLowering::visitDecl(NodeOp op) {
   auto operand = getLoweredValue(op.getInput());
   if (!operand)
-    return handleZeroBit(
-        op.getInput(), [&]() { return setLowering(op.getResult(), Value()); });
+    return handleZeroBit(op.getInput(), [&]() -> LogicalResult {
+      if (op.getInnerSym())
+        return op.emitError("zero width node is referenced by name [")
+               << *op.getInnerSym()
+               << "] (e.g. in an XMR) but must be "
+                  "removed";
+      return setLowering(op.getResult(), Value());
+    });
 
   // Node operations are logical noops, but may carry annotations or be
   // referred to through an inner name. If a don't touch is present, ensure
@@ -2981,8 +3213,7 @@ LogicalResult FIRRTLLowering::visitDecl(MemOp op) {
 
     auto addInput = [&](StringRef field, Value backedge) {
       for (auto a : getAllFieldAccesses(op.getResult(i), field)) {
-        if (a.getType()
-                .cast<FIRRTLBaseType>()
+        if (cast<FIRRTLBaseType>(a.getType())
                 .getPassiveType()
                 .getBitWidthOrSentinel() > 0)
           (void)setLowering(a, backedge);
@@ -3063,7 +3294,7 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
   Operation *oldModule =
       oldInstance.getReferencedModule(circuitState.getInstanceGraph());
 
-  auto newModule = circuitState.getNewModule(oldModule);
+  auto *newModule = circuitState.getNewModule(oldModule);
   if (!newModule) {
     oldInstance->emitOpError("could not find module [")
         << oldInstance.getModuleName() << "] referenced by instance";
@@ -3167,7 +3398,7 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
       newModule, oldInstance.getNameAttr(), operands, parameters, innerSym);
 
   if (oldInstance.getLowerToBind())
-    newInstance->setAttr("doNotPrint", builder.getBoolAttr(true));
+    newInstance.setDoNotPrintAttr(builder.getUnitAttr());
 
   if (newInstance.getInnerSymAttr())
     if (auto forceName = circuitState.instanceForceNames.lookup(
@@ -3189,6 +3420,37 @@ LogicalResult FIRRTLLowering::visitDecl(InstanceOp oldInstance) {
     (void)setLowering(oldPortResult, resultVal);
     ++resultNo;
   }
+  return success();
+}
+
+LogicalResult FIRRTLLowering::visitDecl(ContractOp oldOp) {
+  SmallVector<Value> inputs;
+  SmallVector<Type> types;
+  for (auto input : oldOp.getInputs()) {
+    auto lowered = getLoweredValue(input);
+    if (!lowered)
+      return failure();
+    inputs.push_back(lowered);
+    types.push_back(lowered.getType());
+  }
+
+  auto newOp = builder.create<verif::ContractOp>(types, inputs);
+  newOp->setDiscardableAttrs(oldOp->getDiscardableAttrDictionary());
+  auto &body = newOp.getBody().emplaceBlock();
+
+  for (auto [newResult, oldResult, oldArg] :
+       llvm::zip(newOp.getResults(), oldOp.getResults(),
+                 oldOp.getBody().getArguments())) {
+    if (failed(setLowering(oldResult, newResult)))
+      return failure();
+    if (failed(setLowering(oldArg, newResult)))
+      return failure();
+  }
+
+  body.getOperations().splice(body.end(),
+                              oldOp.getBody().front().getOperations());
+  addToWorklist(body);
+
   return success();
 }
 
@@ -3224,7 +3486,8 @@ LogicalResult FIRRTLLowering::visitExpr(AsClockPrimOp op) {
   return setLoweringTo<seq::ToClockOp>(op, getLoweredValue(op.getInput()));
 }
 
-LogicalResult FIRRTLLowering::visitExpr(mlir::UnrealizedConversionCastOp op) {
+LogicalResult FIRRTLLowering::visitUnrealizedConversionCast(
+    mlir::UnrealizedConversionCastOp op) {
   // General lowering for non-unary casts.
   if (op.getNumOperands() != 1 || op.getNumResults() != 1)
     return failure();
@@ -3247,8 +3510,8 @@ LogicalResult FIRRTLLowering::visitExpr(mlir::UnrealizedConversionCastOp op) {
 
   // FIRRTL -> other
   // Otherwise must be a conversion from FIRRTL type to standard type.
-  auto lowered_result = getLoweredValue(operand);
-  if (!lowered_result) {
+  auto loweredResult = getLoweredValue(operand);
+  if (!loweredResult) {
     // If this is a conversion from a zero bit HW type to firrtl value, then
     // we want to successfully lower this to a null Value.
     if (operand.getType().isSignlessInteger(0)) {
@@ -3259,14 +3522,14 @@ LogicalResult FIRRTLLowering::visitExpr(mlir::UnrealizedConversionCastOp op) {
 
   // We lower builtin.unrealized_conversion_cast converting from a firrtl type
   // to a standard type into the lowered operand.
-  result.replaceAllUsesWith(lowered_result);
+  result.replaceAllUsesWith(loweredResult);
   return success();
 }
 
 LogicalResult FIRRTLLowering::visitExpr(HWStructCastOp op) {
   // Conversions from hw struct types to FIRRTL types are lowered as the
   // input operand.
-  if (auto opStructType = op.getOperand().getType().dyn_cast<hw::StructType>())
+  if (auto opStructType = dyn_cast<hw::StructType>(op.getOperand().getType()))
     return setLowering(op, op.getOperand());
 
   // Otherwise must be a conversion from FIRRTL bundle type to hw struct
@@ -3496,7 +3759,8 @@ LogicalResult FIRRTLLowering::lowerDivLikeOp(Operation *op) {
   else
     result = builder.createOrFold<UnsignedOp>(lhs, rhs, true);
 
-  tryCopyName(result.getDefiningOp(), op);
+  if (auto *definingOp = result.getDefiningOp())
+    tryCopyName(definingOp, op);
 
   if (resultType == opType)
     return setLowering(op->getResult(0), result);
@@ -3531,12 +3795,20 @@ LogicalResult FIRRTLLowering::visitExpr(IsXIntrinsicOp op) {
   if (!input)
     return failure();
 
+  if (!isa<IntType>(input.getType())) {
+    auto srcType = op.getArg().getType();
+    auto bitwidth = firrtl::getBitWidth(type_cast<FIRRTLBaseType>(srcType));
+    assert(bitwidth && "Unknown width");
+    auto intType = builder.getIntegerType(*bitwidth);
+    input = builder.createOrFold<hw::BitcastOp>(intType, input);
+  }
+
   return setLoweringTo<comb::ICmpOp>(
       op, ICmpPredicate::ceq, input,
       getOrCreateXConstant(input.getType().getIntOrFloatBitWidth()), true);
 }
 
-LogicalResult FIRRTLLowering::visitExpr(FPGAProbeIntrinsicOp op) {
+LogicalResult FIRRTLLowering::visitStmt(FPGAProbeIntrinsicOp op) {
   auto operand = getLoweredValue(op.getInput());
   builder.create<hw::WireOp>(operand);
   return success();
@@ -3580,6 +3852,11 @@ LogicalResult FIRRTLLowering::visitExpr(ClockInverterIntrinsicOp op) {
   return setLoweringTo<seq::ClockInverterOp>(op, operand);
 }
 
+LogicalResult FIRRTLLowering::visitExpr(ClockDividerIntrinsicOp op) {
+  auto operand = getLoweredValue(op.getInput());
+  return setLoweringTo<seq::ClockDividerOp>(op, operand, op.getPow2());
+}
+
 LogicalResult FIRRTLLowering::visitExpr(LTLAndIntrinsicOp op) {
   return setLoweringToLTL<ltl::AndOp>(
       op,
@@ -3588,6 +3865,12 @@ LogicalResult FIRRTLLowering::visitExpr(LTLAndIntrinsicOp op) {
 
 LogicalResult FIRRTLLowering::visitExpr(LTLOrIntrinsicOp op) {
   return setLoweringToLTL<ltl::OrOp>(
+      op,
+      ValueRange{getLoweredValue(op.getLhs()), getLoweredValue(op.getRhs())});
+}
+
+LogicalResult FIRRTLLowering::visitExpr(LTLIntersectIntrinsicOp op) {
+  return setLoweringToLTL<ltl::IntersectOp>(
       op,
       ValueRange{getLoweredValue(op.getLhs()), getLoweredValue(op.getRhs())});
 }
@@ -3603,12 +3886,33 @@ LogicalResult FIRRTLLowering::visitExpr(LTLConcatIntrinsicOp op) {
       ValueRange{getLoweredValue(op.getLhs()), getLoweredValue(op.getRhs())});
 }
 
+LogicalResult FIRRTLLowering::visitExpr(LTLRepeatIntrinsicOp op) {
+  return setLoweringToLTL<ltl::RepeatOp>(op, getLoweredValue(op.getInput()),
+                                         op.getBaseAttr(), op.getMoreAttr());
+}
+
+LogicalResult FIRRTLLowering::visitExpr(LTLGoToRepeatIntrinsicOp op) {
+  return setLoweringToLTL<ltl::GoToRepeatOp>(
+      op, getLoweredValue(op.getInput()), op.getBaseAttr(), op.getMoreAttr());
+}
+
+LogicalResult FIRRTLLowering::visitExpr(LTLNonConsecutiveRepeatIntrinsicOp op) {
+  return setLoweringToLTL<ltl::NonConsecutiveRepeatOp>(
+      op, getLoweredValue(op.getInput()), op.getBaseAttr(), op.getMoreAttr());
+}
+
 LogicalResult FIRRTLLowering::visitExpr(LTLNotIntrinsicOp op) {
   return setLoweringToLTL<ltl::NotOp>(op, getLoweredValue(op.getInput()));
 }
 
 LogicalResult FIRRTLLowering::visitExpr(LTLImplicationIntrinsicOp op) {
   return setLoweringToLTL<ltl::ImplicationOp>(
+      op,
+      ValueRange{getLoweredValue(op.getLhs()), getLoweredValue(op.getRhs())});
+}
+
+LogicalResult FIRRTLLowering::visitExpr(LTLUntilIntrinsicOp op) {
+  return setLoweringToLTL<ltl::UntilOp>(
       op,
       ValueRange{getLoweredValue(op.getLhs()), getLoweredValue(op.getRhs())});
 }
@@ -3624,28 +3928,36 @@ LogicalResult FIRRTLLowering::visitExpr(LTLClockIntrinsicOp op) {
                                         getLoweredNonClockValue(op.getClock()));
 }
 
-LogicalResult FIRRTLLowering::visitExpr(LTLDisableIntrinsicOp op) {
-  return setLoweringToLTL<ltl::DisableOp>(
-      op,
-      ValueRange{getLoweredValue(op.getLhs()), getLoweredValue(op.getRhs())});
+template <typename TargetOp, typename IntrinsicOp>
+LogicalResult FIRRTLLowering::lowerVerifIntrinsicOp(IntrinsicOp op) {
+  auto property = getLoweredValue(op.getProperty());
+  auto enable = op.getEnable() ? getLoweredValue(op.getEnable()) : Value();
+  builder.create<TargetOp>(property, enable, op.getLabelAttr());
+  return success();
 }
 
 LogicalResult FIRRTLLowering::visitStmt(VerifAssertIntrinsicOp op) {
-  builder.create<verif::AssertOp>(getLoweredValue(op.getProperty()),
-                                  op.getLabelAttr());
-  return success();
+  return lowerVerifIntrinsicOp<verif::AssertOp>(op);
 }
 
 LogicalResult FIRRTLLowering::visitStmt(VerifAssumeIntrinsicOp op) {
-  builder.create<verif::AssumeOp>(getLoweredValue(op.getProperty()),
-                                  op.getLabelAttr());
-  return success();
+  return lowerVerifIntrinsicOp<verif::AssumeOp>(op);
 }
 
 LogicalResult FIRRTLLowering::visitStmt(VerifCoverIntrinsicOp op) {
-  builder.create<verif::CoverOp>(getLoweredValue(op.getProperty()),
-                                 op.getLabelAttr());
-  return success();
+  return lowerVerifIntrinsicOp<verif::CoverOp>(op);
+}
+
+LogicalResult FIRRTLLowering::visitStmt(VerifRequireIntrinsicOp op) {
+  if (!isa<verif::ContractOp>(op->getParentOp()))
+    return lowerVerifIntrinsicOp<verif::AssertOp>(op);
+  return lowerVerifIntrinsicOp<verif::RequireOp>(op);
+}
+
+LogicalResult FIRRTLLowering::visitStmt(VerifEnsureIntrinsicOp op) {
+  if (!isa<verif::ContractOp>(op->getParentOp()))
+    return lowerVerifIntrinsicOp<verif::AssertOp>(op);
+  return lowerVerifIntrinsicOp<verif::EnsureOp>(op);
 }
 
 LogicalResult FIRRTLLowering::visitExpr(HasBeenResetIntrinsicOp op) {
@@ -3787,7 +4099,7 @@ LogicalResult FIRRTLLowering::visitExpr(MuxPrimOp op) {
   if (!cond || !ifTrue || !ifFalse)
     return failure();
 
-  if (op.getType().isa<ClockType>())
+  if (isa<ClockType>(op.getType()))
     return setLoweringTo<seq::ClockMuxOp>(op, cond, ifTrue, ifFalse);
   return setLoweringTo<comb::MuxOp>(op, ifTrue.getType(), cond, ifTrue, ifFalse,
                                     true);
@@ -4033,14 +4345,14 @@ LogicalResult FIRRTLLowering::visitStmt(ConnectOp op) {
   if (updateIfBackedge(destVal, srcVal))
     return success();
 
-  if (!destVal.getType().isa<hw::InOutType>())
+  if (!isa<hw::InOutType>(destVal.getType()))
     return op.emitError("destination isn't an inout type");
 
   builder.create<sv::AssignOp>(destVal, srcVal);
   return success();
 }
 
-LogicalResult FIRRTLLowering::visitStmt(StrictConnectOp op) {
+LogicalResult FIRRTLLowering::visitStmt(MatchingConnectOp op) {
   auto dest = op.getDest();
   auto srcVal = getLoweredValue(op.getSrc());
   if (!srcVal)
@@ -4061,7 +4373,7 @@ LogicalResult FIRRTLLowering::visitStmt(StrictConnectOp op) {
   if (updateIfBackedge(destVal, srcVal))
     return success();
 
-  if (!destVal.getType().isa<hw::InOutType>())
+  if (!isa<hw::InOutType>(destVal.getType()))
     return op.emitError("destination isn't an inout type");
 
   builder.create<sv::AssignOp>(destVal, srcVal);
@@ -4077,10 +4389,11 @@ LogicalResult FIRRTLLowering::visitStmt(ForceOp op) {
   if (!destVal)
     return failure();
 
-  if (!destVal.getType().isa<hw::InOutType>())
+  if (!isa<hw::InOutType>(destVal.getType()))
     return op.emitError("destination isn't an inout type");
 
   // #ifndef SYNTHESIS
+  circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToInitialBlock([&]() { builder.create<sv::ForceOp>(destVal, srcVal); });
   });
@@ -4099,6 +4412,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefForceOp op) {
     return failure();
 
   // #ifndef SYNTHESIS
+  circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToAlwaysBlock(clock, [&]() {
       addIfProceduralBlock(
@@ -4118,6 +4432,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefForceInitialOp op) {
     return failure();
 
   // #ifndef SYNTHESIS
+  circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToInitialBlock([&]() {
       addIfProceduralBlock(
@@ -4137,6 +4452,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefReleaseOp op) {
     return failure();
 
   // #ifndef SYNTHESIS
+  circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToAlwaysBlock(clock, [&]() {
       addIfProceduralBlock(pred,
@@ -4152,6 +4468,7 @@ LogicalResult FIRRTLLowering::visitStmt(RefReleaseInitialOp op) {
     return failure();
 
   // #ifndef SYNTHESIS
+  circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToInitialBlock([&]() {
       addIfProceduralBlock(pred,
@@ -4172,19 +4489,19 @@ LogicalResult FIRRTLLowering::visitStmt(PrintFOp op) {
   SmallVector<Value, 4> operands;
   operands.reserve(op.getSubstitutions().size());
   for (auto operand : op.getSubstitutions()) {
-    operands.push_back(getLoweredValue(operand));
-    if (!operands.back()) {
-      // If this is a zero bit operand, just pass a one bit zero.
-      if (!isZeroBitFIRRTLType(operand.getType()))
-        return failure();
-      operands.back() = getOrCreateIntConstant(1, 0);
-    }
+    Value loweredValue = getLoweredFmtOperand(operand);
+    if (!loweredValue)
+      return failure();
+    operands.push_back(loweredValue);
   }
 
   // Emit an "#ifndef SYNTHESIS" guard into the always block.
+  circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
   addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
     addToAlwaysBlock(clock, [&]() {
-      circuitState.used_PRINTF_COND = true;
+      circuitState.usedPrintf = true;
+      circuitState.addFragment(theModule, "PRINTF_FD_FRAGMENT");
+      circuitState.addFragment(theModule, "PRINTF_COND_FRAGMENT");
 
       // Emit an "sv.if '`PRINTF_COND_ & cond' into the #ifndef.
       Value ifCond =
@@ -4192,9 +4509,10 @@ LogicalResult FIRRTLLowering::visitStmt(PrintFOp op) {
       ifCond = builder.createOrFold<comb::AndOp>(ifCond, cond, true);
 
       addIfProceduralBlock(ifCond, [&]() {
-        // Emit the sv.fwrite, writing to stderr by default.
-        Value fdStderr = builder.create<hw::ConstantOp>(APInt(32, 0x80000002));
-        builder.create<sv::FWriteOp>(fdStderr, op.getFormatString(), operands);
+        // Emit the sv.fwrite, writing to fd specified by `PRINTF_FD.
+        Value fd = builder.create<sv::MacroRefExprOp>(
+            builder.getIntegerType(32), "PRINTF_FD_");
+        builder.create<sv::FWriteOp>(fd, op.getFormatString(), operands);
       });
     });
   });
@@ -4205,30 +4523,22 @@ LogicalResult FIRRTLLowering::visitStmt(PrintFOp op) {
 // Stop lowers into a nested series of behavioral statements plus $fatal
 // or $finish.
 LogicalResult FIRRTLLowering::visitStmt(StopOp op) {
-  auto clock = getLoweredNonClockValue(op.getClock());
+  auto clock = getLoweredValue(op.getClock());
   auto cond = getLoweredValue(op.getCond());
   if (!clock || !cond)
     return failure();
 
-  // Emit an "#ifndef SYNTHESIS" guard into the always block.
-  addToIfDefBlock("SYNTHESIS", std::function<void()>(), [&]() {
-    // Emit this into an "sv.always posedge" body.
-    addToAlwaysBlock(clock, [&]() {
-      circuitState.used_STOP_COND = true;
+  circuitState.usedStopCond = true;
+  circuitState.addFragment(theModule, "STOP_COND_FRAGMENT");
 
-      // Emit an "sv.if '`STOP_COND_ & cond' into the #ifndef.
-      Value ifCond =
-          builder.create<sv::MacroRefExprOp>(cond.getType(), "STOP_COND_");
-      ifCond = builder.createOrFold<comb::AndOp>(ifCond, cond, true);
-      addIfProceduralBlock(ifCond, [&]() {
-        // Emit the sv.fatal or sv.finish.
-        if (op.getExitCode())
-          builder.create<sv::FatalOp>();
-        else
-          builder.create<sv::FinishOp>();
-      });
-    });
-  });
+  Value stopCond =
+      builder.create<sv::MacroRefExprOp>(cond.getType(), "STOP_COND_");
+  Value exitCond = builder.createOrFold<comb::AndOp>(stopCond, cond, true);
+
+  if (op.getExitCode())
+    builder.create<sim::FatalOp>(clock, exitCond);
+  else
+    builder.create<sim::FinishOp>(clock, exitCond);
 
   return success();
 }
@@ -4292,18 +4602,7 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
   if (auto guardsAttr = op->template getAttrOfType<ArrayAttr>("guards"))
     guards = guardsAttr.getValue();
 
-  auto isAssert = opName == "assert";
-  auto isCover = opName == "cover";
-
-  // TODO : Need to figure out if there is a cleaner way to get the string which
-  // indicates the assert is UNR only. Or better - not rely on this at all -
-  // ideally there should have been some other attribute which indicated that
-  // this assert for UNR only.
-  auto isUnrOnlyAssert = llvm::any_of(guards, [](Attribute attr) {
-    StringAttr strAttr = dyn_cast<StringAttr>(attr);
-    return strAttr && strAttr.getValue() == "USE_UNR_ONLY_CONSTRAINTS";
-  });
-
+  auto isCover = isa<CoverOp>(op);
   auto clock = getLoweredNonClockValue(opClock);
   auto enable = getLoweredValue(opEnable);
   auto predicate = getLoweredValue(opPredicate);
@@ -4320,32 +4619,50 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
 
   StringAttr message;
   SmallVector<Value> messageOps;
+  VerificationFlavor flavor = circuitState.verificationFlavor;
+
+  // For non-assertion, rollback to per-op configuration.
+  if (flavor == VerificationFlavor::IfElseFatal && !isa<AssertOp>(op))
+    flavor = VerificationFlavor::None;
+
+  if (flavor == VerificationFlavor::None) {
+    // TODO: This should *not* be part of the op, but rather a lowering
+    // option that the user of this pass can choose.
+
+    auto format = op->getAttrOfType<StringAttr>("format");
+    // if-else-fatal iff concurrent and the format is specified.
+    if (isConcurrent && format && format.getValue() == "ifElseFatal") {
+      if (!isa<AssertOp>(op))
+        return op->emitError()
+               << "ifElseFatal format cannot be used for non-assertions";
+      flavor = VerificationFlavor::IfElseFatal;
+    } else if (isConcurrent)
+      flavor = VerificationFlavor::SVA;
+    else
+      flavor = VerificationFlavor::Immediate;
+  }
+
   if (!isCover && opMessageAttr && !opMessageAttr.getValue().empty()) {
     message = opMessageAttr;
     for (auto operand : opOperands) {
-      auto loweredValue = getLoweredValue(operand);
-      if (!loweredValue) {
-        // If this is a zero bit operand, just pass a one bit zero.
-        if (!isZeroBitFIRRTLType(operand.getType()))
-          return failure();
-        loweredValue = getOrCreateIntConstant(1, 0);
-      }
-      // Wrap any message ops in $sampled() to guarantee that these will print
-      // with the same value as when the assertion triggers.  (See SystemVerilog
-      // 2017 spec section 16.9.3 for more information.)  The custom
-      // "ifElseFatal" variant is special cased because this isn't actually a
-      // concurrent assertion.
-      auto format = op->getAttrOfType<StringAttr>("format");
-      if (isConcurrent && (!format || format.getValue() != "ifElseFatal" ||
-                           circuitState.emitChiselAssertsAsSVA))
+      auto loweredValue = getLoweredFmtOperand(operand);
+      if (!loweredValue)
+        return failure();
+
+      // For SVA assert/assume statements, wrap any message ops in $sampled() to
+      // guarantee that these will print with the same value as when the
+      // assertion triggers.  (See SystemVerilog 2017 spec section 16.9.3 for
+      // more information.)
+      if (flavor == VerificationFlavor::SVA)
         loweredValue = builder.create<sv::SampledOp>(loweredValue);
       messageOps.push_back(loweredValue);
     }
   }
 
   auto emit = [&]() {
-    // Handle the purely procedural flavor of the operation.
-    if (!isConcurrent && !circuitState.emitChiselAssertsAsSVA) {
+    switch (flavor) {
+    case VerificationFlavor::Immediate: {
+      // Handle the purely procedural flavor of the operation.
       auto deferImmediate = circt::sv::DeferAssertAttr::get(
           builder.getContext(), circt::sv::DeferAssert::Immediate);
       addToAlwaysBlock(clock, [&]() {
@@ -4356,23 +4673,24 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
       });
       return;
     }
-
-    auto boolType = IntegerType::get(builder.getContext(), 1);
-
-    // Handle the `ifElseFatal` format, which does not emit an SVA but
-    // rather a process that uses $error and $fatal to perform the checks.
-    // TODO: This should *not* be part of the op, but rather a lowering
-    // option that the user of this pass can choose.
-    auto format = op->template getAttrOfType<StringAttr>("format");
-    if (format && (format.getValue() == "ifElseFatal" &&
-                   !circuitState.emitChiselAssertsAsSVA)) {
+    case VerificationFlavor::IfElseFatal: {
+      assert(isa<AssertOp>(op) && "only assert is expected");
+      // Handle the `ifElseFatal` format, which does not emit an SVA but
+      // rather a process that uses $error and $fatal to perform the checks.
+      auto boolType = IntegerType::get(builder.getContext(), 1);
       predicate = comb::createOrFoldNot(predicate, builder, /*twoState=*/true);
       predicate = builder.createOrFold<comb::AndOp>(enable, predicate, true);
+
+      circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
       addToIfDefBlock("SYNTHESIS", {}, [&]() {
         addToAlwaysBlock(clock, [&]() {
           addIfProceduralBlock(predicate, [&]() {
-            circuitState.used_ASSERT_VERBOSE_COND = true;
-            circuitState.used_STOP_COND = true;
+            circuitState.usedStopCond = true;
+            circuitState.addFragment(theModule, "STOP_COND_FRAGMENT");
+
+            circuitState.usedAssertVerboseCond = true;
+            circuitState.addFragment(theModule, "ASSERT_VERBOSE_COND_FRAGMENT");
+
             addIfProceduralBlock(
                 builder.create<sv::MacroRefExprOp>(boolType,
                                                    "ASSERT_VERBOSE_COND_"),
@@ -4385,84 +4703,48 @@ LogicalResult FIRRTLLowering::lowerVerificationStatement(
       });
       return;
     }
+    case VerificationFlavor::SVA: {
+      // Formulate the `enable -> predicate` as `!enable | predicate`.
+      // Except for covers, combine them: enable & predicate
+      if (!isCover) {
+        auto notEnable =
+            comb::createOrFoldNot(enable, builder, /*twoState=*/true);
+        predicate =
+            builder.createOrFold<comb::OrOp>(notEnable, predicate, true);
+      } else {
+        predicate = builder.createOrFold<comb::AndOp>(enable, predicate, true);
+      }
 
-    // Formulate the `enable -> predicate` as `!enable | predicate`.
-    // Except for covers, combine them: enable & predicate
-    if (!isCover) {
-      auto notEnable =
-          comb::createOrFoldNot(enable, builder, /*twoState=*/true);
-      predicate = builder.createOrFold<comb::OrOp>(notEnable, predicate, true);
-    } else {
-      predicate = builder.createOrFold<comb::AndOp>(enable, predicate, true);
+      // Handle the regular SVA case.
+      sv::EventControl event;
+      switch (opEventControl) {
+      case EventControl::AtPosEdge:
+        event = circt::sv::EventControl::AtPosEdge;
+        break;
+      case EventControl::AtEdge:
+        event = circt::sv::EventControl::AtEdge;
+        break;
+      case EventControl::AtNegEdge:
+        event = circt::sv::EventControl::AtNegEdge;
+        break;
+      }
+
+      buildConcurrentVerifOp(
+          builder, opName,
+          circt::sv::EventControlAttr::get(builder.getContext(), event), clock,
+          predicate, prefixedLabel, message, messageOps);
+      return;
     }
-
-    // Handle the regular SVA case.
-    sv::EventControl event;
-    switch (opEventControl) {
-    case EventControl::AtPosEdge:
-      event = circt::sv::EventControl::AtPosEdge;
-      break;
-    case EventControl::AtEdge:
-      event = circt::sv::EventControl::AtEdge;
-      break;
-    case EventControl::AtNegEdge:
-      event = circt::sv::EventControl::AtNegEdge;
-      break;
-    }
-
-    buildConcurrentVerifOp(
-        builder, opName,
-        circt::sv::EventControlAttr::get(builder.getContext(), event), clock,
-        predicate, prefixedLabel, message, messageOps);
-
-    // Assertions gain a companion `assume` behind a
-    // `USE_PROPERTY_AS_CONSTRAINT` guard.
-    if (isAssert) {
-      StringAttr assumeLabel;
-      if (label)
-        assumeLabel = StringAttr::get(builder.getContext(),
-                                      "assume__" + label.getValue());
-      addToIfDefBlock("USE_PROPERTY_AS_CONSTRAINT", [&]() {
-        if (!isUnrOnlyAssert) {
-          builder.create<sv::AssumeConcurrentOp>(
-              circt::sv::EventControlAttr::get(builder.getContext(), event),
-              clock, predicate, assumeLabel);
-        } else {
-          builder.create<sv::AlwaysOp>(
-              ArrayRef(sv::EventControl::AtEdge), ArrayRef(predicate), [&]() {
-                buildImmediateVerifOp(builder, "assume", predicate,
-                                      circt::sv::DeferAssertAttr::get(
-                                          builder.getContext(),
-                                          circt::sv::DeferAssert::Immediate),
-                                      assumeLabel);
-              });
-        }
-      });
+    case VerificationFlavor::None:
+      llvm_unreachable(
+          "flavor `None` must be converted into one of concreate flavors");
     }
   };
 
   // Wrap the verification statement up in the optional preprocessor
   // guards. This is a bit awkward since we want to translate an array of
   // guards  into a recursive call to `addToIfDefBlock`.
-  bool anyFailed = false;
-  std::function<void()> emitWrapped = [&]() {
-    if (guards.empty()) {
-      emit();
-      return;
-    }
-    auto guard = guards[0].dyn_cast<StringAttr>();
-    if (!guard) {
-      op->emitOpError("elements in `guards` array must be `StringAttr`");
-      anyFailed = true;
-      return;
-    }
-    guards = guards.drop_front();
-    addToIfDefBlock(guard.getValue(), emitWrapped);
-  };
-  emitWrapped();
-  if (anyFailed)
-    return failure();
-  return success();
+  return emitGuards(op->getLoc(), guards, emit);
 }
 
 // Lower an assert to SystemVerilog.
@@ -4489,6 +4771,56 @@ LogicalResult FIRRTLLowering::visitStmt(CoverOp op) {
       op.getIsConcurrent(), op.getEventControl());
 }
 
+// Lower an UNR only assume to a specific style of SV assume.
+LogicalResult FIRRTLLowering::visitStmt(UnclockedAssumeIntrinsicOp op) {
+  // TODO : Need to figure out if there is a cleaner way to get the string which
+  // indicates the assert is UNR only. Or better - not rely on this at all -
+  // ideally there should have been some other attribute which indicated that
+  // this assert for UNR only.
+  auto guardsAttr = op->getAttrOfType<mlir::ArrayAttr>("guards");
+  ArrayRef<Attribute> guards =
+      guardsAttr ? guardsAttr.getValue() : ArrayRef<Attribute>();
+
+  auto label = op.getNameAttr();
+  StringAttr assumeLabel;
+  if (label && !label.empty())
+    assumeLabel =
+        StringAttr::get(builder.getContext(), "assume__" + label.getValue());
+  auto predicate = getLoweredValue(op.getPredicate());
+  auto enable = getLoweredValue(op.getEnable());
+  auto notEnable = comb::createOrFoldNot(enable, builder, /*twoState=*/true);
+  predicate = builder.createOrFold<comb::OrOp>(notEnable, predicate, true);
+
+  SmallVector<Value> messageOps;
+  for (auto operand : op.getSubstitutions()) {
+    auto loweredValue = getLoweredValue(operand);
+    if (!loweredValue) {
+      // If this is a zero bit operand, just pass a one bit zero.
+      if (!isZeroBitFIRRTLType(operand.getType()))
+        return failure();
+      loweredValue = getOrCreateIntConstant(1, 0);
+    }
+    messageOps.push_back(loweredValue);
+  }
+  return emitGuards(op.getLoc(), guards, [&]() {
+    builder.create<sv::AlwaysOp>(
+        ArrayRef(sv::EventControl::AtEdge), ArrayRef(predicate), [&]() {
+          if (op.getMessageAttr().getValue().empty())
+            buildImmediateVerifOp(
+                builder, "assume", predicate,
+                circt::sv::DeferAssertAttr::get(
+                    builder.getContext(), circt::sv::DeferAssert::Immediate),
+                assumeLabel);
+          else
+            buildImmediateVerifOp(
+                builder, "assume", predicate,
+                circt::sv::DeferAssertAttr::get(
+                    builder.getContext(), circt::sv::DeferAssert::Immediate),
+                assumeLabel, op.getMessageAttr(), messageOps);
+        });
+  });
+}
+
 LogicalResult FIRRTLLowering::visitStmt(AttachOp op) {
   // Don't emit anything for a zero or one operand attach.
   if (op.getAttached().size() < 2)
@@ -4505,7 +4837,7 @@ LogicalResult FIRRTLLowering::visitStmt(AttachOp op) {
       continue;
     }
 
-    if (!inoutValues.back().getType().isa<hw::InOutType>())
+    if (!isa<hw::InOutType>(inoutValues.back().getType()))
       return op.emitError("operand isn't an inout type");
   }
 
@@ -4535,13 +4867,15 @@ LogicalResult FIRRTLLowering::visitStmt(AttachOp op) {
 
   // If the attach operands contain a port, then we can't do anything to
   // simplify the attach operation.
+  circuitState.addMacroDecl(builder.getStringAttr("SYNTHESIS"));
+  circuitState.addMacroDecl(builder.getStringAttr("VERILATOR"));
   addToIfDefBlock(
       "SYNTHESIS",
       // If we're doing synthesis, we emit an all-pairs assign complex.
       [&]() {
         SmallVector<Value, 4> values;
-        for (size_t i = 0, e = inoutValues.size(); i != e; ++i)
-          values.push_back(getReadValue(inoutValues[i]));
+        for (auto inoutValue : inoutValues)
+          values.push_back(getReadValue(inoutValue));
 
         for (size_t i1 = 0, e = inoutValues.size(); i1 != e; ++i1) {
           for (size_t i2 = 0; i2 != e; ++i2)
@@ -4553,7 +4887,7 @@ LogicalResult FIRRTLLowering::visitStmt(AttachOp op) {
       // statement.
       [&]() {
         builder.create<sv::IfDefOp>(
-            "verilator",
+            "VERILATOR",
             [&]() {
               builder.create<sv::VerbatimOp>(
                   "`error \"Verilator does not support alias and thus "

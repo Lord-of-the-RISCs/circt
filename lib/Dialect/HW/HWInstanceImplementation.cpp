@@ -146,10 +146,9 @@ LogicalResult instance_like_impl::verifyOutputs(
   return success();
 }
 
-LogicalResult
-instance_like_impl::verifyParameters(ArrayAttr parameters,
-                                     ArrayAttr moduleParameters,
-                                     const EmitErrorFn &emitError) {
+LogicalResult instance_like_impl::verifyParameters(
+    ArrayAttr parameters, ArrayAttr moduleParameters,
+    ArrayRef<Type> resolvedModParametersRefs, const EmitErrorFn &emitError) {
   // Check parameters match up.
   auto numParameters = parameters.size();
   if (numParameters != moduleParameters.size()) {
@@ -162,8 +161,9 @@ instance_like_impl::verifyParameters(ArrayAttr parameters,
   }
 
   for (size_t i = 0; i != numParameters; ++i) {
-    auto param = parameters[i].cast<ParamDeclAttr>();
-    auto modParam = moduleParameters[i].cast<ParamDeclAttr>();
+    auto param = cast<ParamDeclAttr>(parameters[i]);
+    auto modParam = cast<ParamDeclAttr>(moduleParameters[i]);
+    auto resolvedModParamType = resolvedModParametersRefs[i];
 
     auto paramName = param.getName();
     if (paramName != modParam.getName()) {
@@ -175,7 +175,7 @@ instance_like_impl::verifyParameters(ArrayAttr parameters,
       return failure();
     }
 
-    if (param.getType() != modParam.getType()) {
+    if (param.getType() != resolvedModParamType) {
       emitError([&](auto &diag) {
         diag << "parameter " << paramName << " should have type "
              << modParam.getType() << " but has type " << param.getType();
@@ -227,6 +227,7 @@ LogicalResult instance_like_impl::verifyInstanceOfHWModule(
       ArrayAttr::get(instance->getContext(), mod.getOutputNames());
 
   ArrayRef<Type> resolvedModInputTypesRef = getModuleType(module).getInputs();
+
   SmallVector<Type> resolvedModInputTypes;
   if (parameters) {
     if (failed(instance_like_impl::resolveParametricTypes(
@@ -235,6 +236,7 @@ LogicalResult instance_like_impl::verifyInstanceOfHWModule(
       return failure();
     resolvedModInputTypesRef = resolvedModInputTypes;
   }
+
   if (failed(instance_like_impl::verifyInputs(
           argNames, modArgNames, inputs.getTypes(), resolvedModInputTypesRef,
           emitError)))
@@ -256,10 +258,22 @@ LogicalResult instance_like_impl::verifyInstanceOfHWModule(
     return failure();
 
   if (parameters) {
+    auto modParameters = module->getAttrOfType<ArrayAttr>("parameters");
+    SmallVector<Type> rawModParameters, resolvedModParameters;
+    rawModParameters.reserve(modParameters.size());
+    resolvedModParameters.reserve(modParameters.size());
+    for (auto paramDecl : modParameters.getAsRange<ParamDeclAttr>())
+      rawModParameters.push_back(paramDecl.getType());
+
+    // resolve parameters
+    if (failed(instance_like_impl::resolveParametricTypes(
+            instance->getLoc(), parameters, rawModParameters,
+            resolvedModParameters, emitError)))
+      return failure();
+
     // Check that the parameters are consistent with the referenced module.
-    ArrayAttr modParameters = module->getAttrOfType<ArrayAttr>("parameters");
-    if (failed(instance_like_impl::verifyParameters(parameters, modParameters,
-                                                    emitError)))
+    if (failed(instance_like_impl::verifyParameters(
+            parameters, modParameters, resolvedModParameters, emitError)))
       return failure();
   }
 
@@ -273,14 +287,14 @@ instance_like_impl::verifyParameterStructure(ArrayAttr parameters,
   // Check that all the parameter values specified to the instance are
   // structurally valid.
   for (auto param : parameters) {
-    auto paramAttr = param.cast<ParamDeclAttr>();
+    auto paramAttr = cast<ParamDeclAttr>(param);
     auto value = paramAttr.getValue();
     // The SymbolUses verifier which checks that this exists may not have been
     // run yet. Let it issue the error.
     if (!value)
       continue;
 
-    auto typedValue = value.dyn_cast<mlir::TypedAttr>();
+    auto typedValue = dyn_cast<mlir::TypedAttr>(value);
     if (!typedValue) {
       emitError([&](auto &diag) {
         diag << "parameter " << paramAttr
@@ -308,7 +322,7 @@ instance_like_impl::verifyParameterStructure(ArrayAttr parameters,
 StringAttr instance_like_impl::getName(ArrayAttr names, size_t idx) {
   // Tolerate malformed IR here to enable debug printing etc.
   if (names && idx < names.size())
-    return names[idx].cast<StringAttr>();
+    return cast<StringAttr>(names[idx]);
   return StringAttr();
 }
 
@@ -358,23 +372,23 @@ SmallVector<PortInfo> instance_like_impl::getPortList(Operation *instanceOp) {
     auto type = argTypes[i];
     auto direction = ModulePort::Direction::Input;
 
-    if (auto inout = type.dyn_cast<InOutType>()) {
+    if (auto inout = dyn_cast<InOutType>(type)) {
       type = inout.getElementType();
       direction = ModulePort::Direction::InOut;
     }
 
     LocationAttr loc;
     if (argLocs)
-      loc = argLocs[i].cast<LocationAttr>();
+      loc = cast<LocationAttr>(argLocs[i]);
     ports.push_back(
-        {{argNames[i].cast<StringAttr>(), type, direction}, i, emptyDict, loc});
+        {{cast<StringAttr>(argNames[i]), type, direction}, i, emptyDict, loc});
   }
 
   for (unsigned i = 0, e = resultTypes.size(); i < e; ++i) {
     LocationAttr loc;
     if (resultLocs)
-      loc = resultLocs[i].cast<LocationAttr>();
-    ports.push_back({{resultNames[i].cast<StringAttr>(), resultTypes[i],
+      loc = cast<LocationAttr>(resultLocs[i]);
+    ports.push_back({{cast<StringAttr>(resultNames[i]), resultTypes[i],
                       ModulePort::Direction::Output},
                      i,
                      emptyDict,

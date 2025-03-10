@@ -20,10 +20,12 @@
 #include <cstdint>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace esi {
+class Type;
 
 //===----------------------------------------------------------------------===//
 // Common accelerator description types.
@@ -33,7 +35,6 @@ struct AppID {
   std::string name;
   std::optional<uint32_t> idx;
 
-  AppID(const AppID &) = default;
   AppID(const std::string &name, std::optional<uint32_t> idx = std::nullopt)
       : name(name), idx(idx) {}
 
@@ -53,13 +54,19 @@ public:
 };
 bool operator<(const AppIDPath &a, const AppIDPath &b);
 
+struct Constant {
+  std::any value;
+  std::optional<const Type *> type;
+};
+
 struct ModuleInfo {
-  const std::optional<std::string> name;
-  const std::optional<std::string> summary;
-  const std::optional<std::string> version;
-  const std::optional<std::string> repo;
-  const std::optional<std::string> commitHash;
-  const std::map<std::string, std::any> extra;
+  std::optional<std::string> name;
+  std::optional<std::string> summary;
+  std::optional<std::string> version;
+  std::optional<std::string> repo;
+  std::optional<std::string> commitHash;
+  std::map<std::string, Constant> constants;
+  std::map<std::string, std::any> extra;
 };
 
 /// A description of a service port. Used pretty exclusively in setting up the
@@ -69,11 +76,22 @@ struct ServicePortDesc {
   std::string portName;
 };
 
+/// Details about how to connect to a particular channel.
+struct ChannelAssignment {
+  /// The name of the type of connection. Typically, the name of the DMA engine
+  /// or "cosim" if a cosimulation channel is being used.
+  std::string type;
+  /// Implementation-specific options.
+  std::map<std::string, std::any> implOptions;
+};
+using ChannelAssignments = std::map<std::string, ChannelAssignment>;
+
 /// A description of a hardware client. Used pretty exclusively in setting up
 /// the design.
 struct HWClientDetail {
   AppIDPath relPath;
   ServicePortDesc port;
+  ChannelAssignments channelAssignments;
   std::map<std::string, std::any> implOptions;
 };
 using HWClientDetails = std::vector<HWClientDetail>;
@@ -87,11 +105,33 @@ public:
   /// Adopts the data vector buffer.
   MessageData() = default;
   MessageData(std::vector<uint8_t> &data) : data(std::move(data)) {}
+  MessageData(const uint8_t *data, size_t size) : data(data, data + size) {}
   ~MessageData() = default;
 
   const uint8_t *getBytes() const { return data.data(); }
   /// Get the size of the data in bytes.
   size_t getSize() const { return data.size(); }
+
+  /// Cast to a type. Throws if the size of the data does not match the size of
+  /// the message. The lifetime of the resulting pointer is tied to the lifetime
+  /// of this object.
+  template <typename T>
+  const T *as() const {
+    if (data.size() != sizeof(T))
+      throw std::runtime_error("Data size does not match type size. Size is " +
+                               std::to_string(data.size()) + ", expected " +
+                               std::to_string(sizeof(T)) + ".");
+    return reinterpret_cast<const T *>(data.data());
+  }
+
+  /// Cast from a type to its raw bytes.
+  template <typename T>
+  static MessageData from(T &t) {
+    return MessageData(reinterpret_cast<const uint8_t *>(&t), sizeof(T));
+  }
+
+  /// Convert the data to a hex string.
+  std::string toHex() const;
 
 private:
   std::vector<uint8_t> data;
@@ -107,7 +147,8 @@ std::ostream &operator<<(std::ostream &, const esi::AppID &);
 //===----------------------------------------------------------------------===//
 
 namespace esi {
-std::string toHex(uint32_t val);
+std::string toHex(void *val);
+std::string toHex(uint64_t val);
 } // namespace esi
 
 #endif // ESI_COMMON_H

@@ -152,6 +152,7 @@ if ieee_sims and ieee_sims[-1][1] == config.iverilog_path:
 # Enable ESI runtime tests.
 if config.esi_runtime == "ON":
   config.available_features.add('esi-runtime')
+  config.available_features.add('esitester')
 
   llvm_config.with_environment('PYTHONPATH',
                                [f"{config.esi_runtime_path}/python/"],
@@ -162,8 +163,6 @@ if config.esi_runtime == "ON":
   # Enable ESI cosim tests if they have been built.
   if config.esi_cosim_path != "":
     config.available_features.add('esi-cosim')
-    config.substitutions.append(
-        ('%ESIINC%', f'{config.circt_include_dir}/circt/Dialect/ESI/'))
-    config.substitutions.append(('%ESICOSIM%', f'{config.esi_cosim_path}'))
+    tools.append('esi-cosim.py')
 
 llvm_config.add_tool_substitutions(tools, tool_dirs)

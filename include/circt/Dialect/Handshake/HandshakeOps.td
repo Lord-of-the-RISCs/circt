@@ -16,6 +16,9 @@ include "mlir/IR/BuiltinTypes.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
 include "mlir/Interfaces/InferTypeOpInterface.td"
 
+include "circt/Dialect/ESI/ESITypes.td"
+include "circt/Dialect/Seq/SeqTypes.td"
+
 // @mortbopet: some kind of support for interfaces as parent ops is currently
 // being tracked here: https://github.com/llvm/llvm-project/pull/66196
 class HasParentInterface<string interface>
@@ -94,12 +97,12 @@ def FuncOp : Op<Handshake_Dialect, "func", [
 
     /// Returns the argument name at the given index.
     StringAttr getArgName(unsigned idx) {
-      return getArgNames()[idx].cast<StringAttr>();
+      return llvm::cast<StringAttr>(getArgNames()[idx]);
     }
 
     /// Returns the result name at the given index.
     StringAttr getResName(unsigned idx) {
-      return getResNames()[idx].cast<StringAttr>();
+      return llvm::cast<StringAttr>(getResNames()[idx]);
     }
 
     /// Resolve argument and result names. This can be used during building of
@@ -113,7 +116,7 @@ def FuncOp : Op<Handshake_Dialect, "func", [
     /// safely.
     LogicalResult verifyType() {
       auto type = getFunctionTypeAttr().getValue();
-      if (!type.isa<FunctionType>())
+      if (!llvm::isa<FunctionType>(type))
         return emitOpError(
             "requires '" + getFunctionTypeAttrName().getValue() +
             "' attribute of function type");
@@ -136,6 +139,64 @@ def FuncOp : Op<Handshake_Dialect, "func", [
 
   let hasVerifier = 1;
   let hasCustomAssemblyFormat = 1;
+}
+
+def ESIInstanceOp : Op<Handshake_Dialect, "esi_instance", [
+    CallOpInterface,
+    HasClock,
+    DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
+  let summary = "Instantiate a Handshake circuit";
+  let description = [{
+    Instantiate (call) a Handshake function in a non-Handshake design using ESI
+    channels as the outside connections.
+  }];
+  let arguments = (ins FlatSymbolRefAttr:$module, StrAttr:$instName,
+                       ClockType:$clk, I1:$rst,
+                       Variadic<ChannelType>:$opOperands);
+  let results = (outs Variadic<ChannelType>);
+
+  let assemblyFormat = [{
+    $module $instName `clk` $clk `rst` $rst
+      `(` $opOperands `)` attr-dict `:` functional-type($opOperands, results)
+  }];
+
+  let extraClassDeclaration = [{
+    // Account for `clk` and `rst` operands vs call arguments.
+    static constexpr int NumFixedOperands = 2;
+
+    /// Get the argument operands to the called function.
+    operand_range getArgOperands() {
+      return {arg_operand_begin(), arg_operand_end()};
+    }
+
+    operand_iterator arg_operand_begin() { return operand_begin(); }
+    operand_iterator arg_operand_end() { return operand_end(); }
+
+    /// Return the module of this operation.
+    CallInterfaceCallable getCallableForCallee() {
+      return (*this)->getAttrOfType<SymbolRefAttr>("module");
+    }
+
+    /// Set the callee for this operation.
+    void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
+      (*this)->setAttr(getModuleAttrName(), llvm::cast<mlir::SymbolRefAttr>(callee));
+    }
+
+    MutableOperandRange getArgOperandsMutable() {
+      return getOpOperandsMutable();
+    }
+
+    /// Stub implementations for ArgumentAttributesMethods. If desired,
+    /// implement these by defining arg_attrs and res_attrs as arguments to the
+    /// operation as OptionalAttr<DictArrayAttr>.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
+  }];
 }
 
 // InstanceOp
@@ -200,7 +261,7 @@ def InstanceOp : Handshake_Op<"instance", [
 
     /// Set the callee for this operation.
     void setCalleeFromCallable(mlir::CallInterfaceCallable callee) {
-      (*this)->setAttr(getModuleAttrName(), callee.get<mlir::SymbolRefAttr>());
+      (*this)->setAttr(getModuleAttrName(), llvm::cast<mlir::SymbolRefAttr>(callee));
     }
 
     /// Get the control operand of this instance op
@@ -212,6 +273,15 @@ def InstanceOp : Handshake_Op<"instance", [
       return getOpOperandsMutable();
     }
 
+    /// Stub implementations for ArgumentAttributesMethods. If desired,
+    /// implement these by defining arg_attrs and res_attrs as arguments to the
+    /// operation as OptionalAttr<DictArrayAttr>.
+    mlir::ArrayAttr getArgAttrsAttr() { return nullptr; }
+    mlir::ArrayAttr getResAttrsAttr() { return nullptr; }
+    void setArgAttrsAttr(mlir::ArrayAttr args) {}
+    void setResAttrsAttr(mlir::ArrayAttr args) {}
+    mlir::Attribute removeArgAttrsAttr() { return nullptr; }
+    mlir::Attribute removeResAttrsAttr() { return nullptr; }
   }];
 
   let assemblyFormat = [{
@@ -296,7 +366,8 @@ def BufferOp : Handshake_Op<"buffer", [Pure, HasClock, SameOperandsAndResultType
       assert(getInitValues() && "initValues attribute not set");
       SmallVector<int64_t> values;
       for (auto value : (*this)->getAttrOfType<ArrayAttr>("initValues"))
-        values.push_back(value.cast<IntegerAttr>().getValue().getSExtValue());
+        values.push_back(llvm::cast<IntegerAttr>(value)
+                         .getValue().getSExtValue());
       return values;
     }
 
@@ -446,12 +517,14 @@ def ControlMergeOp : Handshake_Op<"control_merge", [
   let results = (outs AnyType : $result, AnyType : $index);
   
   let builders = [OpBuilder<
-    (ins "ValueRange":$operands), [{
+    (ins "ValueRange":$operands, CArg<"Type", "{}">:$indexType), [{
       assert(!operands.empty() && "cmerge needs at least one operand");
       $_state.addOperands(operands);
+      if(!indexType)
+        indexType = $_builder.getIndexType();
       // By default, the index result has an Index type
       $_state.addTypes(ArrayRef<Type>{operands[0].getType(),
-                                      $_builder.getIndexType()});
+                                      indexType});
   }]>];
   
   let hasCustomAssemblyFormat = 1;
@@ -665,7 +738,7 @@ def ExternalMemoryOp : Handshake_Op<"extmemory", [
 
   let extraClassDeclaration = [{
     mlir::MemRefType getMemRefType() {
-      return getMemref().getType().cast<mlir::MemRefType>();
+      return llvm::cast<mlir::MemRefType>(getMemref().getType());
     }
 
     llvm::SmallVector<handshake::MemLoadInterface> getLoadPorts();
@@ -793,7 +866,7 @@ def UnpackOp : Handshake_Op<"unpack", [
   DeclareOpInterfaceMethods<GeneralOpInterface>,
   TypesMatchWith<"result types match element types of 'tuple'",
                      "input", "results",
-                     "$_self.cast<TupleType>().getTypes()">
+                     "llvm::cast<TupleType>($_self).getTypes()">
 ]> {
   let summary = "unpacks a tuple";
   let description = [{
@@ -815,7 +888,7 @@ def UnpackOp : Handshake_Op<"unpack", [
   let builders = [OpBuilder<(ins "Value":$input), [{
     $_state.addOperands(input);
 
-    TupleType type = input.getType().dyn_cast_or_null<TupleType>();
+    TupleType type = llvm::dyn_cast_or_null<TupleType>(input.getType());
     assert(type && "expect unpack to have a 'TupleType' operand");
     $_state.addTypes(type.getTypes());
   }]>];
@@ -828,7 +901,7 @@ def PackOp : Handshake_Op<"pack", [
   DeclareOpInterfaceMethods<GeneralOpInterface>,
   TypesMatchWith<"input types match element types of 'tuple'",
                    "result", "inputs",
-                   "$_self.cast<TupleType>().getTypes()">
+                   "llvm::cast<TupleType>($_self).getTypes()">
 ]> {
 
   let summary = "packs a tuple";

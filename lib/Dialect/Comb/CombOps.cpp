@@ -24,8 +24,8 @@ using namespace comb;
 /// or larger integer type.
 Value comb::createOrFoldSExt(Location loc, Value value, Type destTy,
                              OpBuilder &builder) {
-  IntegerType valueType = value.getType().dyn_cast<IntegerType>();
-  assert(valueType && destTy.isa<IntegerType>() &&
+  IntegerType valueType = dyn_cast<IntegerType>(value.getType());
+  assert(valueType && isa<IntegerType>(destTy) &&
          valueType.getWidth() <= destTy.getIntOrFloatBitWidth() &&
          valueType.getWidth() != 0 && "invalid sext operands");
   // If already the right size, we are done.
@@ -54,6 +54,61 @@ Value comb::createOrFoldNot(Location loc, Value value, OpBuilder &builder,
 Value comb::createOrFoldNot(Value value, ImplicitLocOpBuilder &builder,
                             bool twoState) {
   return createOrFoldNot(builder.getLoc(), value, builder, twoState);
+}
+
+// Extract individual bits from a value
+void comb::extractBits(OpBuilder &builder, Value val,
+                       SmallVectorImpl<Value> &bits) {
+  assert(val.getType().isInteger() && "expected integer");
+  auto width = val.getType().getIntOrFloatBitWidth();
+  bits.reserve(width);
+
+  // Check if we can reuse concat operands
+  if (auto concat = val.getDefiningOp<comb::ConcatOp>()) {
+    if (concat.getNumOperands() == width &&
+        llvm::all_of(concat.getOperandTypes(), [](Type type) {
+          return type.getIntOrFloatBitWidth() == 1;
+        })) {
+      // Reverse the operands to match the bit order
+      bits.append(std::make_reverse_iterator(concat.getOperands().end()),
+                  std::make_reverse_iterator(concat.getOperands().begin()));
+      return;
+    }
+  }
+
+  // Extract individual bits
+  for (int64_t i = 0; i < width; ++i)
+    bits.push_back(
+        builder.createOrFold<comb::ExtractOp>(val.getLoc(), val, i, 1));
+}
+
+// Construct a mux tree for given leaf nodes. `selectors` is the selector for
+// each level of the tree. Currently the selector is tested from MSB to LSB.
+Value comb::constructMuxTree(OpBuilder &builder, Location loc,
+                             ArrayRef<Value> selectors,
+                             ArrayRef<Value> leafNodes,
+                             Value outOfBoundsValue) {
+  // Recursive helper function to construct the mux tree
+  std::function<Value(size_t, size_t)> constructTreeHelper =
+      [&](size_t id, size_t level) -> Value {
+    // Base case: at the lowest level, return the result
+    if (level == 0) {
+      // Return the result for the given index. If the index is out of bounds,
+      // return the out-of-bound value.
+      return id < leafNodes.size() ? leafNodes[id] : outOfBoundsValue;
+    }
+
+    auto selector = selectors[level - 1];
+
+    // Recursive case: create muxes for true and false branches
+    auto trueVal = constructTreeHelper(2 * id + 1, level - 1);
+    auto falseVal = constructTreeHelper(2 * id, level - 1);
+
+    // Combine the results with a mux
+    return builder.createOrFold<comb::MuxOp>(loc, selector, trueVal, falseVal);
+  };
+
+  return constructTreeHelper(0, llvm::Log2_64_Ceil(leafNodes.size()));
 }
 
 //===----------------------------------------------------------------------===//
@@ -183,8 +238,8 @@ bool ICmpOp::isNotEqualZero() {
 LogicalResult ReplicateOp::verify() {
   // The source must be equal or smaller than the dest type, and an even
   // multiple of it.  Both are already known to be signless integers.
-  auto srcWidth = getOperand().getType().cast<IntegerType>().getWidth();
-  auto dstWidth = getType().cast<IntegerType>().getWidth();
+  auto srcWidth = cast<IntegerType>(getOperand().getType()).getWidth();
+  auto dstWidth = cast<IntegerType>(getType()).getWidth();
   if (srcWidth == 0)
     return emitOpError("replicate does not take zero bit integer");
 
@@ -243,7 +298,7 @@ static unsigned getTotalWidth(ValueRange inputs) {
 }
 
 LogicalResult ConcatOp::verify() {
-  unsigned tyWidth = getType().cast<IntegerType>().getWidth();
+  unsigned tyWidth = cast<IntegerType>(getType()).getWidth();
   unsigned operandsTotalWidth = getTotalWidth(getInputs());
   if (tyWidth != operandsTotalWidth)
     return emitOpError("ConcatOp requires operands total width to "
@@ -258,7 +313,7 @@ void ConcatOp::build(OpBuilder &builder, OperationState &result, Value hd,
                      ValueRange tl) {
   result.addOperands(ValueRange{hd});
   result.addOperands(tl);
-  unsigned hdWidth = hd.getType().cast<IntegerType>().getWidth();
+  unsigned hdWidth = cast<IntegerType>(hd.getType()).getWidth();
   result.addTypes(builder.getIntegerType(getTotalWidth(tl) + hdWidth));
 }
 
@@ -276,8 +331,8 @@ LogicalResult ConcatOp::inferReturnTypes(
 //===----------------------------------------------------------------------===//
 
 LogicalResult ExtractOp::verify() {
-  unsigned srcWidth = getInput().getType().cast<IntegerType>().getWidth();
-  unsigned dstWidth = getType().cast<IntegerType>().getWidth();
+  unsigned srcWidth = cast<IntegerType>(getInput().getType()).getWidth();
+  unsigned dstWidth = cast<IntegerType>(getType()).getWidth();
   if (getLowBit() >= srcWidth || srcWidth - getLowBit() < dstWidth)
     return emitOpError("from bit too large for input"), failure();
 

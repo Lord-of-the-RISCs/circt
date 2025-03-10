@@ -5,18 +5,26 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 //===----------------------------------------------------------------------===//
+//
+// This file implements the C-API for FIRRTL dialect.
+//
+//===----------------------------------------------------------------------===//
 
 #include "circt-c/Dialect/FIRRTL.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
+#include "circt/Dialect/FIRRTL/Import/FIRAnnotations.h"
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Registration.h"
 #include "mlir/CAPI/Support.h"
+#include "llvm/Support/JSON.h"
 
 using namespace circt;
 using namespace firrtl;
+
+namespace json = llvm::json;
 
 //===----------------------------------------------------------------------===//
 // Dialect API.
@@ -29,39 +37,82 @@ MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(FIRRTL, firrtl,
 // Type API.
 //===----------------------------------------------------------------------===//
 
+bool firrtlTypeIsConst(MlirType type) { return isConst(unwrap(type)); }
+
+MlirType firrtlTypeGetConstType(MlirType type, bool isConst) {
+  return wrap(cast<FIRRTLBaseType>(unwrap(type)).getConstType(isConst));
+}
+
+int64_t firrtlTypeGetBitWidth(MlirType type, bool ignoreFlip) {
+  return getBitWidth(cast<FIRRTLBaseType>(unwrap(type)), ignoreFlip)
+      .value_or(-1);
+}
+
+bool firrtlTypeIsAUInt(MlirType type) { return isa<UIntType>(unwrap(type)); }
+
 MlirType firrtlTypeGetUInt(MlirContext ctx, int32_t width) {
   return wrap(UIntType::get(unwrap(ctx), width));
 }
+
+bool firrtlTypeIsASInt(MlirType type) { return isa<SIntType>(unwrap(type)); }
 
 MlirType firrtlTypeGetSInt(MlirContext ctx, int32_t width) {
   return wrap(SIntType::get(unwrap(ctx), width));
 }
 
+bool firrtlTypeIsAClock(MlirType type) { return isa<ClockType>(unwrap(type)); }
+
 MlirType firrtlTypeGetClock(MlirContext ctx) {
   return wrap(ClockType::get(unwrap(ctx)));
 }
 
+bool firrtlTypeIsAReset(MlirType type) { return isa<ResetType>(unwrap(type)); }
+
 MlirType firrtlTypeGetReset(MlirContext ctx) {
   return wrap(ResetType::get(unwrap(ctx)));
+}
+
+bool firrtlTypeIsAAsyncReset(MlirType type) {
+  return isa<AsyncResetType>(unwrap(type));
 }
 
 MlirType firrtlTypeGetAsyncReset(MlirContext ctx) {
   return wrap(AsyncResetType::get(unwrap(ctx)));
 }
 
+bool firrtlTypeIsAAnalog(MlirType type) {
+  return isa<AnalogType>(unwrap(type));
+}
+
 MlirType firrtlTypeGetAnalog(MlirContext ctx, int32_t width) {
   return wrap(AnalogType::get(unwrap(ctx), width));
 }
 
+bool firrtlTypeIsAVector(MlirType type) {
+  return isa<FVectorType>(unwrap(type));
+}
+
 MlirType firrtlTypeGetVector(MlirContext ctx, MlirType element, size_t count) {
-  auto baseType = unwrap(element).cast<FIRRTLBaseType>();
+  auto baseType = cast<FIRRTLBaseType>(unwrap(element));
   assert(baseType && "element must be base type");
 
   return wrap(FVectorType::get(baseType, count));
 }
 
+MlirType firrtlTypeGetVectorElement(MlirType vec) {
+  return wrap(cast<FVectorType>(unwrap(vec)).getElementType());
+}
+
+size_t firrtlTypeGetVectorNumElements(MlirType vec) {
+  return cast<FVectorType>(unwrap(vec)).getNumElements();
+}
+
+bool firrtlTypeIsABundle(MlirType type) {
+  return isa<BundleType>(unwrap(type));
+}
+
 bool firrtlTypeIsAOpenBundle(MlirType type) {
-  return unwrap(type).isa<OpenBundleType>();
+  return isa<OpenBundleType>(unwrap(type));
 }
 
 MlirType firrtlTypeGetBundle(MlirContext ctx, size_t count,
@@ -73,7 +124,7 @@ MlirType firrtlTypeGetBundle(MlirContext ctx, size_t count,
 
   for (size_t i = 0; i < count; i++) {
     auto field = fields[i];
-    auto type = unwrap(field.type).cast<FIRRTLType>();
+    auto type = cast<FIRRTLType>(unwrap(field.type));
     bundleFields.emplace_back(unwrap(field.name), field.isFlip, type);
     bundleCompatible &= isa<BundleType::ElementType>(type);
   }
@@ -90,11 +141,40 @@ MlirType firrtlTypeGetBundle(MlirContext ctx, size_t count,
   return wrap(OpenBundleType::get(unwrap(ctx), bundleFields));
 }
 
+size_t firrtlTypeGetBundleNumFields(MlirType bundle) {
+  if (auto bundleType = dyn_cast<BundleType>(unwrap(bundle))) {
+    return bundleType.getNumElements();
+  } else if (auto bundleType = dyn_cast<OpenBundleType>(unwrap(bundle))) {
+    return bundleType.getNumElements();
+  } else {
+    llvm_unreachable("must be a bundle type");
+  }
+}
+
+bool firrtlTypeGetBundleFieldByIndex(MlirType type, size_t index,
+                                     FIRRTLBundleField *field) {
+  auto unwrapped = unwrap(type);
+
+  auto cvt = [field](auto element) {
+    field->name = wrap(element.name);
+    field->isFlip = element.isFlip;
+    field->type = wrap(element.type);
+  };
+  if (auto bundleType = dyn_cast<BundleType>(unwrapped)) {
+    cvt(bundleType.getElement(index));
+    return true;
+  } else if (auto bundleType = dyn_cast<OpenBundleType>(unwrapped)) {
+    cvt(bundleType.getElement(index));
+    return true;
+  }
+  return false;
+}
+
 unsigned firrtlTypeGetBundleFieldIndex(MlirType type, MlirStringRef fieldName) {
   std::optional<unsigned> fieldIndex;
-  if (auto bundleType = unwrap(type).dyn_cast<BundleType>()) {
+  if (auto bundleType = dyn_cast<BundleType>(unwrap(type))) {
     fieldIndex = bundleType.getElementIndex(unwrap(fieldName));
-  } else if (auto bundleType = unwrap(type).dyn_cast<OpenBundleType>()) {
+  } else if (auto bundleType = dyn_cast<OpenBundleType>(unwrap(type))) {
     fieldIndex = bundleType.getElementIndex(unwrap(fieldName));
   } else {
     llvm_unreachable("must be a bundle type");
@@ -103,48 +183,74 @@ unsigned firrtlTypeGetBundleFieldIndex(MlirType type, MlirStringRef fieldName) {
   return fieldIndex.value();
 }
 
+bool firrtlTypeIsARef(MlirType type) { return isa<RefType>(unwrap(type)); }
+
 MlirType firrtlTypeGetRef(MlirType target, bool forceable) {
-  auto baseType = unwrap(target).dyn_cast<FIRRTLBaseType>();
+  auto baseType = dyn_cast<FIRRTLBaseType>(unwrap(target));
   assert(baseType && "target must be base type");
 
   return wrap(RefType::get(baseType, forceable));
+}
+
+bool firrtlTypeIsAAnyRef(MlirType type) {
+  return isa<AnyRefType>(unwrap(type));
 }
 
 MlirType firrtlTypeGetAnyRef(MlirContext ctx) {
   return wrap(AnyRefType::get(unwrap(ctx)));
 }
 
+bool firrtlTypeIsAInteger(MlirType type) {
+  return isa<FIntegerType>(unwrap(type));
+}
+
 MlirType firrtlTypeGetInteger(MlirContext ctx) {
   return wrap(FIntegerType::get(unwrap(ctx)));
+}
+
+bool firrtlTypeIsADouble(MlirType type) {
+  return isa<DoubleType>(unwrap(type));
 }
 
 MlirType firrtlTypeGetDouble(MlirContext ctx) {
   return wrap(DoubleType::get(unwrap(ctx)));
 }
 
+bool firrtlTypeIsAString(MlirType type) {
+  return isa<StringType>(unwrap(type));
+}
+
 MlirType firrtlTypeGetString(MlirContext ctx) {
   return wrap(StringType::get(unwrap(ctx)));
 }
+
+bool firrtlTypeIsABoolean(MlirType type) { return isa<BoolType>(unwrap(type)); }
 
 MlirType firrtlTypeGetBoolean(MlirContext ctx) {
   return wrap(BoolType::get(unwrap(ctx)));
 }
 
+bool firrtlTypeIsAPath(MlirType type) { return isa<PathType>(unwrap(type)); }
+
 MlirType firrtlTypeGetPath(MlirContext ctx) {
   return wrap(PathType::get(unwrap(ctx)));
 }
 
+bool firrtlTypeIsAList(MlirType type) { return isa<ListType>(unwrap(type)); }
+
 MlirType firrtlTypeGetList(MlirContext ctx, MlirType elementType) {
-  auto type = unwrap(elementType).dyn_cast<PropertyType>();
+  auto type = dyn_cast<PropertyType>(unwrap(elementType));
   assert(type && "element must be property type");
 
   return wrap(ListType::get(unwrap(ctx), type));
 }
 
+bool firrtlTypeIsAClass(MlirType type) { return isa<ClassType>(unwrap(type)); }
+
 MlirType firrtlTypeGetClass(MlirContext ctx, MlirAttribute name,
                             size_t numberOfElements,
                             const FIRRTLClassElement *elements) {
-  auto nameSymbol = unwrap(name).dyn_cast<FlatSymbolRefAttr>();
+  auto nameSymbol = dyn_cast<FlatSymbolRefAttr>(unwrap(name));
   assert(nameSymbol && "name must be FlatSymbolRefAttr");
 
   SmallVector<ClassElement, 4> classElements;
@@ -157,6 +263,12 @@ MlirType firrtlTypeGetClass(MlirContext ctx, MlirAttribute name,
     classElements.emplace_back(unwrap(element.name), unwrap(element.type), dir);
   }
   return wrap(ClassType::get(unwrap(ctx), nameSymbol, classElements));
+}
+
+MlirType firrtlTypeGetMaskType(MlirType type) {
+  auto baseType = type_dyn_cast<FIRRTLBaseType>(unwrap(type));
+  assert(baseType && "unexpected type, must be base type");
+  return wrap(baseType.getMaskType());
 }
 
 //===----------------------------------------------------------------------===//
@@ -177,6 +289,22 @@ MlirAttribute firrtlAttrGetConvention(MlirContext ctx,
   }
 
   return wrap(ConventionAttr::get(unwrap(ctx), value));
+}
+
+MlirAttribute firrtlAttrGetLayerConvention(MlirContext ctx,
+                                           FIRRTLLayerConvention convention) {
+  LayerConvention value;
+
+  switch (convention) {
+  case FIRRTL_LAYER_CONVENTION_BIND:
+    value = LayerConvention::Bind;
+    break;
+  case FIRRTL_LAYER_CONVENTION_INLINE:
+    value = LayerConvention::Inline;
+    break;
+  }
+
+  return wrap(LayerConventionAttr::get(unwrap(ctx), value));
 }
 
 MlirAttribute firrtlAttrGetPortDirs(MlirContext ctx, size_t count,
@@ -277,6 +405,12 @@ MlirAttribute firrtlAttrGetEventControl(MlirContext ctx,
   return wrap(EventControlAttr::get(unwrap(ctx), value));
 }
 
+MlirAttribute firrtlAttrGetIntegerFromString(MlirType type, unsigned numBits,
+                                             MlirStringRef str, uint8_t radix) {
+  auto value = APInt{numBits, unwrap(str), radix};
+  return wrap(IntegerAttr::get(unwrap(type), value));
+}
+
 FIRRTLValueFlow firrtlValueFoldFlow(MlirValue value, FIRRTLValueFlow flow) {
   Flow flowValue;
 
@@ -307,4 +441,26 @@ FIRRTLValueFlow firrtlValueFoldFlow(MlirValue value, FIRRTLValueFlow flow) {
   case Flow::Duplex:
     return FIRRTL_VALUE_FLOW_DUPLEX;
   }
+  llvm_unreachable("invalid flow");
+}
+
+bool firrtlImportAnnotationsFromJSONRaw(
+    MlirContext ctx, MlirStringRef annotationsStr,
+    MlirAttribute *importedAnnotationsArray) {
+  auto annotations = json::parse(unwrap(annotationsStr));
+  if (!annotations) {
+    return false;
+  }
+
+  auto *ctxUnwrapped = unwrap(ctx);
+
+  json::Path::Root root;
+  SmallVector<Attribute> annos;
+  if (!importAnnotationsFromJSONRaw(annotations.get(), annos, root,
+                                    ctxUnwrapped)) {
+    return false;
+  }
+
+  *importedAnnotationsArray = wrap(ArrayAttr::get(ctxUnwrapped, annos));
+  return true;
 }

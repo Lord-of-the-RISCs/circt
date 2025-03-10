@@ -32,7 +32,7 @@ TEST(JSONTest, RoundTripTypes) {
 
   NamedAttrList mapping;
 
-  auto floatAttr = FloatAttr::get(FloatType::getF64(&context), 123.4);
+  auto floatAttr = FloatAttr::get(Float64Type::get(&context), 123.4);
   mapping.append("float", floatAttr);
 
   auto intAttr = IntegerAttr::get(i64ty, 567);
@@ -72,8 +72,8 @@ TEST(JSONTest, RoundTripTypes) {
   ASSERT_TRUE(bool(jsonValue));
 
   json::Path::Root root;
-  auto dict = convertJSONToAttribute(&context, jsonValue.get(), root)
-                  .cast<DictionaryAttr>();
+  auto dict = cast<DictionaryAttr>(
+      convertJSONToAttribute(&context, jsonValue.get(), root));
 
   ASSERT_EQ(floatAttr, dict.getAs<FloatAttr>("float"));
   ASSERT_EQ(intAttr, dict.getAs<IntegerAttr>("int"));

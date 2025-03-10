@@ -27,7 +27,7 @@ indicate to the compiler that a wire "foo" should not be optimized away.
 ```json
 {
   "class":"firrtl.transforms.DontTouchAnnotation",
-  "target""~MyCircuit|MyModule>foo"
+  "target":"~MyCircuit|MyModule>foo"
 }
 ```
 
@@ -345,6 +345,34 @@ The options are:
 }
 ```
 
+### BodyTypeLoweringAnnotation
+
+| Property            | Type   | Description                                          |
+| ------------------- | ------ | ---------------------------------------------------- |
+| class               | string | `circt.BodyTypeLoweringAnnotation`                   |
+| convention          | string | See `Convention` annotation                          |
+| target              | string | See `Convention` annotation                          |
+| includeHierarchy    | bool   | Apply the convention to all modules in the hierarchy |
+
+Specify the type lowering option for module internal signals.
+This is similar to the `Convention` annotation, but for internal signals
+rather than module ports. Refer to the `Convention` annotation for each
+property description.
+
+When `includeHierarchy` is `false`, it indicates the convention is applied only to
+the specified module. If `includeHierarchy` is `true`, the convention is applied to
+all modules in the hierarchy. If there are multiple annotation instances that specify
+conventions, the `scalarized` convention takes precedence over the `internal` convention.
+
+```json
+{
+  "class": "circt.BodyTypeLoweringAnnotation",
+  "convention": "scalarized",
+  "target": "~Foo|Bar",
+  "includeHierarchy": true
+}
+```
+
 ### ElaborationArtefactsDirectory
 
 | Property   | Type   | Description                                              |
@@ -474,28 +502,80 @@ Example:
 }
 ```
 
+### FullResetAnnotation
+
+| Property   | Type   | Description                      |
+| ---------- | ------ | -------------                    |
+| class      | string | `circt.FullAsyncResetAnnotation` |
+| target     | string | Reference target                 |
+| resetType  | string | "async" or "sync"                |
+
+
+The target must be a signal that is a reset. The type of the signal must be (or inferred
+to be) the same as the reset type specified in the annotation.
+
+Indicates that all reset-less registers which are children of the module containing
+the target will have the reset targeted attached, with a reset value of 0.
+
+The module containing the target of this annotation is not allowed to reside in multiple
+hierarchies.
+
+Example:
+```json
+{
+  "class": "circt.FullResetAnnotation",
+  "target": "~Foo|Bar/d:Baz>reset",
+  "resetType": "async"
+}
+```
+
+### ExcludeFromFullResetAnnotation
+
+| Property   | Type   | Description                            |
+| ---------- | ------ | -------------                          |
+| class      | string | `circt.ExcludeFromFullResetAnnotation` |
+| target     | string | Reference target                       |
+
+This annotation indicates that the target moudle should be excluded from the
+FullResetAnnotation of a parent module.
+
+Example:
+```json
+{
+  "class": "circt.IgnoreFullAsyncResetAnnotation",
+  "target": "~Foo|Bar/d:Baz"
+}
+```
+
 ### FullAsyncResetAnnotation
+
+**Deprecated, use FullResetAnnotation**
 
 | Property   | Type   | Description                                         |
 | ---------- | ------ | -------------                                       |
 | class      | string | `sifive.enterprise.firrtl.FullAsyncResetAnnotation` |
 | target     | string | Reference target                                    |
 
-Indicates that all reset-less registers which are children of the target will
-have an asynchronous reset attached, with a reset value of 0.
 
-A module targeted by this annotation is not allowed to reside in multiple
+The target must be a signal that is or is inferred to be an asynchronous reset.
+
+Indicates that all reset-less registers which are children of the module containing
+the target will have the asynchronous reset targeted attached, with a reset value of 0.
+
+The module containing the target of this annotation is not allowed to reside in multiple
 hierarchies.
 
 Example:
 ```json
 {
   "class": "sifive.enterprise.firrtl.FullAsyncResetAnnotation",
-  "target": "~Foo|Bar/d:Baz"
+  "target": "~Foo|Bar/d:Baz>reset"
 }
 ```
 
 ### IgnoreFullAsyncResetAnnotation
+
+**Deprecated, use ExcludeFromFullResetAnnotation**
 
 | Property   | Type   | Description                                               |
 | ---------- | ------ | -------------                                             |
@@ -652,131 +732,6 @@ Example:
 }
 ```
 
-### NestedPrefixModulesAnnotation
-
-| Property   | Type   | Description                                              |
-| ---------- | ------ | -------------                                            |
-| class      | string | `sifive.enterprise.firrtl.NestedPrefixModulesAnnotation` |
-| prefix     | string | Prefix to use                                            |
-| inclusive  | bool   | Whether this prefix is inclusive of the target           |
-
-This annotations prefixes all module names under the target with the required
-prefix.  If `inclusive` is true, it includes the target module in the renaming.
-If `inclusive` is false, it will only rename modules instantiated underneath
-the target module.  If a module is required to have two different prefixes, it
-will be cloned.
-
-This annotation is also applied to any interfaces or modules generated by the
-Grand Central Views/Interfaces pass.  This annotation is applied _before_
-`PrefixInterfacesAnnotation`.
-
-Example:
-```json
-{
-  "class": "sifive.enterprise.firrtl.NestedPrefixModulesAnnotation",
-  "prefix": "MyPrefix_",
-  "inclusive": true
-}
-```
-
-### OMIRFileAnnotation
-
-| Property   | Type   | Description                                           |
-| ---------- | ------ | -------------                                         |
-| class      | string | `freechips.rocketchip.objectmodel.OMIRFileAnnotation` |
-| filename   | string | Output file to emit OMIR to                           |
-
-This annotation defines the output file to write the JSON-serialized OMIR to after compilation.
-
-Example:
-```json
-{
-  "class": "freechips.rocketchip.objectmodel.OMIRFileAnnotation",
-  "filename": "path/to/omir.json"
-}
-```
-
-### OMIRAnnotation
-
-| Property   | Type   | Description                                       |
-| ---------- | ------ | -------------                                     |
-| class      | string | `freechips.rocketchip.objectmodel.OMIRAnnotation` |
-| nodes      | array  | A list of OMIR nodes                              |
-
-This annotation specifies a piece of Object Model 2.0 IR. The `nodes` field
-is an array of individual OMIR nodes (Scala class `OMNode`), which have the
-following form:
-```json
-{
-  "info": "@[FileA line:col FileB line:col ...]",
-  "id": "OMID:42",
-  "fields": [/*...*/]
-}
-```
-The `fields` entry is an array of individual OMIR fields (Scala class `OMField`), which have the following form:
-```json
-{
-  "info": "@[FileA line:col FileB line:col ...]",
-  "name": "foo",
-  "value": /*...*/
-}
-```
-The `value` field can be a JSON array or dictionary (corresponding to the `OMArray` and `OMMap` Scala classes, respectively), or any of the string-encoded OMIR classes:
-
-- `OMMap:<fields>`
-- `OMArray:<elements>`
-- `OMReference:<id>`
-- `OMBigInt:<value>`
-- `OMInt:<value>`
-- `OMLong:<value>`
-- `OMString:<value>`
-- `OMBoolean:<value>`
-- `OMDouble:<value>`
-- `OMBigDecimal:<value>`
-- `OMFrozenTarget:<omir>`
-- `OMDeleted`
-- `OMReferenceTarget:<target>`
-- `OMMemberReferenceTarget:<target>`
-- `OMMemberInstanceTarget:<target>`
-- `OMInstanceTarget:<target>`
-- `OMDontTouchedReferenceTarget:<target>`
-
-Example:
-```json
-{
-  "class": "freechips.rocketchip.objectmodel.OMIRAnnotation",
-  "nodes": [
-    {
-      "info": "",
-      "id": "OMID:0",
-      "fields": [
-        {"info": "", "name": "a", "value": "OMReference:0"},
-        {"info": "", "name": "b", "value": "OMBigInt:42"},
-        {"info": "", "name": "c", "value": "OMLong:ff"},
-        {"info": "", "name": "d", "value": "OMString:hello"},
-        {"info": "", "name": "f", "value": "OMBigDecimal:10.5"},
-        {"info": "", "name": "g", "value": "OMDeleted:"},
-        {"info": "", "name": "i", "value": 42},
-        {"info": "", "name": "j", "value": true},
-        {"info": "", "name": "k", "value": 3.14}
-      ]
-    },
-    {
-      "info": "",
-      "id": "OMID:1",
-      "fields": [
-        {"info": "", "name": "a", "value": "OMReferenceTarget:~Foo|Foo"},
-        {"info": "", "name": "b", "value": "OMInstanceTarget:~Foo|Foo"},
-        {"info": "", "name": "c", "value": "OMMemberReferenceTarget:~Foo|Foo"},
-        {"info": "", "name": "d", "value": "OMMemberInstanceTarget:~Foo|Foo"},
-        {"info": "", "name": "e", "value": "OMDontTouchedReferenceTarget:~Foo|Foo"},
-        {"info": "", "name": "f", "value": "OMReferenceTarget:~Foo|Bar"}
-      ]
-    }
-  ]
-}
-```
-
 ### RetimeModuleAnnotation
 
 | Property   | Type   | Description                                              |
@@ -811,65 +766,6 @@ Example:
   "filename": "retime_modules.json"
 }
 ```
-
-### SeqMemInstanceMetadataAnnotation
-
-| Property   | Type   | Description                                  								|
-| ---------- | ------ | -------------                                								|
-| class      | string | `sifive.enterprise.firrtl.SeqMemInstanceMetadataAnnotation` |
-| target     | string | Reference target                             								|
-
-This annotation attaches metadata to the firrtl.mem operation. The `data` is
-emitted onto the `seq_mems.json` file. It is required for verification only and
-used by memory generator tools for simulation.
-
-Example:
-```json
-{
-    "class":"sifive.enterprise.firrtl.SeqMemInstanceMetadataAnnotation",
-    "data":{
-      "baseAddress":2147483648,
-      "eccScheme":"none",
-      "eccBits":0,
-      "dataBits":8,
-      "eccIndices":[ ]
-    },
-    "target":"~CoreIPSubsystemVerifTestHarness|TLRAM>mem"
-}
-```
-
-### ScalaClassAnnotation
-
-| Property   | Type   | Description                                     |
-| ---------- | ------ | -------------                                   |
-| class      | string | `sifive.enterprise.firrtl.ScalaClassAnnotation` |
-| target     | string | Reference target                                |
-| className  | string | The corresponding class name                    |
-
-This annotation records the name of the Java or Scala class which corresponds
-to the module.
-
-Example:
-```json
-{
-  "class":"sifive.enterprise.firrtl.ScalaClassAnnotation",
-  "target":"Top.ClockGroupAggregator",
-  "className":"freechips.rocketchip.prci.ClockGroupAggregator"
-}
-```
-
-### circt.Intrinsic
-
-| Property   | Type   | Description       |
-| ---------- | ------ | -------------     |
-| class      | string | `circt.Intrinsic` |
-| target     | string | Reference target  |
-| intrinsic  | string | Name of Intrinsic |
-
-Used to indicate an external module is really an intrinsic module.  This exists
-to allow a frontend to generate intrinsics without FIRRTL language support for
-intrinsics.  It is expected this will be deprecated as soon as the FIRRTL language
-supports intrinsics.  This annotation can only be local and applied to a module.
 
 ### SitestBlackBoxAnnotation
 
@@ -908,32 +804,6 @@ Example:
 {
   "class":"sifive.enterprise.firrtl.SitestTestHarnessBlackBoxAnnotation",
   "filename":"./testharness_blackboxes.json"
-}
-```
-
-### SubCircuitsTargetDirectory
-
-| Property   | Type   | Description                                                        |
-| ---------- | ------ | -------------                                                      |
-| class      | string | `sifive.enterprise.grandcentral.phases.SubCircuitsTargetDirectory` |
-| dir        | string | The sub-circuit output directory                                   |
-
-This annotation is used to indicate the directory to serialize sub-circuits to
-by GrandCentral. Sub-circuits will be put in subdirectories of `dir`, named by
-their `circuitPackage` field.
-
-In the Scala FIRRTL compiler this is attached to the circuit with the
-commandline option `sub-circuits-target-dir`.
-```
--sub-circuit-targets-dir <dir>
--sctd <dir>
-```
-
-Example:
-```json
-{
-  "class":"sifive.enterprise.grandcentral.phases.SubCircuitsTargetDirectory",
-  "dir":"verilog/verif.subcircuits"
 }
 ```
 
@@ -1020,9 +890,9 @@ Example:
 | group       | string | Name of an optional wrapper module under which to group extracted instances |
 
 This annotation causes the `ExtractInstances` pass to move instances of
-extmodules with defname `EICG_wrapper` upwards in the hierarchy, either out of
-the DUT if `group` is omitted or empty, or into a submodule of the DUT with the
-name given in `group`. The wiring prefix is hard-coded to `clock_gate`.
+extmodules whose defnames end in `EICG_wrapper` upwards in the hierarchy, either
+out of the DUT if `group` is omitted or empty, or into a submodule of the DUT
+with the name given in `group`. The wiring prefix is hard-coded to `clock_gate`.
 
 Applies to the circuit.
 
@@ -1106,21 +976,12 @@ array.
 A reference target is a JSON serialization of a regular reference target
 string.
 
-#### UnknownGroundType
-
-| Property   | Type   | Description                                                          |
-| ---------- | ------ | -------------                                                        |
-| class      | string | `sifive.enterprise.grandcentral.GrandCentralView$UnknownGroundType$` |
-
-This represents an unknown FIRRTL ground type.
-
 #### AugmentedGroundType
 
 | Property   | Type   | Description                                          |
 | ---------- | ------ | -------------                                        |
 | class      | string | `sifive.enterprise.grandcentral.AugmentedGroundType` |
 | ref        | object | ReferenceTarget of the target component              |
-| tpe        | object | UnknownGroundType                                    |
 
 Creates a SystemVerilog logic type.
 
@@ -1143,9 +1004,6 @@ Example:
         "value": 0
       }
     ]
-  },
-  "tpe": {
-    "class": "sifive.enterprise.grandcentral.GrandCentralView$UnknownGroundType$"
   }
 }
 ```
@@ -1155,7 +1013,7 @@ Example:
 | Property   | Type   | Description                                          |
 | ---------- | ------ | -------------                                        |
 | class      | string | `sifive.enterprise.grandcentral.AugmentedVectorType` |
-| elements   | array  | List of augmented types.
+| elements   | array  | List of augmented types.                             |
 
 Creates a SystemVerilog unpacked array.
 
@@ -1302,29 +1160,6 @@ Example:
   "class": "sifive.enterprise.grandcentral.ExtractGrandCentralAnnotation",
   "directory": "gct-dir",
   "filename": "gct-dir/bindings.sv"
-}
-```
-
-#### PrefixInterfacesAnnotation
-
-| Property | Type   | Description                                               |
-|----------|--------|-----------------------------------------------------------|
-| class    | string | sifive.enterprise.grandcentral.PrefixInterfacesAnnotation |
-| prefix   | string | A prefix to apply to all interface names                  |
-
-This annotation can be used to set a global prefix for all interfaces generated
-by Grand Central, including nested interfaces.  The prefix will be applied
-_after_ any prefixes set by `NestedPrefixModulesAnnotation`.
-
-This annotation may only exist zero or one times.  This differs from the SFC
-implementation which will choose the first instance of this annotation.
-
-Example:
-
-``` json
-{
-  "class": "sifive.enterprise.grandcentral.PrefixInterfacesAnnotation",
-  "prefix": "PREFIX_"
 }
 ```
 
@@ -1514,6 +1349,26 @@ Example:
 }
 ```
 
+### OutputDirAnnotation
+
+| Property   | Type   | Description                             |
+| ---------- | ------ | --------------------------------------- |
+| class      | string | `circt.OutputDirAnnotation`             |
+| dirname    | string | The output directory                    |
+| target     | string | Reference target                        |
+
+Specify the output directory for a module. The target must be a public module,
+and must be local.
+
+Example:
+```json
+{
+  "class": "circt.OutputDirAnnotation",
+  "dirname": "verification",
+  "target": "~Foo|Bar"
+}
+```
+
 ## Attributes in SV
 
 Some annotations transform into attributes consumed by non-FIRRTL passes.  This
@@ -1569,4 +1424,3 @@ modules' bind file. This attribute has type `OutputFileAttr`.
 
 Used by SVExtractTestCode.  Indicates a module whose instances should be
 extracted from the circuit in the indicated extraction type.
-

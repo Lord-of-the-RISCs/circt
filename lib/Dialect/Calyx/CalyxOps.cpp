@@ -12,11 +12,13 @@
 
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/FSM/FSMOps.h"
 #include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/DialectImplementation.h"
@@ -132,8 +134,8 @@ static std::string valueName(Operation *scopeOp, Value v) {
 /// port on a cell interface.
 static bool isPort(Value value) {
   Operation *definingOp = value.getDefiningOp();
-  return value.isa<BlockArgument>() ||
-         (definingOp && isa<CellInterface>(definingOp));
+  return isa<BlockArgument>(value) ||
+         isa_and_nonnull<CellInterface>(definingOp);
 }
 
 /// Gets the port for a given BlockArgument.
@@ -356,7 +358,7 @@ static void eraseControlWithGroupAndConditional(OpTy op,
       rewriter.eraseOp(group);
   }
   // Check the conditional after the Group, since it will be driven within.
-  if (!cond.isa<BlockArgument>() && cond.getDefiningOp()->use_empty())
+  if (!isa<BlockArgument>(cond) && cond.getDefiningOp()->use_empty())
     rewriter.eraseOp(cond.getDefiningOp());
 }
 
@@ -373,7 +375,7 @@ static void eraseControlWithConditional(OpTy op, PatternRewriter &rewriter) {
   rewriter.eraseOp(op);
 
   // Check if conditional is still needed, and remove if it isn't
-  if (!cond.isa<BlockArgument>() && cond.getDefiningOp()->use_empty())
+  if (!isa<BlockArgument>(cond) && cond.getDefiningOp()->use_empty())
     rewriter.eraseOp(cond.getDefiningOp());
 }
 
@@ -627,7 +629,7 @@ static Value getBlockArgumentWithName(StringRef name, ComponentOp op) {
   ArrayAttr portNames = op.getPortNames();
 
   for (size_t i = 0, e = portNames.size(); i != e; ++i) {
-    auto portName = portNames[i].cast<StringAttr>();
+    auto portName = cast<StringAttr>(portNames[i]);
     if (portName.getValue() == name)
       return op.getBodyBlock()->getArgument(i);
   }
@@ -665,10 +667,9 @@ SmallVector<PortInfo> ComponentOp::getPortInfo() {
 
   SmallVector<PortInfo> results;
   for (size_t i = 0, e = portNamesAttr.size(); i != e; ++i) {
-    results.push_back(PortInfo{portNamesAttr[i].cast<StringAttr>(),
-                               portTypes[i],
+    results.push_back(PortInfo{cast<StringAttr>(portNamesAttr[i]), portTypes[i],
                                direction::get(portDirectionsAttr[i]),
-                               portAttrs[i].cast<DictionaryAttr>()});
+                               cast<DictionaryAttr>(portAttrs[i])});
   }
   return results;
 }
@@ -745,16 +746,25 @@ LogicalResult ComponentOp::verify() {
 
   // Verify the component actually does something: has a non-empty Control
   // region, or continuous assignments.
-  bool hasNoControlConstructs =
-      getControlOp().getBodyBlock()->getOperations().empty();
+  bool hasNoControlConstructs = true;
+  getControlOp().walk<WalkOrder::PreOrder>([&](Operation *op) {
+    if (isa<EnableOp, InvokeOp, fsm::MachineOp>(op)) {
+      hasNoControlConstructs = false;
+      return WalkResult::interrupt();
+    }
+    return WalkResult::advance();
+  });
   bool hasNoAssignments =
       getWiresOp().getBodyBlock()->getOps<AssignOp>().empty();
   if (hasNoControlConstructs && hasNoAssignments)
     return emitOpError(
-        "The component currently does nothing. It needs to either have "
-        "continuous assignments in the Wires region or control constructs in "
-        "the Control region.");
-
+               "The component currently does nothing. It needs to either have "
+               "continuous assignments in the Wires region or control "
+               "constructs in the Control region. The Control region "
+               "should contain at least one of ")
+           << "'" << EnableOp::getOperationName() << "' , "
+           << "'" << InvokeOp::getOperationName() << "' or "
+           << "'" << fsm::MachineOp::getOperationName() << "'.";
   return success();
 }
 
@@ -770,7 +780,7 @@ void ComponentOp::getAsmBlockArgumentNames(
   auto ports = getPortNames();
   auto *block = &getRegion()->front();
   for (size_t i = 0, e = block->getNumArguments(); i != e; ++i)
-    setNameFn(block->getArgument(i), ports[i].cast<StringAttr>().getValue());
+    setNameFn(block->getArgument(i), cast<StringAttr>(ports[i]).getValue());
 }
 
 //===----------------------------------------------------------------------===//
@@ -784,10 +794,9 @@ SmallVector<PortInfo> CombComponentOp::getPortInfo() {
 
   SmallVector<PortInfo> results;
   for (size_t i = 0, e = portNamesAttr.size(); i != e; ++i) {
-    results.push_back(PortInfo{portNamesAttr[i].cast<StringAttr>(),
-                               portTypes[i],
+    results.push_back(PortInfo{cast<StringAttr>(portNamesAttr[i]), portTypes[i],
                                direction::get(portDirectionsAttr[i]),
-                               portAttrs[i].cast<DictionaryAttr>()});
+                               cast<DictionaryAttr>(portAttrs[i])});
   }
   return results;
 }
@@ -844,8 +853,7 @@ LogicalResult CombComponentOp::verify() {
   if (hasNoAssignments)
     return emitOpError(
         "The component currently does nothing. It needs to either have "
-        "continuous assignments in the Wires region or control constructs in "
-        "the Control region.");
+        "continuous assignments in the Wires region.");
 
   // Check that all cells are combinational
   auto cells = getOps<CellInterface>();
@@ -883,7 +891,7 @@ void CombComponentOp::getAsmBlockArgumentNames(
   auto ports = getPortNames();
   auto *block = &getRegion()->front();
   for (size_t i = 0, e = block->getNumArguments(); i != e; ++i)
-    setNameFn(block->getArgument(i), ports[i].cast<StringAttr>().getValue());
+    setNameFn(block->getArgument(i), cast<StringAttr>(ports[i]).getValue());
 }
 
 //===----------------------------------------------------------------------===//
@@ -1191,6 +1199,44 @@ uint32_t CycleOp::getGroupLatency() {
 }
 
 //===----------------------------------------------------------------------===//
+// Floating Point Op
+//===----------------------------------------------------------------------===//
+FloatingPointStandard AddFOpIEEE754::getFloatingPointStandard() {
+  return FloatingPointStandard::IEEE754;
+}
+
+FloatingPointStandard MulFOpIEEE754::getFloatingPointStandard() {
+  return FloatingPointStandard::IEEE754;
+}
+
+FloatingPointStandard CompareFOpIEEE754::getFloatingPointStandard() {
+  return FloatingPointStandard::IEEE754;
+}
+
+FloatingPointStandard FpToIntOpIEEE754::getFloatingPointStandard() {
+  return FloatingPointStandard::IEEE754;
+}
+
+FloatingPointStandard IntToFpOpIEEE754::getFloatingPointStandard() {
+  return FloatingPointStandard::IEEE754;
+}
+
+FloatingPointStandard DivSqrtOpIEEE754::getFloatingPointStandard() {
+  return FloatingPointStandard::IEEE754;
+}
+
+std::string AddFOpIEEE754::getCalyxLibraryName() { return "std_addFN"; }
+
+std::string MulFOpIEEE754::getCalyxLibraryName() { return "std_mulFN"; }
+
+std::string CompareFOpIEEE754::getCalyxLibraryName() { return "std_compareFN"; }
+
+std::string FpToIntOpIEEE754::getCalyxLibraryName() { return "std_fpToInt"; }
+
+std::string IntToFpOpIEEE754::getCalyxLibraryName() { return "std_intToFp"; }
+
+std::string DivSqrtOpIEEE754::getCalyxLibraryName() { return "std_divSqrtFN"; }
+//===----------------------------------------------------------------------===//
 // GroupInterface
 //===----------------------------------------------------------------------===//
 
@@ -1429,12 +1475,12 @@ static void getCellAsmResultNames(OpAsmSetValueNameFn setNameFn, Operation *op,
 static LogicalResult verifyPortDirection(Operation *op, Value value,
                                          bool isDestination) {
   Operation *definingOp = value.getDefiningOp();
-  bool isComponentPort = value.isa<BlockArgument>(),
-       isCellInterfacePort = definingOp && isa<CellInterface>(definingOp);
+  bool isComponentPort = isa<BlockArgument>(value),
+       isCellInterfacePort = isa_and_nonnull<CellInterface>(definingOp);
   assert((isComponentPort || isCellInterfacePort) && "Not a port.");
 
   PortInfo port = isComponentPort
-                      ? getPortInfo(value.cast<BlockArgument>())
+                      ? getPortInfo(cast<BlockArgument>(value))
                       : cast<CellInterface>(definingOp).portInfo(value);
 
   bool isSource = !isDestination;
@@ -1623,7 +1669,7 @@ void InstanceOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
 SmallVector<StringRef> InstanceOp::portNames() {
   SmallVector<StringRef> portNames;
   for (Attribute name : getReferencedComponent().getPortNames())
-    portNames.push_back(name.cast<StringAttr>().getValue());
+    portNames.push_back(cast<StringAttr>(name).getValue());
   return portNames;
 }
 
@@ -1694,8 +1740,8 @@ verifyPrimitiveOpType(PrimitiveOp instance,
            << " but got " << numParams;
 
   for (size_t i = 0; i != numExpected; ++i) {
-    auto param = parameters[i].cast<circt::hw::ParamDeclAttr>();
-    auto modParam = modParameters[i].cast<circt::hw::ParamDeclAttr>();
+    auto param = cast<circt::hw::ParamDeclAttr>(parameters[i]);
+    auto modParam = cast<circt::hw::ParamDeclAttr>(modParameters[i]);
 
     auto paramName = param.getName();
     if (paramName != modParam.getName())
@@ -1883,7 +1929,7 @@ static void printParameterList(OpAsmPrinter &p, Operation *op,
 
   p << '<';
   llvm::interleaveComma(parameters, p, [&](Attribute param) {
-    auto paramAttr = param.cast<hw::ParamDeclAttr>();
+    auto paramAttr = cast<hw::ParamDeclAttr>(param);
     p << paramAttr.getName().getValue() << ": " << paramAttr.getType();
     if (auto value = paramAttr.getValue()) {
       p << " = ";
@@ -1944,6 +1990,77 @@ void GroupDoneOp::print(OpAsmPrinter &p) { printGroupPort(p, *this); }
 ParseResult GroupDoneOp::parse(OpAsmParser &parser, OperationState &result) {
   return parseGroupPort(parser, result);
 }
+
+//===----------------------------------------------------------------------===//
+// ConstantOp
+//===----------------------------------------------------------------------===//
+void ConstantOp::getAsmResultNames(
+    function_ref<void(Value, StringRef)> setNameFn) {
+  if (isa<FloatAttr>(getValue())) {
+    setNameFn(getResult(), "cst");
+    return;
+  }
+  auto intCst = llvm::dyn_cast<IntegerAttr>(getValue());
+  auto intType = llvm::dyn_cast<IntegerType>(getType());
+
+  // Sugar i1 constants with 'true' and 'false'.
+  if (intType && intType.getWidth() == 1)
+    return setNameFn(getResult(), intCst.getInt() > 0 ? "true" : "false");
+
+  // Otherwise, build a complex name with the value and type.
+  SmallString<32> specialNameBuffer;
+  llvm::raw_svector_ostream specialName(specialNameBuffer);
+  specialName << 'c' << intCst.getValue();
+  if (intType)
+    specialName << '_' << getType();
+  setNameFn(getResult(), specialName.str());
+}
+
+LogicalResult ConstantOp::verify() {
+  auto type = getType();
+  assert(isa<IntegerType>(type) && "must be an IntegerType");
+  // The value's bit width must match the return type bitwidth.
+  if (auto valTyBitWidth = getValue().getType().getIntOrFloatBitWidth();
+      valTyBitWidth != type.getIntOrFloatBitWidth()) {
+    return emitOpError() << "value type bit width" << valTyBitWidth
+                         << " must match return type: "
+                         << type.getIntOrFloatBitWidth();
+  }
+  // Integer values must be signless.
+  if (llvm::isa<IntegerType>(type) &&
+      !llvm::cast<IntegerType>(type).isSignless())
+    return emitOpError("integer return type must be signless");
+  // Any float or integers attribute are acceptable.
+  if (!llvm::isa<IntegerAttr, FloatAttr>(getValue())) {
+    return emitOpError("value must be an integer or float attribute");
+  }
+
+  return success();
+}
+
+OpFoldResult calyx::ConstantOp::fold(FoldAdaptor adaptor) {
+  return getValueAttr();
+}
+
+void calyx::ConstantOp::build(OpBuilder &builder, OperationState &state,
+                              StringRef symName, Attribute attr, Type type) {
+  state.addAttribute(SymbolTable::getSymbolAttrName(),
+                     builder.getStringAttr(symName));
+  state.addAttribute("value", attr);
+  SmallVector<Type> types;
+  types.push_back(type); // Out
+  state.addTypes(types);
+}
+
+SmallVector<StringRef> ConstantOp::portNames() { return {"out"}; }
+
+SmallVector<Direction> ConstantOp::portDirections() { return {Output}; }
+
+SmallVector<DictionaryAttr> ConstantOp::portAttributes() {
+  return {DictionaryAttr::get(getContext())};
+}
+
+bool ConstantOp::isCombinational() { return true; }
 
 //===----------------------------------------------------------------------===//
 // RegisterOp
@@ -2065,8 +2182,8 @@ LogicalResult MemoryOp::verify() {
            << numAddrs;
 
   for (size_t i = 0; i < numDims; ++i) {
-    int64_t size = opSizes[i].cast<IntegerAttr>().getInt();
-    int64_t addrSize = opAddrSizes[i].cast<IntegerAttr>().getInt();
+    int64_t size = cast<IntegerAttr>(opSizes[i]).getInt();
+    int64_t addrSize = cast<IntegerAttr>(opAddrSizes[i]).getInt();
     if (llvm::Log2_64_Ceil(size) > addrSize)
       return emitOpError("address size (")
              << addrSize << ") for dimension " << i
@@ -2092,8 +2209,8 @@ SmallVector<StringRef> SeqMemoryOp::portNames() {
         StringAttr::get(this->getContext(), "addr" + std::to_string(i));
     portNames.push_back(nameAttr.getValue());
   }
-  portNames.append({"write_data", "write_en", "write_done", clkPort,
-                    "read_data", "read_en", "read_done"});
+  portNames.append({clkPort, "reset", "content_en", "write_en", "write_data",
+                    "read_data", "done"});
   return portNames;
 }
 
@@ -2101,7 +2218,7 @@ SmallVector<Direction> SeqMemoryOp::portDirections() {
   SmallVector<Direction> portDirections;
   for (size_t i = 0, e = getAddrSizes().size(); i != e; ++i)
     portDirections.push_back(Input);
-  portDirections.append({Input, Input, Output, Input, Output, Input, Output});
+  portDirections.append({Input, Input, Input, Input, Input, Output, Output});
   return portDirections;
 }
 
@@ -2115,19 +2232,18 @@ SmallVector<DictionaryAttr> SeqMemoryOp::portAttributes() {
   // Use a boolean to indicate this attribute is used.
   IntegerAttr isSet = IntegerAttr::get(builder.getIndexType(), 1);
   IntegerAttr isTwo = IntegerAttr::get(builder.getIndexType(), 2);
-  NamedAttrList writeEn, writeDone, clk, reset, readEn, readDone;
-  writeEn.append(goPort, isSet);
-  writeDone.append(donePort, isSet);
+  NamedAttrList done, clk, reset, contentEn;
+  done.append(donePort, isSet);
   clk.append(clkPort, isSet);
-  readEn.append(goPort, isTwo);
-  readDone.append(donePort, isTwo);
-  portAttributes.append({DictionaryAttr::get(context),     // Write Data
-                         writeEn.getDictionary(context),   // Write enable
-                         writeDone.getDictionary(context), // Write done
-                         clk.getDictionary(context),       // Clk
-                         DictionaryAttr::get(context),     // Out
-                         readEn.getDictionary(context),    // Read enable
-                         readDone.getDictionary(context)}  // Read done
+  clk.append(resetPort, isSet);
+  contentEn.append(goPort, isTwo);
+  portAttributes.append({clk.getDictionary(context),       // Clk
+                         reset.getDictionary(context),     // Reset
+                         contentEn.getDictionary(context), // Content enable
+                         DictionaryAttr::get(context),     // Write enable
+                         DictionaryAttr::get(context),     // Write data
+                         DictionaryAttr::get(context),     // Read data
+                         done.getDictionary(context)}      // Done
   );
   return portAttributes;
 }
@@ -2143,13 +2259,13 @@ void SeqMemoryOp::build(OpBuilder &builder, OperationState &state,
   SmallVector<Type> types;
   for (int64_t size : addrSizes)
     types.push_back(builder.getIntegerType(size)); // Addresses
-  types.push_back(builder.getIntegerType(width));  // Write data
-  types.push_back(builder.getI1Type());            // Write enable
-  types.push_back(builder.getI1Type());            // Write done
   types.push_back(builder.getI1Type());            // Clk
+  types.push_back(builder.getI1Type());            // Reset
+  types.push_back(builder.getI1Type());            // Content enable
+  types.push_back(builder.getI1Type());            // Write enable
+  types.push_back(builder.getIntegerType(width));  // Write data
   types.push_back(builder.getIntegerType(width));  // Read data
-  types.push_back(builder.getI1Type());            // Read enable
-  types.push_back(builder.getI1Type());            // Read done
+  types.push_back(builder.getI1Type());            // Done
   state.addTypes(types);
 }
 
@@ -2163,14 +2279,14 @@ LogicalResult SeqMemoryOp::verify() {
            << numDims << ") and address sizes (" << numAddrs << ")";
 
   size_t numExtraPorts =
-      7; // write data/enable/done, clk, and read data/enable/done.
+      7; // write data/enable, clk, reset, read data, content enable, and done.
   if (getNumResults() != numAddrs + numExtraPorts)
     return emitOpError("incorrect number of address ports, expected ")
            << numAddrs;
 
   for (size_t i = 0; i < numDims; ++i) {
-    int64_t size = opSizes[i].cast<IntegerAttr>().getInt();
-    int64_t addrSize = opAddrSizes[i].cast<IntegerAttr>().getInt();
+    int64_t size = cast<IntegerAttr>(opSizes[i]).getInt();
+    int64_t addrSize = cast<IntegerAttr>(opAddrSizes[i]).getInt();
     if (llvm::Log2_64_Ceil(size) > addrSize)
       return emitOpError("address size (")
              << addrSize << ") for dimension " << i
@@ -2238,6 +2354,8 @@ template <typename OpTy>
 static std::optional<EnableOp> getLastEnableOp(OpTy parent) {
   static_assert(IsAny<OpTy, SeqOp, StaticSeqOp>(),
                 "Should be a StaticSeqOp or SeqOp.");
+  if (parent.getBodyBlock()->empty())
+    return std::nullopt;
   auto &lastOp = parent.getBodyBlock()->back();
   if (auto enableOp = dyn_cast<EnableOp>(lastOp))
     return enableOp;
@@ -2607,6 +2725,30 @@ ParseResult InvokeOp::parse(OpAsmParser &parser, OperationState &result) {
     return failure();
   FlatSymbolRefAttr callee = FlatSymbolRefAttr::get(componentName);
   SMLoc loc = parser.getCurrentLocation();
+
+  SmallVector<Attribute, 4> refCells;
+  if (succeeded(parser.parseOptionalLSquare())) {
+    if (parser.parseCommaSeparatedList([&]() -> ParseResult {
+          std::string refCellName;
+          std::string externalMem;
+          NamedAttrList refCellAttr;
+          if (parser.parseKeywordOrString(&refCellName) ||
+              parser.parseEqual() || parser.parseKeywordOrString(&externalMem))
+            return failure();
+          auto externalMemAttr =
+              SymbolRefAttr::get(parser.getContext(), externalMem);
+          refCellAttr.append(StringAttr::get(parser.getContext(), refCellName),
+                             externalMemAttr);
+          refCells.push_back(
+              DictionaryAttr::get(parser.getContext(), refCellAttr));
+          return success();
+        }) ||
+        parser.parseRSquare())
+      return failure();
+  }
+  result.addAttribute("refCellsMap",
+                      ArrayAttr::get(parser.getContext(), refCells));
+
   result.addAttribute("callee", callee);
   if (parseParameterList(parser, result, ports, inputs, portNames, inputNames,
                          types))
@@ -2623,7 +2765,19 @@ ParseResult InvokeOp::parse(OpAsmParser &parser, OperationState &result) {
 }
 
 void InvokeOp::print(OpAsmPrinter &p) {
-  p << " @" << getCallee() << "(";
+  p << " @" << getCallee() << "[";
+  auto refCellNamesMap = getRefCellsMap();
+  llvm::interleaveComma(refCellNamesMap, p, [&](Attribute attr) {
+    auto dictAttr = cast<DictionaryAttr>(attr);
+    llvm::interleaveComma(dictAttr, p, [&](NamedAttribute namedAttr) {
+      auto refCellName = namedAttr.getName().str();
+      auto externalMem =
+          cast<FlatSymbolRefAttr>(namedAttr.getValue()).getValue();
+      p << refCellName << " = " << externalMem;
+    });
+  });
+  p << "](";
+
   auto ports = getPorts();
   auto inputs = getInputs();
   llvm::interleaveComma(llvm::zip(ports, inputs), p, [&](auto arg) {
@@ -2749,10 +2903,12 @@ LogicalResult InvokeOp::verify() {
     return emitOpError() << "with instance '@" << callee
                          << "', which does not exist.";
   // The argument list of invoke is empty.
-  if (getInputs().empty())
+  if (getInputs().empty() && getRefCellsMap().empty()) {
     return emitOpError() << "'@" << callee
-                         << "' has zero input and output port connections; "
+                         << "' has zero input and output port connections and "
+                            "has no passing-by-reference cells; "
                             "expected at least one.";
+  }
   size_t goPortNum = 0, donePortNum = 0;
   // They both have a go port and a done port, but the "go" port for
   // registers and memrey should be "write_en" port.
@@ -2794,7 +2950,7 @@ LogicalResult InvokeOp::verify() {
     // inputs are required to be destination ports.
     if (failed(verifyInvokeOpValue(*this, port, true)))
       return emitOpError() << "'@" << callee << "' has input '"
-                           << portName.cast<StringAttr>().getValue()
+                           << cast<StringAttr>(portName).getValue()
                            << "', which is a source port. The inputs are "
                               "required to be destination ports.";
     // The go port should not appear in the parameter list.
@@ -2804,12 +2960,12 @@ LogicalResult InvokeOp::verify() {
     // Check the direction of these source ports.
     if (failed(verifyInvokeOpValue(*this, input, false)))
       return emitOpError() << "'@" << callee << "' has output '"
-                           << inputName.cast<StringAttr>().getValue()
+                           << cast<StringAttr>(inputName).getValue()
                            << "', which is a destination port. The inputs are "
                               "required to be source ports.";
     if (failed(verifyComplexLogic(*this, input)))
       return emitOpError() << "'@" << callee << "' has '"
-                           << inputName.cast<StringAttr>().getValue()
+                           << cast<StringAttr>(inputName).getValue()
                            << "', which is not a port or constant. Complex "
                               "logic should be conducted in the guard.";
     if (input == doneValue)
@@ -2818,8 +2974,8 @@ LogicalResult InvokeOp::verify() {
     // Check if the connection uses the callee's port.
     if (port.getDefiningOp() != operation && input.getDefiningOp() != operation)
       return emitOpError() << "the connection "
-                           << portName.cast<StringAttr>().getValue() << " = "
-                           << inputName.cast<StringAttr>().getValue()
+                           << cast<StringAttr>(portName).getValue() << " = "
+                           << cast<StringAttr>(inputName).getValue()
                            << " is not defined as an input port of '@" << callee
                            << "'.";
   }

@@ -10,15 +10,22 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLVisitors.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Support/FieldRef.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_EXPANDWHENS
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -355,7 +362,7 @@ public:
     recordConnect(getFieldRefFromValue(op.getDest()), op);
   }
 
-  void visitStmt(StrictConnectOp op) {
+  void visitStmt(MatchingConnectOp op) {
     recordConnect(getFieldRefFromValue(op.getDest()), op);
   }
 
@@ -509,22 +516,29 @@ public:
   using LastConnectResolver<WhenOpVisitor>::visitExpr;
   using LastConnectResolver<WhenOpVisitor>::visitDecl;
   using LastConnectResolver<WhenOpVisitor>::visitStmt;
+  using LastConnectResolver<WhenOpVisitor>::visitStmtExpr;
 
   /// Process a block, recording each declaration, and expanding all whens.
   void process(Block &block);
 
   /// Simulation Constructs.
+  void visitStmt(VerifAssertIntrinsicOp op);
+  void visitStmt(VerifAssumeIntrinsicOp op);
+  void visitStmt(VerifCoverIntrinsicOp op);
   void visitStmt(AssertOp op);
   void visitStmt(AssumeOp op);
+  void visitStmt(UnclockedAssumeIntrinsicOp op);
   void visitStmt(CoverOp op);
   void visitStmt(ModuleOp op);
   void visitStmt(PrintFOp op);
   void visitStmt(StopOp op);
   void visitStmt(WhenOp op);
+  void visitStmt(LayerBlockOp op);
   void visitStmt(RefForceOp op);
   void visitStmt(RefForceInitialOp op);
   void visitStmt(RefReleaseOp op);
   void visitStmt(RefReleaseInitialOp op);
+  void visitStmtExpr(DPICallIntrinsicOp op);
 
 private:
   /// And a 1-bit value with the current condition.  If we are in the outer
@@ -535,9 +549,84 @@ private:
         condition.getLoc(), condition.getType(), condition, value);
   }
 
+  /// Concurrent and of a property with the current condition.  If we are in
+  /// the outer scope, i.e. not in a WhenOp region, then there is no condition.
+  Value ltlAndWithCondition(Operation *op, Value property) {
+    // Look through nodes.
+    while (auto nodeOp = property.getDefiningOp<NodeOp>())
+      property = nodeOp.getInput();
+
+    // Look through `ltl.clock` ops.
+    if (auto clockOp = property.getDefiningOp<LTLClockIntrinsicOp>()) {
+      auto input = ltlAndWithCondition(op, clockOp.getInput());
+      auto &newClockOp = createdLTLClockOps[{clockOp, input}];
+      if (!newClockOp) {
+        newClockOp = OpBuilder(op).cloneWithoutRegions(clockOp);
+        newClockOp.getInputMutable().assign(input);
+      }
+      return newClockOp;
+    }
+
+    // Otherwise create a new `ltl.and` with the condition.
+    auto &newOp = createdLTLAndOps[{condition, property}];
+    if (!newOp)
+      newOp = OpBuilder(op).createOrFold<LTLAndIntrinsicOp>(
+          condition.getLoc(), property.getType(), condition, property);
+    return newOp;
+  }
+
+  /// Overlapping implication with the condition as its antecedent and a given
+  /// property as the consequent.  If we are in the outer scope, i.e. not in a
+  /// WhenOp region, then there is no condition.
+  Value ltlImplicationWithCondition(Operation *op, Value property) {
+    // Look through nodes.
+    while (auto nodeOp = property.getDefiningOp<NodeOp>())
+      property = nodeOp.getInput();
+
+    // Look through `ltl.clock` ops.
+    if (auto clockOp = property.getDefiningOp<LTLClockIntrinsicOp>()) {
+      auto input = ltlImplicationWithCondition(op, clockOp.getInput());
+      auto &newClockOp = createdLTLClockOps[{clockOp, input}];
+      if (!newClockOp) {
+        newClockOp = OpBuilder(op).cloneWithoutRegions(clockOp);
+        newClockOp.getInputMutable().assign(input);
+      }
+      return newClockOp;
+    }
+
+    // Merge condition into `ltl.implication` left-hand side.
+    if (auto implOp = property.getDefiningOp<LTLImplicationIntrinsicOp>()) {
+      auto lhs = ltlAndWithCondition(op, implOp.getLhs());
+      auto &newImplOp = createdLTLImplicationOps[{lhs, implOp.getRhs()}];
+      if (!newImplOp) {
+        auto clonedOp = OpBuilder(op).cloneWithoutRegions(implOp);
+        clonedOp.getLhsMutable().assign(lhs);
+        newImplOp = clonedOp;
+      }
+      return newImplOp;
+    }
+
+    // Otherwise create a new `ltl.implication` with the condition on the LHS.
+    auto &newImplOp = createdLTLImplicationOps[{condition, property}];
+    if (!newImplOp)
+      newImplOp = OpBuilder(op).createOrFold<LTLImplicationIntrinsicOp>(
+          condition.getLoc(), property.getType(), condition, property);
+    return newImplOp;
+  }
+
 private:
   /// The current wrapping condition. If null, we are in the outer scope.
   Value condition;
+
+  /// The `ltl.and` operations that have been created.
+  SmallDenseMap<std::pair<Value, Value>, Value> createdLTLAndOps;
+
+  /// The `ltl.implication` operations that have been created.
+  SmallDenseMap<std::pair<Value, Value>, Value> createdLTLImplicationOps;
+
+  /// The `ltl.clock` operations that have been created.
+  SmallDenseMap<std::pair<LTLClockIntrinsicOp, Value>, LTLClockIntrinsicOp>
+      createdLTLClockOps;
 };
 } // namespace
 
@@ -555,11 +644,29 @@ void WhenOpVisitor::visitStmt(StopOp op) {
   op.getCondMutable().assign(andWithCondition(op, op.getCond()));
 }
 
+void WhenOpVisitor::visitStmt(VerifAssertIntrinsicOp op) {
+  op.getPropertyMutable().assign(
+      ltlImplicationWithCondition(op, op.getProperty()));
+}
+
+void WhenOpVisitor::visitStmt(VerifAssumeIntrinsicOp op) {
+  op.getPropertyMutable().assign(
+      ltlImplicationWithCondition(op, op.getProperty()));
+}
+
+void WhenOpVisitor::visitStmt(VerifCoverIntrinsicOp op) {
+  op.getPropertyMutable().assign(ltlAndWithCondition(op, op.getProperty()));
+}
+
 void WhenOpVisitor::visitStmt(AssertOp op) {
   op.getEnableMutable().assign(andWithCondition(op, op.getEnable()));
 }
 
 void WhenOpVisitor::visitStmt(AssumeOp op) {
+  op.getEnableMutable().assign(andWithCondition(op, op.getEnable()));
+}
+
+void WhenOpVisitor::visitStmt(UnclockedAssumeIntrinsicOp op) {
   op.getEnableMutable().assign(andWithCondition(op, op.getEnable()));
 }
 
@@ -569,6 +676,11 @@ void WhenOpVisitor::visitStmt(CoverOp op) {
 
 void WhenOpVisitor::visitStmt(WhenOp whenOp) {
   processWhenOp(whenOp, condition);
+}
+
+// NOLINTNEXTLINE(misc-no-recursion)
+void WhenOpVisitor::visitStmt(LayerBlockOp layerBlockOp) {
+  process(*layerBlockOp.getBody());
 }
 
 void WhenOpVisitor::visitStmt(RefForceOp op) {
@@ -585,6 +697,13 @@ void WhenOpVisitor::visitStmt(RefReleaseOp op) {
 
 void WhenOpVisitor::visitStmt(RefReleaseInitialOp op) {
   op.getPredicateMutable().assign(andWithCondition(op, op.getPredicate()));
+}
+
+void WhenOpVisitor::visitStmtExpr(DPICallIntrinsicOp op) {
+  if (op.getEnable())
+    op.getEnableMutable().assign(andWithCondition(op, op.getEnable()));
+  else
+    op.getEnableMutable().assign(condition);
 }
 
 /// This is a common helper that is dispatched to by the concrete visitors.
@@ -656,7 +775,7 @@ public:
   using LastConnectResolver<ModuleVisitor>::visitStmt;
   void visitStmt(WhenOp whenOp);
   void visitStmt(ConnectOp connectOp);
-  void visitStmt(StrictConnectOp connectOp);
+  void visitStmt(MatchingConnectOp connectOp);
   void visitStmt(LayerBlockOp layerBlockOp);
 
   bool run(FModuleLike op);
@@ -701,7 +820,7 @@ void ModuleVisitor::visitStmt(ConnectOp op) {
   anythingChanged |= recordConnect(getFieldRefFromValue(op.getDest()), op);
 }
 
-void ModuleVisitor::visitStmt(StrictConnectOp op) {
+void ModuleVisitor::visitStmt(MatchingConnectOp op) {
   anythingChanged |= recordConnect(getFieldRefFromValue(op.getDest()), op);
 }
 
@@ -752,7 +871,8 @@ LogicalResult ModuleVisitor::checkInitialization() {
 //===----------------------------------------------------------------------===//
 
 namespace {
-class ExpandWhensPass : public ExpandWhensBase<ExpandWhensPass> {
+class ExpandWhensPass
+    : public circt::firrtl::impl::ExpandWhensBase<ExpandWhensPass> {
   void runOnOperation() override;
 };
 } // end anonymous namespace

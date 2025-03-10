@@ -1,4 +1,4 @@
-// RUN: circt-opt %s -canonicalize='top-down=true region-simplify=false' --allow-unregistered-dialect | FileCheck %s
+// RUN: circt-opt %s -canonicalize='top-down=true region-simplify=disabled' --allow-unregistered-dialect | FileCheck %s
 
 // CHECK-LABEL: @narrowMux
 hw.module @narrowMux(in %a: i8, in %b: i8, in %c: i1, out o: i4) {
@@ -179,87 +179,6 @@ hw.module @dedupLong(in %arg0 : i7, in %arg1 : i7, in %arg2: i7, out resAnd: i7,
   %0 = comb.and %arg0, %arg1, %arg2, %arg0 : i7
   %1 = comb.or %arg0, %arg1, %arg2, %arg0 : i7
   hw.output %0, %1 : i7, i7
-}
-
-// CHECK-LABEL: hw.module @orExclusiveConcats
-hw.module @orExclusiveConcats(in %arg0 : i6, in %arg1 : i2, out o: i9) {
-  // CHECK-NEXT:    %false = hw.constant false
-  // CHECK-NEXT:    %0 = comb.concat %arg1, %false, %arg0 : i2, i1, i6
-  // CHECK-NEXT:    hw.output %0 : i9
-  %c0 = hw.constant 0 : i3
-  %0 = comb.concat %c0, %arg0 : i3, i6
-  %c1 = hw.constant 0 : i7
-  %1 = comb.concat %arg1, %c1 : i2, i7
-  %2 = comb.or %0, %1 : i9
-  hw.output %2 : i9
-}
-
-// When two concats are or'd together and have mutually-exclusive fields, they
-// can be merged together into a single concat.
-// concat0: 0aaa aaa0 0000 0bb0
-// concat1: 0000 0000 ccdd d000
-// merged:  0aaa aaa0 ccdd dbb0
-// CHECK-LABEL: hw.module @orExclusiveConcats2
-hw.module @orExclusiveConcats2(in %arg0 : i6, in %arg1 : i2, in %arg2: i2, in %arg3: i3, out o: i16) {
-  // CHECK-NEXT:    %false = hw.constant false
-  // CHECK-NEXT:    %0 = comb.concat %false, %arg0, %false, %arg2, %arg3, %arg1, %false : i1, i6, i1, i2, i3, i2, i1
-  // CHECK-NEXT:    hw.output %0 : i16
-  %c0 = hw.constant 0 : i1
-  %c1 = hw.constant 0 : i6
-  %c2 = hw.constant 0 : i1
-  %0 = comb.concat %c0, %arg0, %c1, %arg1, %c2: i1, i6, i6, i2, i1
-  %c3 = hw.constant 0 : i8
-  %c4 = hw.constant 0 : i3
-  %1 = comb.concat %c3, %arg2, %arg3, %c4 : i8, i2, i3, i3
-  %2 = comb.or %0, %1 : i16
-  hw.output %2 : i16
-}
-
-// When two concats are or'd together and have mutually-exclusive fields, they
-// can be merged together into a single concat.
-// concat0: aaaa 1111
-// concat1: 1111 10bb
-// merged:  1111 1111
-// CHECK-LABEL: hw.module @orExclusiveConcats3
-hw.module @orExclusiveConcats3(in %arg0 : i4, in %arg1 : i2, out o: i8) {
-  // CHECK-NEXT:    [[RES:%[a-z0-9_-]+]] = hw.constant -1 : i8
-  // CHECK-NEXT:    hw.output [[RES]] : i8
-  %c0 = hw.constant -1 : i4
-  %0 = comb.concat %arg0, %c0: i4, i4
-  %c1 = hw.constant -1 : i5
-  %c2 = hw.constant 0 : i1
-  %1 = comb.concat %c1, %c2, %arg1 : i5, i1, i2
-  %2 = comb.or %0, %1 : i8
-  hw.output %2 : i8
-}
-
-// CHECK-LABEL: hw.module @orMultipleExclusiveConcats
-hw.module @orMultipleExclusiveConcats(in %arg0 : i2, in %arg1 : i2, in %arg2: i2, out o: i6) {
-  // CHECK-NEXT:    %0 = comb.concat %arg0, %arg1, %arg2 : i2, i2, i2
-  // CHECK-NEXT:    hw.output %0 : i6
-  %c2 = hw.constant 0 : i2
-  %c4 = hw.constant 0 : i4
-  %0 = comb.concat %arg0, %c4: i2, i4
-  %1 = comb.concat %c2, %arg1, %c2: i2, i2, i2
-  %2 = comb.concat %c4, %arg2: i4, i2
-  %out = comb.or %0, %1, %2 : i6
-  hw.output %out : i6
-}
-
-// CHECK-LABEL: hw.module @orConcatsWithMux
-hw.module @orConcatsWithMux(in %bit: i1, in %cond: i1, out o: i6) {
-  // CHECK-NEXT:    [[RES:%[a-z0-9_-]+]] = hw.constant 0 : i4
-  // CHECK-NEXT:    %0 = comb.concat [[RES]], %cond, %bit : i4, i1, i1
-  // CHECK-NEXT:    hw.output %0 : i6
-  %c0 = hw.constant 0 : i5
-  %0 = comb.concat %c0, %bit: i5, i1
-  %c1 = hw.constant 0 : i4
-  %c2 = hw.constant 2 : i2
-  %c3 = hw.constant 0 : i2
-  %1 = comb.mux %cond, %c2, %c3 : i2
-  %2 = comb.concat %c1, %1 : i4, i2
-  %3 = comb.or %0, %2 : i6
-  hw.output %3 : i6
 }
 
 // CHECK-LABEL: @extractNested
@@ -565,6 +484,20 @@ hw.module @narrowAdditionToDirectAddition(in %x: i8, in %y: i8, out z1: i8) {
   %0 = comb.concat %x, %x : i8, i8
   %1 = comb.concat %y, %y : i8, i8
   %2 = comb.add %0, %1 : i16
+  %3 = comb.extract %2 from 0 : (i16) -> i8
+  hw.output %3 : i8
+}
+
+// Validates that narrowing preserves the two-state attribute.
+// CHECK-LABEL: hw.module @narrowAdditionToDirectAdditionTwoState
+hw.module @narrowAdditionToDirectAdditionTwoState(in %x: i8, in %y: i8, out z1: i8) {
+  // CHECK-NEXT: [[RESULT:%.+]] = comb.add bin %x, %y : i8
+  // CHECK-NEXT: hw.output [[RESULT]]
+
+  %false = hw.constant false
+  %0 = comb.concat %x, %x : i8, i8
+  %1 = comb.concat %y, %y : i8, i8
+  %2 = comb.add bin %0, %1 : i16
   %3 = comb.extract %2 from 0 : (i16) -> i8
   hw.output %3 : i8
 }
@@ -1221,17 +1154,26 @@ hw.module @test1560(in %value: i38, out a: i1) {
 }
 
 // CHECK-LABEL: hw.module @extractShift
-hw.module @extractShift(in %arg0 : i4, out o1 : i1, out o2: i1) {
+hw.module @extractShift(in %arg0 : i4, out o1 : i1, out o2: i1, out o3: i1, out o4: i1) {
   %c1 = hw.constant 1: i4
   %0 = comb.shl %c1, %arg0 : i4
+  %1 = comb.shl %c1, %arg0 : i4
+  %2 = comb.shl %c1, %arg0 : i4
 
-  // CHECK:  %0 = comb.icmp eq %arg0, %c0_i4 : i4
-  %1 = comb.extract %0 from 0 : (i4) -> i1
+  // CHECK: %[[O1:.+]] = comb.icmp eq %arg0, %c0_i4 : i4
+  %3 = comb.extract %0 from 0 : (i4) -> i1
 
-  // CHECK: %1 = comb.icmp eq %arg0, %c2_i4 : i4
-  %2 = comb.extract %0 from 2 : (i4) -> i1
-  // CHECK: hw.output %0, %1
-  hw.output %1, %2: i1, i1
+  // CHECK: %[[O2:.+]] = comb.icmp eq %arg0, %c2_i4 : i4
+  %4 = comb.extract %1 from 2 : (i4) -> i1
+
+  // CHECK: %[[O3:.+]] = comb.extract
+  %5 = comb.extract %2 from 2 : (i4) -> i1
+
+  // CHECK: %[[O4:.+]] = comb.extract
+  %6 = comb.extract %2 from 2 : (i4) -> i1
+
+  // CHECK: hw.output %[[O1]], %[[O2]], %[[O3]], %[[O4]]
+  hw.output %3, %4, %5, %6: i1, i1, i1, i1
 }
 
 // CHECK-LABEL: hw.module @moduloZeroDividend
@@ -1288,7 +1230,7 @@ hw.module @muxConstantsFold(in %cond: i1, out o: i25) {
 hw.module @muxCommon(in %cond: i1, in %cond2: i1,
                      in %arg0 : i32, in %arg1 : i32, in %arg2: i32, in %arg3: i32,
   out o1: i32, out o2: i32, out o3: i32, out o4: i32, 
-  out o5: i32, out orResult: i32, out o6: i32, out o7: i32) {
+  out o5: i32, out orResult: i32, out o6: i32, out o7: i32, out o8 : i1) {
   %allones = hw.constant -1 : i32
   %notArg0 = comb.xor %arg0, %allones : i32
 
@@ -1333,10 +1275,13 @@ hw.module @muxCommon(in %cond: i1, in %cond2: i1,
   %1 = comb.mux %cond, %arg1, %arg0 : i32
   %o7 = comb.mux %cond2, %1, %arg0 : i32
 
+  /// CHECK: [[O8:%.+]] = comb.mux [[O8]], [[O8]], [[O8]] : i1
+  %o8 = comb.mux %o8, %o8, %o8 : i1
+
   // CHECK: hw.output [[O1]], [[O2]], [[O3]], [[O4]], [[O5]], [[ORRESULT]],
-  // CHECK: [[O6]], [[O7]]
-  hw.output %o1, %o2, %o3, %o4, %o5, %orResult, %o6, %o7
-    : i32, i32, i32, i32, i32, i32, i32, i32
+  // CHECK: [[O6]], [[O7]], [[O8]]
+  hw.output %o1, %o2, %o3, %o4, %o5, %orResult, %o6, %o7, %o8
+    : i32, i32, i32, i32, i32, i32, i32, i32, i1
 }
 
 // CHECK-LABEL: @flatten_multi_use_and
@@ -1552,6 +1497,59 @@ hw.module @OrMuxSameTrueValueAndZero(in %tag_0: i1, in %tag_1: i1, in %tag_2: i1
     %add2 = comb.add %add1, %c : i32
     "terminator"(%add2) : (i32) -> ()
 }) : () -> ()
+
+// CHECK-LABEL: "test.acrossBlockCanonicalizationBarrierFlattenAndIdem"
+// CHECK: ^bb1:
+// CHECK-NEXT: %[[OUT:.+]] = comb.or %0, %1, %2 : i32
+// CHECK-NEXT: "terminator"(%[[OUT]]) : (i32) -> ()
+"test.acrossBlockCanonicalizationBarrierFlattenAndIdem"() ({
+^bb0(%arg0: i32, %arg1: i32, %arg2: i32):
+  %0 = comb.or %arg0, %arg1 : i32
+  %1 = comb.or %arg1, %arg2 : i32
+  %2 = comb.or %arg0, %arg2 : i32
+  "terminator"() : () -> ()
+^bb1:  // no predecessors
+  // Flatten and unique, but not across blocks.
+  %3 = comb.or %0, %1 : i32
+  %4 = comb.or %1, %2 : i32
+  %5 = comb.or %3, %4, %0, %1, %1, %2 : i32
+
+  "terminator"(%5) : (i32) -> ()
+}) : () -> ()
+
+// CHECK-LABEL: "test.acrossBlockCanonicalizationBarrierIdem"
+// CHECK: ^bb1:
+// CHECK-NEXT: %[[OUT1:.+]] = comb.or %0, %1 : i32
+// CHECK-NEXT: %[[OUT2:.+]] = comb.or %[[OUT1]], %arg0 : i32
+// CHECK-NEXT: "terminator"(%[[OUT1]], %[[OUT2]]) : (i32, i32) -> ()
+"test.acrossBlockCanonicalizationBarrierIdem"() ({
+^bb0(%arg0: i32, %arg1: i32, %arg2: i32):
+  %0 = comb.or %arg0, %arg1 : i32
+  %1 = comb.or %arg1, %arg2 : i32
+  "terminator"() : () -> ()
+^bb1:  // no predecessors
+  %2 = comb.or %0, %1, %1 : i32
+  %3 = comb.or %2, %0, %1, %arg0 : i32
+
+  "terminator"(%2, %3) : (i32, i32) -> ()
+}) : () -> ()
+
+// Check multi-operation idempotent operand deduplication.
+// CHECK-LABEL: @IdemTwoState
+// CHECK-NEXT: %[[ZERO:.+]] = comb.or bin %cond, %val1
+// CHECK-NEXT: %[[ONE:.+]] = comb.or bin %val1, %val2
+// Don't allow dropping these (%0/%1) due to two-state differences.
+// CHECK-NEXT: %[[TWO:.+]] = comb.or %[[ZERO]], %[[ONE]]
+// New operation should preserve two-state-ness.
+// CHECK-NEXT: %[[THREE:.+]] = comb.or bin %[[TWO]], %[[ZERO]], %[[ONE]]
+// CHECK-NEXT: hw.output %[[ZERO]], %[[ONE]], %[[TWO]], %[[THREE]]
+hw.module @IdemTwoState(in %cond: i32, in %val1: i32, in %val2: i32, out o1: i32, out o2: i32, out o3: i32, out o4: i32) {
+  %0 = comb.or bin %cond, %val1 : i32
+  %1 = comb.or bin %val1, %val2: i32
+  %2 = comb.or %0, %1 : i32
+  %3 = comb.or bin %cond, %val1, %val2, %2, %0, %1 : i32
+  hw.output %0, %1, %2, %3: i32, i32, i32, i32
+}
 
 // CHECK-LABEL: hw.module @combineOppositeBinCmpIntoConstant
 // CHECK: %[[TRUE:.+]] = hw.constant true

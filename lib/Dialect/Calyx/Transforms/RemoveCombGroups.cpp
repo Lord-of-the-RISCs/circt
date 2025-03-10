@@ -72,7 +72,6 @@
 /// }
 /// ```
 
-#include "PassDetails.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
 #include "circt/Dialect/Calyx/CalyxPasses.h"
 #include "circt/Support/LLVM.h"
@@ -80,6 +79,13 @@
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
+
+namespace circt {
+namespace calyx {
+#define GEN_PASS_DEF_REMOVECOMBGROUPS
+#include "circt/Dialect/Calyx/CalyxPasses.h.inc"
+} // namespace calyx
+} // namespace circt
 
 using namespace circt;
 using namespace calyx;
@@ -119,9 +125,10 @@ struct RemoveCombGroupsPattern : public OpRewritePattern<calyx::CombGroupOp> {
                                 PatternRewriter &rewriter) const override {
 
     auto component = combGroup->getParentOfType<ComponentOp>();
-    auto group = rewriter.replaceOpWithNewOp<calyx::GroupOp>(
-        combGroup, combGroup.getName());
+    auto group = rewriter.create<calyx::GroupOp>(combGroup.getLoc(),
+                                                 combGroup.getName());
     rewriter.mergeBlocks(combGroup.getBodyBlock(), group.getBodyBlock());
+    rewriter.replaceOp(combGroup, group);
 
     // Determine which cell results are read from the control schedule.
     SetVector<Operation *> cellsAssigned;
@@ -133,7 +140,7 @@ struct RemoveCombGroupsPattern : public OpRewritePattern<calyx::CombGroupOp> {
 
     rewriter.setInsertionPointToStart(group.getBodyBlock());
     auto oneConstant = rewriter.create<hw::ConstantOp>(
-        group.getLoc(), APInt(1, 1, /*isSigned=*/true));
+        group.getLoc(), APInt(1, 1, /*isSigned=*/true, /*implicitTrunc=*/true));
 
     // Maintain the set of cell results which have already been assigned to
     // its register within this group.
@@ -202,7 +209,7 @@ struct RemoveCombGroupsPattern : public OpRewritePattern<calyx::CombGroupOp> {
 };
 
 struct RemoveCombGroupsPass
-    : public RemoveCombGroupsBase<RemoveCombGroupsPass> {
+    : public circt::calyx::impl::RemoveCombGroupsBase<RemoveCombGroupsPass> {
   void runOnOperation() override;
 
   /// Removes 'with' groups from an operation and instead schedules the group

@@ -7,7 +7,8 @@ requires = [
 
   # MLIR build depends.
   "numpy",
-  "pybind11>=2.9",
+  "pybind11>=2.11,<=2.12",
+  "nanobind==2.4.0",
   "PyYAML",
 
   # PyCDE depends
@@ -30,7 +31,16 @@ manylinux-x86_64-image = "ghcr.io/circt/images/pycde-build"
 
 [tool.cibuildwheel.linux]
 # Use our internal auditwheel script so as to not mess up the collateral.
-repair-wheel-command = "frontends/PyCDE/auditwheel.sh {dest_dir} {wheel}"
+environment-pass = [
+  "SCCACHE_GHA_ENABLED",
+  "ACTIONS_CACHE_URL",
+  "ACTIONS_RUNTIME_TOKEN",
+  "CMAKE_GENERATOR",
+  "SETUPTOOLS_SCM_DEBUG",
+  "BUILD_TYPE",
+  "RUN_TESTS",
+  "COMPILER_LAUNCHER",
+]
 
 [project]
 name = "pycde"

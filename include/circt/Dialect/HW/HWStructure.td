@@ -17,6 +17,7 @@ include "circt/Dialect/HW/HWAttributes.td"
 include "circt/Dialect/HW/HWDialect.td"
 include "circt/Dialect/HW/HWOpInterfaces.td"
 include "circt/Dialect/HW/HWTypes.td"
+include "circt/Dialect/Emit/EmitOpInterfaces.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
 include "mlir/IR/OpAsmInterface.td"
 include "mlir/IR/OpBase.td"
@@ -112,7 +113,8 @@ class HWModuleOpBase<string mnemonic, list<Trait> traits = []> :
 
 def HWModuleOp : HWModuleOpBase<"module",
       [IsolatedFromAbove, RegionKindInterface,
-       SingleBlockImplicitTerminator<"OutputOp">]>{
+       SingleBlockImplicitTerminator<"OutputOp">,
+       HWEmittableModuleLike]>{
   let summary = "HW Module";
   let description = [{
     The "hw.module" operation represents a Verilog module, including a given
@@ -398,38 +400,6 @@ class HWInstanceOpBase<string mnemonic, list<Trait> traits = []> :
   code extraInstanceClassDeclaration = [{}];
 
   let extraClassDeclaration = extraInstanceClassDeclaration # [{
-    /// Return the name of the specified input port or null if it cannot be
-    /// determined.
-    StringAttr getArgumentName(size_t idx) {
-      return instance_like_impl::getName(getArgNames(), idx);
-    }
-
-    /// Return the name of the specified result or null if it cannot be
-    /// determined.
-    StringAttr getResultName(size_t idx) {
-      return instance_like_impl::getName(getResultNames(), idx);
-    }
-
-    /// Change the name of the specified input port.
-    void setArgumentName(size_t i, StringAttr name) {
-      setInputNames(instance_like_impl::updateName(getArgNames(), i, name));
-    }
-
-    /// Change the name of the specified output port.
-    void setResultName(size_t i, StringAttr name) {
-      setOutputNames(instance_like_impl::updateName(getResultNames(), i, name));
-    }
-
-    /// Change the names of all the input ports.
-    void setInputNames(ArrayAttr names) {
-      setArgNamesAttr(names);
-    }
-
-    /// Change the names of all the result ports.
-    void setOutputNames(ArrayAttr names) {
-      setResultNamesAttr(names);
-    }
-
     /// Return the values for the port in port order.
     /// Note: The module ports may not be input, output ordered. This computes
     /// the port index to instance result/input Value mapping.
@@ -465,7 +435,7 @@ class HWInstanceOpBase<string mnemonic, list<Trait> traits = []> :
     /// attribute.
     void $cppClass::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
       ::circt::hw::instance_like_impl::getAsmResultNames(
-          setNameFn, getInstanceName(), getResultNames(), getResults());
+          setNameFn, getInstanceName(), getOutputNames(), getResults());
     }
 
     void $cppClass::getValues(SmallVectorImpl<Value> &values,
@@ -486,7 +456,7 @@ class HWInstanceOpBase<string mnemonic, list<Trait> traits = []> :
 def InstanceOp : HWInstanceOpBase<"instance", [HWInstanceLike]> {
   let summary = "Create an instance of a module";
   let description = [{
-    This represents an instance of a module. The inputs and results are
+    This represents an instance of a module. The inputs and outputs are
     the referenced module's inputs and outputs.  The `argNames` and
     `resultNames` attributes must match the referenced module.
 
@@ -499,7 +469,8 @@ def InstanceOp : HWInstanceOpBase<"instance", [HWInstanceLike]> {
                        Variadic<AnyType>:$inputs,
                        StrArrayAttr:$argNames, StrArrayAttr:$resultNames,
                        ParamDeclArrayAttr:$parameters,
-                       OptionalAttr<InnerSymAttr>:$inner_sym);
+                       OptionalAttr<InnerSymAttr>:$inner_sym,
+                       UnitAttr:$doNotPrint);
   let results = (outs Variadic<AnyType>:$results);
 
   let builders = [
@@ -571,7 +542,8 @@ def InstanceChoiceOp : HWInstanceOpBase<"instance_choice", [
                        Variadic<AnyType>:$inputs,
                        StrArrayAttr:$argNames, StrArrayAttr:$resultNames,
                        ParamDeclArrayAttr:$parameters,
-                       OptionalAttr<InnerSymAttr>:$inner_sym);
+                       OptionalAttr<InnerSymAttr>:$inner_sym,
+                       UnitAttr:$doNotPrint);
   let results = (outs Variadic<AnyType>:$results);
 
   let hasCustomAssemblyFormat = 1;
@@ -582,7 +554,7 @@ def InstanceChoiceOp : HWInstanceOpBase<"instance_choice", [
      * Return the name of the default target.
      */
     StringAttr getDefaultModuleNameAttr() {
-      return getModuleNamesAttr()[0].cast<FlatSymbolRefAttr>().getAttr();
+      return llvm::cast<FlatSymbolRefAttr>(getModuleNamesAttr()[0]).getAttr();
     }
   }];
 }
@@ -712,7 +684,7 @@ def TriggeredOp : HWOp<"triggered", [
   let results = (outs);
 
   let assemblyFormat = [{
-    $event $trigger  `(` $inputs `)` `:` type($inputs) $body attr-dict
+    $event $trigger  (`(` $inputs^ `)` `:` type($inputs))? $body attr-dict
   }];
 
   let extraClassDeclaration = [{

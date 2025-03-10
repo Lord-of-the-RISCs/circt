@@ -10,26 +10,37 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Analysis/DependenceAnalysis.h"
 #include "circt/Analysis/SchedulingAnalysis.h"
 #include "circt/Dialect/HW/HWOpInterfaces.h"
+#include "circt/Dialect/Pipeline/PipelineOps.h"
+#include "circt/Dialect/Pipeline/PipelinePasses.h"
 #include "circt/Dialect/SSP/SSPOps.h"
 #include "circt/Dialect/SSP/Utilities.h"
 #include "circt/Scheduling/Algorithms.h"
 #include "circt/Scheduling/Utilities.h"
 #include "circt/Support/BackedgeBuilder.h"
+#include "mlir/Pass/Pass.h"
 
 #define DEBUG_TYPE "pipeline-schedule-linear"
 
+namespace circt {
+namespace pipeline {
+#define GEN_PASS_DEF_SCHEDULELINEARPIPELINE
+#include "circt/Dialect/Pipeline/PipelinePasses.h.inc"
+} // namespace pipeline
+} // namespace circt
+
 using namespace mlir;
 using namespace circt;
+using namespace circt::scheduling;
 using namespace pipeline;
 
 namespace {
 
 class ScheduleLinearPipelinePass
-    : public ScheduleLinearPipelineBase<ScheduleLinearPipelinePass> {
+    : public circt::pipeline::impl::ScheduleLinearPipelineBase<
+          ScheduleLinearPipelinePass> {
 public:
   void runOnOperation() override;
 
@@ -58,7 +69,7 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
            << opLibAttr << "' not found";
 
   // Load operator info from attribute.
-  auto problem = Problem::get(pipeline);
+  Problem problem(pipeline);
 
   DenseMap<SymbolRefAttr, Problem::OperatorType> operatorTypes;
   SmallDenseMap<StringAttr, unsigned> oprIds;
@@ -140,7 +151,7 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
   auto schedPipeline = b.template create<pipeline::ScheduledPipelineOp>(
       pipeline.getLoc(), pipeline.getDataOutputs().getTypes(),
       pipeline.getInputs(), pipeline.getInputNames(), pipeline.getOutputNames(),
-      pipeline.getClock(), pipeline.getReset(), pipeline.getGo(),
+      pipeline.getClock(), pipeline.getGo(), pipeline.getReset(),
       pipeline.getStall(), pipeline.getNameAttr());
 
   Block *currentStage = schedPipeline.getStage(0);

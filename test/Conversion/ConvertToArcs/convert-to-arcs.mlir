@@ -110,6 +110,46 @@ hw.module @Reshuffling(in %clockA: !seq.clock, in %clockB: !seq.clock, out z0: i
 
 hw.module.extern private @Reshuffling2(out z0: i4, out z1: i4, out z2: i4, out z3: i4)
 
+// CHECK-LABEL: arc.define @ReshufflingInit_arc(%arg0: i4, %arg1: i4)
+// CHECK-NEXT:    arc.output %arg0, %arg1
+// CHECK-NEXT:  }
+
+// CHECK-LABEL: arc.define @ReshufflingInit_arc_0(%arg0: i4, %arg1: i4)
+// CHECK-NEXT:    arc.output %arg0, %arg1
+// CHECK-NEXT:  }
+
+// CHECK-LABEL: hw.module @ReshufflingInit
+hw.module @ReshufflingInit(in %clockA: !seq.clock, in %clockB: !seq.clock, out z0: i4, out z1: i4, out z2: i4, out z3: i4) {
+  // CHECK-NEXT: hw.instance "x" @Reshuffling2()
+  // CHECK-NEXT:  %[[INITIAL:.+]]:3 = seq.initial() {
+  // CHECK-NEXT:    %c1_i4 = hw.constant 1 : i4
+  // CHECK-NEXT:    %c2_i4 = hw.constant 2 : i4
+  // CHECK-NEXT:    %c3_i4 = hw.constant 3 : i4
+  // CHECK-NEXT:    seq.yield %c1_i4, %c2_i4, %c3_i4 : i4, i4, i4
+  // CHECK-NEXT:  } : () -> (!seq.immutable<i4>, !seq.immutable<i4>, !seq.immutable<i4>)
+  // CHECK-NEXT: %[[C1:.+]] = seq.from_immutable %[[INITIAL]]#0
+  // CHECK-NEXT: %[[C2:.+]] = seq.from_immutable %[[INITIAL]]#1
+  // CHECK-NEXT: %[[C3:.+]] = seq.from_immutable %[[INITIAL]]#2
+  // CHECK-NEXT: %[[C0:.+]] = hw.constant 0 : i4
+  // CHECK-NEXT: arc.state @ReshufflingInit_arc(%x.z0, %x.z1) clock %clockA initial (%[[C0]], %[[C1]] : i4, i4) latency 1
+  // CHECK-NEXT: arc.state @ReshufflingInit_arc_0(%x.z2, %x.z3) clock %clockB initial (%[[C2]], %[[C3]] : i4, i4) latency 1
+  // CHECK-NEXT: hw.output
+
+  %x.z0, %x.z1, %x.z2, %x.z3 = hw.instance "x" @Reshuffling2() -> (z0: i4, z1: i4, z2: i4, z3: i4)
+  %4 = seq.compreg %x.z0, %clockA : i4
+  %init0, %init1, %init2 = seq.initial () {
+    %cst1 = hw.constant 1 : i4
+    %cst2 = hw.constant 2 : i4
+    %cst3 = hw.constant 3 : i4
+    seq.yield %cst1, %cst2, %cst3 : i4, i4, i4
+  } : () -> (!seq.immutable<i4>, !seq.immutable<i4>, !seq.immutable<i4>)
+  %5 = seq.compreg %x.z1, %clockA initial %init0 : i4
+  %6 = seq.compreg %x.z2, %clockB initial %init1 : i4
+  %7 = seq.compreg %x.z3, %clockB initial %init2 : i4
+  hw.output %4, %5, %6, %7 : i4, i4, i4, i4
+}
+// CHECK-NEXT: }
+
 
 // CHECK-LABEL: arc.define @FactorOutCommonOps_arc(
 // CHECK-NEXT:    comb.xor
@@ -192,6 +232,26 @@ hw.module @Trivial(in %clock: !seq.clock, in %i0: i4, in %reset: i1, out out: i4
   // CHECK-NEXT: hw.output [[RES0:%.+]]
   %0 = hw.constant 0 : i4
   %foo = seq.compreg %i0, %clock reset %reset, %0 : i4
+  hw.output %foo : i4
+}
+// CHECK-NEXT: }
+
+// CHECK:   arc.define @[[TRIVIALINIT_ARC:.+]]([[ARG0:%.+]]: i4)
+// CHECK-NEXT:     arc.output [[ARG0]]
+// CHECK-NEXT:  }
+
+// CHECK-LABEL: hw.module @TrivialWithInit(
+hw.module @TrivialWithInit(in %clock: !seq.clock, in %i0: i4, in %reset: i1, out out: i4) {
+  // CHECK: %[[INIT:.+]] = seq.initial() {
+  // CHECK: %[[CAST:.+]] = seq.from_immutable %[[INIT]]
+  // CHECK: [[RES0:%.+]] = arc.state @[[TRIVIALINIT_ARC]](%i0) clock %clock reset %reset initial (%[[CAST]] : i4) latency 1 {names = ["foo"]
+  // CHECK-NEXT: hw.output [[RES0:%.+]]
+  %0 = hw.constant 0 : i4
+  %init = seq.initial() {
+    %cst2 = hw.constant 2 : i4
+    seq.yield %cst2: i4
+  } : () -> !seq.immutable<i4>
+  %foo = seq.compreg %i0, %clock reset %reset, %0 initial %init: i4
   hw.output %foo : i4
 }
 // CHECK-NEXT: }

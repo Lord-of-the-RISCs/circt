@@ -1,4 +1,4 @@
-add_circt_library(CIRCTCFToHandshake
+add_circt_conversion_library(CIRCTCFToHandshake
   CFToHandshake.cpp
 
   ADDITIONAL_HEADER_DIRS
@@ -6,12 +6,11 @@ add_circt_library(CIRCTCFToHandshake
 
   DEPENDS
   CIRCTConversionPassIncGen
-  MLIRArithDialect
 
   LINK_LIBS PUBLIC
   CIRCTHandshake
-  CIRCTHandshakeTransforms
   CIRCTSupport
+  CIRCTTransforms
   MLIRIR
   MLIRPass
   MLIRArithDialect

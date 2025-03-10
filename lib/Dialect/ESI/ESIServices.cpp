@@ -25,32 +25,19 @@
 #include <memory>
 #include <utility>
 
+namespace circt {
+namespace esi {
+#define GEN_PASS_DEF_ESICONNECTSERVICES
+#include "circt/Dialect/ESI/ESIPasses.h.inc"
+} // namespace esi
+} // namespace circt
+
 using namespace circt;
 using namespace circt::esi;
 
-LogicalResult
-ServiceGeneratorDispatcher::generate(ServiceImplementReqOp req,
-                                     ServiceDeclOpInterface decl) {
-  // Lookup based on 'impl_type' attribute and pass through the generate request
-  // if found.
-  auto genF = genLookupTable.find(req.getImplTypeAttr().getValue());
-  if (genF == genLookupTable.end()) {
-    if (failIfNotFound)
-      return req.emitOpError("Could not find service generator for attribute '")
-             << req.getImplTypeAttr() << "'";
-    return success();
-  }
-
-  // Since we always need a record of generation, create it here then pass it to
-  // the generator for possible modification.
-  OpBuilder b(req);
-  auto implRecord = b.create<ServiceImplRecordOp>(
-      req.getLoc(), req.getAppID(), req.getServiceSymbolAttr(),
-      req.getStdServiceAttr(), req.getImplTypeAttr(), b.getDictionaryAttr({}));
-  implRecord.getReqDetails().emplaceBlock();
-
-  return genF->second(req, decl, implRecord);
-}
+//===----------------------------------------------------------------------===//
+// C++ service generators.
+//===----------------------------------------------------------------------===//
 
 /// The generator for the "cosim" impl_type.
 static LogicalResult
@@ -71,6 +58,7 @@ instantiateCosimEndpointOps(ServiceImplementReqOp implReq,
   }
 
   Block &connImplBlock = implRecord.getReqDetails().front();
+  implRecord.setIsEngine(true);
   OpBuilder implRecords = OpBuilder::atBlockEnd(&connImplBlock);
 
   // Assemble the name to use for an endpoint.
@@ -87,6 +75,14 @@ instantiateCosimEndpointOps(ServiceImplementReqOp implReq,
         ".");
     os << "." << channelName.getValue();
     return StringAttr::get(ctxt, os.str());
+  };
+
+  auto getAssignment = [&](StringAttr name, StringAttr channelName) {
+    DictionaryAttr assignment = b.getDictionaryAttr({
+        b.getNamedAttr("type", b.getStringAttr("cosim")),
+        b.getNamedAttr("name", channelName),
+    });
+    return b.getNamedAttr(name, assignment);
   };
 
   llvm::DenseMap<ServiceImplementConnReqOp, unsigned> toClientResultNum;
@@ -110,8 +106,7 @@ instantiateCosimEndpointOps(ServiceImplementReqOp implReq,
             loc, ch.type, clk, rst,
             toStringAttr(req.getRelativeAppIDPathAttr(), ch.name));
         toServerValues.push_back(cosim.getFromHost());
-        channelAssignments.push_back(
-            b.getNamedAttr(ch.name, cosim.getIdAttr()));
+        channelAssignments.push_back(getAssignment(ch.name, cosim.getIdAttr()));
       }
     }
 
@@ -126,16 +121,14 @@ instantiateCosimEndpointOps(ServiceImplementReqOp implReq,
         auto cosim = b.create<CosimToHostEndpointOp>(
             loc, clk, rst, pack.getFromChannels()[chanIdx++],
             toStringAttr(req.getRelativeAppIDPathAttr(), ch.name));
-        channelAssignments.push_back(
-            b.getNamedAttr(ch.name, cosim.getIdAttr()));
+        channelAssignments.push_back(getAssignment(ch.name, cosim.getIdAttr()));
       }
     }
 
     implRecords.create<ServiceImplClientRecordOp>(
         req.getLoc(), req.getRelativeAppIDPathAttr(), req.getServicePortAttr(),
-        TypeAttr::get(bundleType),
-        b.getDictionaryAttr(b.getNamedAttr(
-            "channel_assignments", b.getDictionaryAttr(channelAssignments))));
+        TypeAttr::get(bundleType), b.getDictionaryAttr(channelAssignments),
+        DictionaryAttr());
   }
 
   // Erase the generation request.
@@ -271,7 +264,7 @@ instantiateSystemVerilogMemory(ServiceImplementReqOp implReq,
   // Now construct the memory writes.
   auto hwClk = b.create<seq::FromClockOp>(clk);
   b.create<sv::AlwaysFFOp>(
-      sv::EventControl::AtPosEdge, hwClk, ResetType::SyncReset,
+      sv::EventControl::AtPosEdge, hwClk, sv::ResetType::SyncReset,
       sv::EventControl::AtPosEdge, rst, [&] {
         for (auto [go, address, data] : writeGoAddressData) {
           Value a = address, d = data; // So the lambda can capture.
@@ -285,6 +278,35 @@ instantiateSystemVerilogMemory(ServiceImplementReqOp implReq,
 
   implReq.erase();
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// Service generator dispatcher.
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+ServiceGeneratorDispatcher::generate(ServiceImplementReqOp req,
+                                     ServiceDeclOpInterface decl) {
+  // Lookup based on 'impl_type' attribute and pass through the generate request
+  // if found.
+  auto genF = genLookupTable.find(req.getImplTypeAttr().getValue());
+  if (genF == genLookupTable.end()) {
+    if (failIfNotFound)
+      return req.emitOpError("Could not find service generator for attribute '")
+             << req.getImplTypeAttr() << "'";
+    return success();
+  }
+
+  // Since we always need a record of generation, create it here then pass it to
+  // the generator for possible modification.
+  OpBuilder b(req);
+  auto implRecord = b.create<ServiceImplRecordOp>(
+      req.getLoc(), req.getAppID(), /*isEngine=*/false,
+      req.getServiceSymbolAttr(), req.getStdServiceAttr(),
+      req.getImplTypeAttr(), b.getDictionaryAttr({}));
+  implRecord.getReqDetails().emplaceBlock();
+
+  return genF->second(req, decl, implRecord);
 }
 
 static ServiceGeneratorDispatcher globalDispatcher(
@@ -307,12 +329,66 @@ void ServiceGeneratorDispatcher::registerGenerator(StringRef implType,
 //===----------------------------------------------------------------------===//
 
 namespace {
+/// Find all the modules and use the partial order of the instantiation DAG
+/// to sort them. If we use this order when "bubbling" up operations, we
+/// guarantee one-pass completeness. As a side-effect, populate the module to
+/// instantiation sites mapping.
+///
+/// Assumption (unchecked): there is not a cycle in the instantiation graph.
+struct ModuleSorter {
+protected:
+  SymbolCache topLevelSyms;
+  DenseMap<Operation *, SmallVector<igraph::InstanceOpInterface, 1>>
+      moduleInstantiations;
+
+  void getAndSortModules(ModuleOp topMod,
+                         SmallVectorImpl<hw::HWModuleLike> &mods);
+  void getAndSortModulesVisitor(hw::HWModuleLike mod,
+                                SmallVectorImpl<hw::HWModuleLike> &mods,
+                                DenseSet<Operation *> &modsSeen);
+};
+} // namespace
+
+void ModuleSorter::getAndSortModules(ModuleOp topMod,
+                                     SmallVectorImpl<hw::HWModuleLike> &mods) {
+  // Add here _before_ we go deeper to prevent infinite recursion.
+  DenseSet<Operation *> modsSeen;
+  mods.clear();
+  moduleInstantiations.clear();
+  topMod.walk([&](hw::HWModuleLike mod) {
+    getAndSortModulesVisitor(mod, mods, modsSeen);
+  });
+}
+
+// Run a post-order DFS.
+void ModuleSorter::getAndSortModulesVisitor(
+    hw::HWModuleLike mod, SmallVectorImpl<hw::HWModuleLike> &mods,
+    DenseSet<Operation *> &modsSeen) {
+  if (modsSeen.contains(mod))
+    return;
+  modsSeen.insert(mod);
+
+  mod.walk([&](igraph::InstanceOpInterface inst) {
+    auto targetNameAttrs = inst.getReferencedModuleNamesAttr();
+    for (auto targetNameAttr : targetNameAttrs) {
+      Operation *modOp =
+          topLevelSyms.getDefinition(cast<StringAttr>(targetNameAttr));
+      assert(modOp);
+      moduleInstantiations[modOp].push_back(inst);
+      if (auto modLike = dyn_cast<hw::HWModuleLike>(modOp))
+        getAndSortModulesVisitor(modLike, mods, modsSeen);
+    }
+  });
+
+  mods.push_back(mod);
+}
+namespace {
 /// Implements a pass to connect up ESI services clients to the nearest server
 /// instantiation. Wires up the ports and generates a generation request to
 /// call a user-specified generator.
 struct ESIConnectServicesPass
-    : public ESIConnectServicesBase<ESIConnectServicesPass>,
-      msft::PassCommon {
+    : public circt::esi::impl::ESIConnectServicesBase<ESIConnectServicesPass>,
+      ModuleSorter {
 
   ESIConnectServicesPass(const ServiceGeneratorDispatcher &gen)
       : genDispatcher(gen) {}
@@ -335,7 +411,8 @@ struct ESIConnectServicesPass
   /// For any service which is "local" (provides the requested service) in a
   /// module, replace it with a ServiceImplementOp. Said op is to be replaced
   /// with an instantiation by a generator.
-  LogicalResult replaceInst(ServiceInstanceOp, Block *portReqs);
+  LogicalResult replaceInst(ServiceInstanceOp,
+                            ArrayRef<ServiceImplementConnReqOp> portReqs);
 
   /// Figure out which requests are "local" vs need to be surfaced. Call
   /// 'surfaceReqs' and/or 'replaceInst' as appropriate.
@@ -406,36 +483,50 @@ LogicalResult ESIConnectServicesPass::process(hw::HWModuleLike mod) {
   Block &modBlock = mod->getRegion(0).front();
 
   // The non-local reqs which need to be surfaced from this module.
-  SmallVector<ServiceImplementConnReqOp, 4> nonLocalReqs;
+  SetVector<ServiceImplementConnReqOp> nonLocalReqs;
   // Index the local services and create blocks in which to put the requests.
-  DenseMap<SymbolRefAttr, Block *> localImplReqs;
-  Block *anyServiceInst = nullptr;
-  for (auto instOp : modBlock.getOps<ServiceInstanceOp>()) {
-    auto *b = new Block();
-    localImplReqs[instOp.getServiceSymbolAttr()] = b;
-    if (!instOp.getServiceSymbolAttr())
-      anyServiceInst = b;
-  }
+  llvm::MapVector<SymbolRefAttr, llvm::SetVector<ServiceImplementConnReqOp>>
+      localImplReqs;
+  for (auto instOp : modBlock.getOps<ServiceInstanceOp>())
+    localImplReqs[instOp.getServiceSymbolAttr()] = {};
+  // AFTER we assemble the local services table (and it will not change the
+  // location of the values), get the pointer to the default service instance,
+  // if any.
+  llvm::SetVector<ServiceImplementConnReqOp> *anyServiceInst = nullptr;
+  if (auto defaultService = localImplReqs.find(SymbolRefAttr());
+      defaultService != localImplReqs.end())
+    anyServiceInst = &defaultService->second;
 
-  // Sort the various requests by destination.
-  mod.walk([&](ServiceImplementConnReqOp req) {
-    auto service = req.getServicePort().getModuleRef();
-    auto implOpF = localImplReqs.find(service);
-    if (implOpF != localImplReqs.end())
-      req->moveBefore(implOpF->second, implOpF->second->end());
-    else if (anyServiceInst)
-      req->moveBefore(anyServiceInst, anyServiceInst->end());
-    else
-      nonLocalReqs.push_back(req);
-  });
+  auto sortConnReqs = [&]() {
+    // Sort the various requests by destination.
+    for (auto req : llvm::make_early_inc_range(
+             mod.getBodyBlock()->getOps<ServiceImplementConnReqOp>())) {
+      auto service = req.getServicePort().getModuleRef();
+      auto reqListIter = localImplReqs.find(service);
+      if (reqListIter != localImplReqs.end())
+        reqListIter->second.insert(req);
+      else if (anyServiceInst)
+        anyServiceInst->insert(req);
+      else
+        nonLocalReqs.insert(req);
+    }
+  };
+  // Bootstrap the sorting.
+  sortConnReqs();
 
   // Replace each service instance with a generation request. If a service
   // generator is registered, generate the server.
   for (auto instOp :
        llvm::make_early_inc_range(modBlock.getOps<ServiceInstanceOp>())) {
-    Block *portReqs = localImplReqs[instOp.getServiceSymbolAttr()];
-    if (failed(replaceInst(instOp, portReqs)))
+    auto portReqs = localImplReqs[instOp.getServiceSymbolAttr()];
+    if (failed(replaceInst(instOp, portReqs.getArrayRef())))
       return failure();
+
+    // Find any new requests which were created by a generator.
+    for (RequestConnectionOp req : llvm::make_early_inc_range(
+             mod.getBodyBlock()->getOps<RequestConnectionOp>()))
+      convertReq(req);
+    sortConnReqs();
   }
 
   // Surface all of the requests which cannot be fulfilled locally.
@@ -443,14 +534,13 @@ LogicalResult ESIConnectServicesPass::process(hw::HWModuleLike mod) {
     return success();
 
   if (auto mutableMod = dyn_cast<hw::HWMutableModuleLike>(mod.getOperation()))
-    return surfaceReqs(mutableMod, nonLocalReqs);
+    return surfaceReqs(mutableMod, nonLocalReqs.getArrayRef());
   return mod.emitOpError(
       "Cannot surface requests through module without mutable ports");
 }
 
-LogicalResult ESIConnectServicesPass::replaceInst(ServiceInstanceOp instOp,
-                                                  Block *portReqs) {
-  assert(portReqs);
+LogicalResult ESIConnectServicesPass::replaceInst(
+    ServiceInstanceOp instOp, ArrayRef<ServiceImplementConnReqOp> portReqs) {
   auto declSym = instOp.getServiceSymbolAttr();
   ServiceDeclOpInterface decl;
   if (declSym) {
@@ -465,7 +555,7 @@ LogicalResult ESIConnectServicesPass::replaceInst(ServiceInstanceOp instOp,
   // + the to_client types.
   SmallVector<Type, 8> resultTypes(instOp.getResultTypes().begin(),
                                    instOp.getResultTypes().end());
-  for (auto req : portReqs->getOps<ServiceImplementConnReqOp>())
+  for (auto req : portReqs)
     resultTypes.push_back(req.getBundleType());
 
   // Create the generation request op.
@@ -475,23 +565,30 @@ LogicalResult ESIConnectServicesPass::replaceInst(ServiceInstanceOp instOp,
       instOp.getServiceSymbolAttr(), instOp.getImplTypeAttr(),
       getStdService(declSym), instOp.getImplOptsAttr(), instOp.getOperands());
   implOp->setDialectAttrs(instOp->getDialectAttrs());
-  implOp.getPortReqs().push_back(portReqs);
+  Block &reqBlock = implOp.getPortReqs().emplaceBlock();
 
   // Update the users.
   for (auto [n, o] : llvm::zip(implOp.getResults(), instOp.getResults()))
     o.replaceAllUsesWith(n);
   unsigned instOpNumResults = instOp.getNumResults();
-  for (auto [idx, req] :
-       llvm::enumerate(portReqs->getOps<ServiceImplementConnReqOp>())) {
+  for (size_t idx = 0, e = portReqs.size(); idx < e; ++idx) {
+    ServiceImplementConnReqOp req = portReqs[idx];
     req.getToClient().replaceAllUsesWith(
         implOp.getResult(idx + instOpNumResults));
   }
 
+  for (auto req : portReqs)
+    req->moveBefore(&reqBlock, reqBlock.end());
+
+  // Erase the instance first in case it consumes any channels or bundles. If it
+  // does, the service generator will fail to verify the IR as there will be
+  // multiple uses.
+  instOp.erase();
+
   // Try to generate the service provider.
   if (failed(genDispatcher.generate(implOp, decl)))
-    return instOp.emitOpError("failed to generate server");
+    return implOp.emitOpError("failed to generate server");
 
-  instOp.erase();
   return success();
 }
 

@@ -16,6 +16,7 @@
 #include "circt/Support/LLVM.h"
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace llvm {
 class SourceMgr;
@@ -44,6 +45,12 @@ struct ImportVerilogOptions {
     Full
   };
   Mode mode = Mode::Full;
+
+  /// Generate debug information in the form of debug dialect ops in the IR.
+  bool debugInfo = false;
+
+  /// Interpret `always @(*)` as `always_comb`.
+  bool lowerAlwaysAtStarAsComb = true;
 
   //===--------------------------------------------------------------------===//
   // Include paths
@@ -145,6 +152,9 @@ mlir::LogicalResult
 preprocessVerilog(llvm::SourceMgr &sourceMgr, mlir::MLIRContext *context,
                   mlir::TimingScope &ts, llvm::raw_ostream &os,
                   const ImportVerilogOptions *options = nullptr);
+
+/// Register the `import-verilog` MLIR translation.
+void registerFromVerilogTranslation();
 
 /// Return a human-readable string describing the slang frontend version linked
 /// into CIRCT.

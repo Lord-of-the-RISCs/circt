@@ -60,7 +60,14 @@ struct Emitter {
   void emitModuleParameters(Operation *op, ArrayAttr parameters);
   void emitDeclaration(LayerOp op);
   void emitDeclaration(OptionOp op);
+  void emitDeclaration(FormalOp op);
   void emitEnabledLayers(ArrayRef<Attribute> layers);
+
+  void emitParamAssign(ParamDeclAttr param, Operation *op,
+                       std::optional<PPExtString> wordBeforeLHS = std::nullopt);
+  void emitParamValue(Attribute value, Operation *op);
+
+  void emitGenericIntrinsic(GenericIntrinsicOp op);
 
   // Statement emission
   void emitStatementsInBlock(Block &block);
@@ -73,7 +80,7 @@ struct Emitter {
   void emitStatement(SkipOp op);
   void emitStatement(PrintFOp op);
   void emitStatement(ConnectOp op);
-  void emitStatement(StrictConnectOp op);
+  void emitStatement(MatchingConnectOp op);
   void emitStatement(PropAssignOp op);
   void emitStatement(InstanceOp op);
   void emitStatement(InstanceChoiceOp op);
@@ -91,6 +98,7 @@ struct Emitter {
   void emitStatement(RefReleaseOp op);
   void emitStatement(RefReleaseInitialOp op);
   void emitStatement(LayerBlockOp op);
+  void emitStatement(GenericIntrinsicOp op);
 
   template <class T>
   void emitVerifStatement(T op, StringRef mnemonic);
@@ -120,6 +128,7 @@ struct Emitter {
   void emitExpression(DoubleConstantOp op);
   void emitExpression(ListCreateOp op);
   void emitExpression(UnresolvedPathOp op);
+  void emitExpression(GenericIntrinsicOp op);
 
   void emitPrimExpr(StringRef mnemonic, Operation *op,
                     ArrayRef<uint32_t> attrs = {});
@@ -363,7 +372,7 @@ private:
     SymbolTable symbolTable;
     hw::InnerSymbolTableCollection istc;
     hw::InnerRefNamespace irn{symbolTable, istc};
-    SymInfos(Operation *op) : symbolTable(op), istc(op){};
+    SymInfos(Operation *op) : symbolTable(op), istc(op) {};
   };
   std::optional<std::reference_wrapper<SymInfos>> symInfos;
 
@@ -400,6 +409,7 @@ void Emitter::emitCircuit(CircuitOp op) {
           })
           .Case<LayerOp>([&](auto op) { emitDeclaration(op); })
           .Case<OptionOp>([&](auto op) { emitDeclaration(op); })
+          .Case<FormalOp>([&](auto op) { emitDeclaration(op); })
           .Default([&](auto op) {
             emitOpError(op, "not supported for emission inside circuit");
           });
@@ -417,6 +427,79 @@ void Emitter::emitEnabledLayers(ArrayRef<Attribute> layers) {
     emitSymbol(cast<SymbolRefAttr>(layer));
     ps << PP::end;
   }
+}
+
+void Emitter::emitParamAssign(ParamDeclAttr param, Operation *op,
+                              std::optional<PPExtString> wordBeforeLHS) {
+  if (wordBeforeLHS) {
+    ps << *wordBeforeLHS << PP::nbsp;
+  }
+  ps << PPExtString(param.getName().strref()) << PP::nbsp << "=" << PP::nbsp;
+  emitParamValue(param.getValue(), op);
+}
+
+void Emitter::emitParamValue(Attribute value, Operation *op) {
+  TypeSwitch<Attribute>(value)
+      .Case<IntegerAttr>([&](auto attr) { ps.addAsString(attr.getValue()); })
+      .Case<FloatAttr>([&](auto attr) {
+        SmallString<16> str;
+        attr.getValue().toString(str);
+        ps << str;
+      })
+      .Case<StringAttr>(
+          [&](auto attr) { ps.writeQuotedEscaped(attr.getValue()); })
+      .Case<ArrayAttr>([&](auto attr) {
+        ps.scopedBox(PP::bbox2, [&]() {
+          ps << "[";
+          interleaveComma(attr.getValue(),
+                          [&](auto element) { emitParamValue(element, op); });
+          ps << "]";
+        });
+      })
+      .Case<DictionaryAttr>([&](auto attr) {
+        ps.scopedBox(PP::bbox2, [&]() {
+          ps << "{";
+          interleaveComma(attr.getValue(), [&](auto field) {
+            ps << PPExtString(field.getName()) << PP::nbsp << "=" << PP::nbsp;
+            emitParamValue(field.getValue(), op);
+          });
+          ps << "}";
+        });
+      })
+      .Default([&](auto attr) {
+        emitOpError(op, "with unsupported parameter attribute: ") << attr;
+        ps << "<unsupported-attr ";
+        ps.addAsString(attr);
+        ps << ">";
+      });
+}
+
+void Emitter::emitGenericIntrinsic(GenericIntrinsicOp op) {
+  ps << "intrinsic(";
+  ps.scopedBox(PP::cbox0, [&]() {
+    ps.scopedBox(PP::ibox2, [&]() {
+      ps << op.getIntrinsic();
+      ps.scopedBox(PP::ibox0, [&]() {
+        auto params = op.getParameters();
+        if (!params.empty()) {
+          ps << "<";
+          ps.scopedBox(PP::ibox0, [&]() {
+            interleaveComma(
+                params.getAsRange<ParamDeclAttr>(),
+                [&](ParamDeclAttr param) { emitParamAssign(param, op); });
+          });
+          ps << ">";
+        }
+      });
+      if (op.getNumResults() != 0)
+        emitTypeWithColon(op.getResult().getType());
+    });
+    if (op.getNumOperands() != 0) {
+      ps << "," << PP::space;
+      ps.scopedBox(PP::ibox0, [&]() { interleaveComma(op->getOperands()); });
+    }
+    ps << ")";
+  });
 }
 
 /// Emit an entire module.
@@ -490,18 +573,9 @@ void Emitter::emitModule(FIntModuleOp op) {
     auto ports = op.getPorts();
     emitModulePorts(ports);
 
-    // Emit the optional intrinsic.
-    //
-    // TODO: This really shouldn't be optional, but it is currently encoded like
-    // this.
-    if (op.getIntrinsic().has_value()) {
-      auto intrinsic = *op.getIntrinsic();
-      if (!intrinsic.empty()) {
-        startStatement();
-        ps << "intrinsic = " << PPExtString(*op.getIntrinsic());
-        setPendingNewline();
-      }
-    }
+    startStatement();
+    ps << "intrinsic = " << PPExtString(op.getIntrinsic());
+    setPendingNewline();
 
     // Emit the parameters.
     emitModuleParameters(op, op.getParameters());
@@ -528,27 +602,9 @@ void Emitter::emitModulePorts(ArrayRef<PortInfo> ports,
 }
 
 void Emitter::emitModuleParameters(Operation *op, ArrayAttr parameters) {
-  for (auto param : llvm::map_range(parameters, [](Attribute attr) {
-         return cast<ParamDeclAttr>(attr);
-       })) {
+  for (auto param : parameters.getAsRange<ParamDeclAttr>()) {
     startStatement();
-    // TODO: AssignLike ?
-    ps << "parameter " << PPExtString(param.getName().getValue()) << " = ";
-    TypeSwitch<Attribute>(param.getValue())
-        .Case<IntegerAttr>([&](auto attr) { ps.addAsString(attr.getValue()); })
-        .Case<FloatAttr>([&](auto attr) {
-          SmallString<16> str;
-          attr.getValue().toString(str);
-          ps << str;
-        })
-        .Case<StringAttr>(
-            [&](auto attr) { ps.writeQuotedEscaped(attr.getValue()); })
-        .Default([&](auto attr) {
-          emitOpError(op, "with unsupported parameter attribute: ") << attr;
-          ps << "<unsupported-attr ";
-          ps.addAsString(attr);
-          ps << ">";
-        });
+    emitParamAssign(param, op, PPExtString("parameter"));
     setPendingNewline();
   }
 }
@@ -557,7 +613,14 @@ void Emitter::emitModuleParameters(Operation *op, ArrayAttr parameters) {
 void Emitter::emitDeclaration(LayerOp op) {
   startStatement();
   ps << "layer " << PPExtString(op.getSymName()) << ", "
-     << PPExtString(stringifyLayerConvention(op.getConvention())) << " : ";
+     << PPExtString(stringifyLayerConvention(op.getConvention()));
+
+  if (auto outputFile = op->getAttrOfType<hw::OutputFileAttr>("output_file")) {
+    ps << ", ";
+    ps.writeQuotedEscaped(outputFile.getFilename().getValue());
+  }
+
+  ps << " : ";
   emitLocationAndNewLine(op);
   ps.scopedBox(PP::bbox2, [&]() {
     for (auto &bodyOp : op.getBody().getOps()) {
@@ -586,10 +649,37 @@ void Emitter::emitDeclaration(OptionOp op) {
   ps << PP::newline << PP::newline;
 }
 
+/// Emit a formal test definition.
+void Emitter::emitDeclaration(FormalOp op) {
+  startStatement();
+  ps.cbox(4, IndentStyle::Block);
+  ps << "formal " << PPExtString(legalize(op.getSymNameAttr()));
+  ps << " of " << PPExtString(legalize(op.getModuleNameAttr().getAttr()));
+  ps << PP::nbsp << ":" << PP::end;
+  emitLocation(op);
+
+  ps.scopedBox(PP::bbox2, [&]() {
+    setPendingNewline();
+    for (auto param : op.getParameters()) {
+      startStatement();
+      ps << PPExtString(param.getName()) << PP::nbsp << "=" << PP::nbsp;
+      emitParamValue(param.getValue(), op);
+      setPendingNewline();
+    }
+  });
+}
+
 /// Check if an operation is inlined into the emission of their users. For
 /// example, subfields are always inlined.
 static bool isEmittedInline(Operation *op) {
-  return isExpression(op) && !isa<InvalidValueOp>(op);
+  // FIRRTL expressions are statically classified as always inlineable.
+  // InvalidValueOp never is inlined, and is handled specially.
+  // GenericIntrinsicOp is inlined if has exactly one use (only emit once)
+  // that is not emitted inline.  This is to ensure it is emitted inline
+  // in common cases, but only inspect one level deep.
+  return (isExpression(op) && !isa<InvalidValueOp>(op)) ||
+         (isa<GenericIntrinsicOp>(op) && op->hasOneUse() &&
+          !isEmittedInline(*op->getUsers().begin()));
 }
 
 void Emitter::emitStatementsInBlock(Block &block) {
@@ -600,12 +690,13 @@ void Emitter::emitStatementsInBlock(Block &block) {
       continue;
     TypeSwitch<Operation *>(&bodyOp)
         .Case<WhenOp, WireOp, RegOp, RegResetOp, NodeOp, StopOp, SkipOp,
-              PrintFOp, AssertOp, AssumeOp, CoverOp, ConnectOp, StrictConnectOp,
-              PropAssignOp, InstanceOp, InstanceChoiceOp, AttachOp, MemOp,
-              InvalidValueOp, SeqMemOp, CombMemOp, MemoryPortOp,
-              MemoryDebugPortOp, MemoryPortAccessOp, RefDefineOp, RefForceOp,
-              RefForceInitialOp, RefReleaseOp, RefReleaseInitialOp,
-              LayerBlockOp>([&](auto op) { emitStatement(op); })
+              PrintFOp, AssertOp, AssumeOp, CoverOp, ConnectOp,
+              MatchingConnectOp, PropAssignOp, InstanceOp, InstanceChoiceOp,
+              AttachOp, MemOp, InvalidValueOp, SeqMemOp, CombMemOp,
+              MemoryPortOp, MemoryDebugPortOp, MemoryPortAccessOp, RefDefineOp,
+              RefForceOp, RefForceInitialOp, RefReleaseOp, RefReleaseInitialOp,
+              LayerBlockOp, GenericIntrinsicOp>(
+            [&](auto op) { emitStatement(op); })
         .Default([&](auto op) {
           startStatement();
           ps << "// operation " << PPExtString(op->getName().getStringRef());
@@ -793,8 +884,7 @@ void Emitter::emitStatement(ConnectOp op) {
   } else {
     auto emitLHS = [&]() { emitExpression(op.getDest()); };
     if (op.getSrc().getDefiningOp<InvalidValueOp>()) {
-      emitAssignLike(
-          emitLHS, [&]() { ps << "invalid"; }, PPExtString("is"));
+      emitAssignLike(emitLHS, [&]() { ps << "invalid"; }, PPExtString("is"));
     } else {
       emitAssignLike(
           emitLHS, [&]() { emitExpression(op.getSrc()); }, PPExtString("<="));
@@ -803,7 +893,7 @@ void Emitter::emitStatement(ConnectOp op) {
   emitLocationAndNewLine(op);
 }
 
-void Emitter::emitStatement(StrictConnectOp op) {
+void Emitter::emitStatement(MatchingConnectOp op) {
   startStatement();
   if (FIRVersion(3, 0, 0) <= version) {
     ps.scopedBox(PP::ibox2, [&]() {
@@ -820,8 +910,7 @@ void Emitter::emitStatement(StrictConnectOp op) {
   } else {
     auto emitLHS = [&]() { emitExpression(op.getDest()); };
     if (op.getSrc().getDefiningOp<InvalidValueOp>()) {
-      emitAssignLike(
-          emitLHS, [&]() { ps << "invalid"; }, PPExtString("is"));
+      emitAssignLike(emitLHS, [&]() { ps << "invalid"; }, PPExtString("is"));
     } else {
       emitAssignLike(
           emitLHS, [&]() { emitExpression(op.getSrc()); }, PPExtString("<="));
@@ -958,7 +1047,7 @@ void Emitter::emitStatement(SeqMemOp op) {
   ps.scopedBox(PP::ibox2, [&]() {
     ps << "smem " << PPExtString(legalize(op.getNameAttr()));
     emitTypeWithColon(op.getType());
-    ps << PP::space;
+    ps << "," << PP::space;
     emitAttribute(op.getRuw());
   });
   emitLocationAndNewLine(op);
@@ -1077,7 +1166,7 @@ void Emitter::emitStatement(InvalidValueOp op) {
   // a connect.
   if (llvm::all_of(op->getUses(), [&](OpOperand &use) {
         return use.getOperandNumber() == 1 &&
-               isa<ConnectOp, StrictConnectOp>(use.getOwner());
+               isa<ConnectOp, MatchingConnectOp>(use.getOwner());
       }))
     return;
 
@@ -1093,6 +1182,20 @@ void Emitter::emitStatement(InvalidValueOp op) {
     ps << "invalidate " << PPExtString(name);
   else
     ps << PPExtString(name) << " is invalid";
+  emitLocationAndNewLine(op);
+}
+
+void Emitter::emitStatement(GenericIntrinsicOp op) {
+  startStatement();
+  if (op.use_empty())
+    emitGenericIntrinsic(op);
+  else {
+    assert(!isEmittedInline(op));
+    auto name = circuitNamespace.newName("_gen_int");
+    addValueName(op.getResult(), name);
+    emitAssignLike([&]() { ps << "node " << PPExtString(name); },
+                   [&]() { emitGenericIntrinsic(op); });
+  }
   emitLocationAndNewLine(op);
 }
 
@@ -1123,7 +1226,7 @@ void Emitter::emitExpression(Value value) {
           BitsPrimOp, HeadPrimOp, TailPrimOp, PadPrimOp, MuxPrimOp, ShlPrimOp,
           ShrPrimOp, UninferredResetCastOp, ConstCastOp, StringConstantOp,
           FIntegerConstantOp, BoolConstantOp, DoubleConstantOp, ListCreateOp,
-          UnresolvedPathOp,
+          UnresolvedPathOp, GenericIntrinsicOp,
           // Reference expressions
           RefSendOp, RefResolveOp, RefSubOp, RWProbeOp, RefCastOp>(
           [&](auto op) {
@@ -1311,6 +1414,10 @@ void Emitter::emitExpression(UnresolvedPathOp op) {
   ps << ")";
 }
 
+void Emitter::emitExpression(GenericIntrinsicOp op) {
+  emitGenericIntrinsic(op);
+}
+
 void Emitter::emitExpression(ConstCastOp op) { emitExpression(op.getInput()); }
 
 void Emitter::emitPrimExpr(StringRef mnemonic, Operation *op,
@@ -1446,7 +1553,8 @@ void Emitter::emitType(Type type, bool includeConst) {
 void Emitter::emitLocation(Location loc) {
   // TODO: Handle FusedLoc and uniquify locations, avoid repeated file names.
   ps << PP::neverbreak;
-  if (auto fileLoc = loc->dyn_cast_or_null<FileLineColLoc>()) {
+  if (auto fileLoc =
+          dyn_cast_or_null<FileLineColLoc, LocationAttr>(LocationAttr(loc))) {
     ps << " @[" << fileLoc.getFilename().getValue();
     if (auto line = fileLoc.getLine()) {
       ps << " ";

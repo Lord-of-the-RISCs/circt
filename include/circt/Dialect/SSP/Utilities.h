@@ -142,7 +142,7 @@ ProblemT loadProblem(InstanceOp instOp,
                      std::tuple<OperatorTypePropertyTs...> oprProps,
                      std::tuple<DependencePropertyTs...> depProps,
                      std::tuple<InstancePropertyTs...> instProps) {
-  auto prob = ProblemT::get(instOp);
+  ProblemT prob(instOp);
 
   loadInstanceProperties<ProblemT, InstancePropertyTs...>(
       prob, instOp.getSspPropertiesAttr());
@@ -325,7 +325,7 @@ saveProblem(ProblemT &prob, std::tuple<OperationPropertyTs...> opProps,
 
   // Set up instance.
   auto instOp = b.create<InstanceOp>(
-      builder.getStringAttr(ProblemT::PROBLEM_NAME),
+      builder.getStringAttr(ProblemT::name),
       saveInstanceProperties<ProblemT, InstancePropertyTs...>(prob, b));
   for (auto &&attr : prob.getContainingOp()->getAttrs()) {
     if (attr.getName().strref().starts_with("SpecHLS"))

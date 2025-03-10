@@ -1,4 +1,4 @@
-; RUN: firtool %s | FileCheck %s
+; RUN: firtool -split-input-file %s | FileCheck %s
 
 ; This test is checking that FIRRTL external modules which have BlackBoxInline
 ; annotations want to write to the same file write to the proper output
@@ -7,33 +7,42 @@
 ;
 ; The test enumerates all possible combinations for a simple design that
 ; consists of a TestHarness top module, a DUT instantiated by the TestHarness,
-; and a Grand Central companion module inside the DUT.  This is summarized by
-; the table below. A one in the "T" column indicates it is instantiated by the
-; TestHarness, a one in the "D" column indicates it is instantiated by the DUT,
-; and a one in the "G" column indicates it is instantiated by the Grand Central
-; companion.
+; and a Grand Central companion module inside the DUT.  Additionally, both the
+; DUT and the TestHarness have layerblocks of the Verification color.  This is
+; summarized by the table below. A one ("1") in the "T" column indicates it is
+; instantiated by the TestHarness, a one in the "D" column indicates it is
+; instantiated by the DUT, and a one in the "G" column indicates it is
+; instantiated by the Grand Central companion.  A zero ("0") indicates it is not
+; instantiated.  An "L" indicates that it is instantiated in a layer in that
+; module.
 ;
 ;            T D G Output
 ;     --------------------
-;     Foo    0 0 1 gct/Foo.sv
+;     Foo    0 0 1 verification/gct/Foo.sv
 ;     Bar    0 1 0 Bar.sv
 ;     Baz    0 1 1 Baz.sv
-;     Qux    1 0 0 testbench/Qux.sv
-;     Quz    1 0 1 gct/Quz.sv
+;     Qux    1 0 0 verification/testbench/Qux.sv
+;     Quz    1 0 1 verification/Quz.sv
 ;     Corge  1 1 0 Corge.sv
 ;     Grault 1 1 1 Grault
+;     Bazola 0 L 0 Bazola.sv
+;     Ztesch L 0 0 verification/testbench/Ztesch.sv
+;     Thud   L L 0 Thud.sv
 ;
 ; CHECK-LABEL: module DUT
 ;
-; CHECK: FILE "gct{{[/\]}}Foo.sv"
+; CHECK: FILE "verification{{[/\]}}gct{{[/\]}}Foo.sv"
 ; CHECK: FILE ".{{[/\]}}Bar.sv"
-; CHECK: FILE ".{{[/\]}}Baz.sv"
-; CHECK: FILE "testbench{{[/\]}}Qux.sv"
-; CHECK: FILE "gct{{[/\]}}Quz.sv"
-; CHECK: FILE ".{{[/\]}}Corge.sv"
-; CHECK: FILE ".{{[/\]}}Grault.sv"
+; CHECK: FILE "Baz.sv"
+; CHECK: FILE "verification{{[/\]}}testbench{{[/\]}}Qux.sv"
+; CHECK: FILE "verification{{[/\]}}Quz.sv"
+; CHECK: FILE "Corge.sv"
+; CHECK: FILE "Grault.sv"
+; CHECK: FILE "verification{{[/\]}}assert{{[/\]}}Bazola.sv"
+; CHECK: FILE "verification{{[/\]}}assert{{[/\]}}Ztesch.sv"
+; CHECK: FILE "verification{{[/\]}}assert{{[/\]}}Thud.sv"
 
-FIRRTL version 3.0.0
+FIRRTL version 4.0.0
 circuit TestHarness: %[[
   {
     "class": "sifive.enterprise.grandcentral.ViewAnnotation",
@@ -70,12 +79,12 @@ circuit TestHarness: %[[
   },
   {
     "class": "sifive.enterprise.grandcentral.ExtractGrandCentralAnnotation",
-    "directory": "gct",
+    "directory": "verification/gct",
     "filename": "bindings.sv"
   },
   {
     "class": "sifive.enterprise.firrtl.TestBenchDirAnnotation",
-    "dirname": "testbench"
+    "dirname": "verification/testbench"
   },
   {
     "class": "firrtl.transforms.BlackBoxInlineAnno",
@@ -148,8 +157,34 @@ circuit TestHarness: %[[
     "target": "~TestHarness|BlackBox_Grault_GCT",
     "name": "Grault.sv",
     "text": "module Grault #(parameter X=hello)(output a);\nendmodule"
+  },
+  {
+    "class": "firrtl.transforms.BlackBoxInlineAnno",
+    "target": "~TestHarness|BlackBox_Bazola_DUT",
+    "name": "Bazola.sv",
+    "text": "module Bazola #(parameter X=hello)(output a);\nendmodule"
+  },
+  {
+    "class": "firrtl.transforms.BlackBoxInlineAnno",
+    "target": "~TestHarness|BlackBox_Ztesch_TestHarness",
+    "name": "Ztesch.sv",
+    "text": "module Ztesch #(parameter X=hello)(output a);\nendmodule"
+  },
+  {
+    "class": "firrtl.transforms.BlackBoxInlineAnno",
+    "target": "~TestHarness|BlackBox_Thud_TestHarness",
+    "name": "Thud.sv",
+    "text": "module Thud #(parameter X=hello)(output a);\nendmodule"
+  },
+  {
+    "class": "firrtl.transforms.BlackBoxInlineAnno",
+    "target": "~TestHarness|BlackBox_Thud_DUT",
+    "name": "Thud.sv",
+    "text": "module Thud #(parameter X=hello)(output a);\nendmodule"
   }
 ]]
+  layer Assert, bind, "verification/assert":
+
   extmodule BlackBox_Foo_GCT:
     output a: UInt<1>
     defname = Foo
@@ -205,7 +240,26 @@ circuit TestHarness: %[[
     defname = Grault
     parameter X = "Grault_GCT"
 
-  module TestHarness:
+  extmodule BlackBox_Bazola_DUT:
+    output a: UInt<1>
+    defname = Bazola
+    parameter X = "Bazola_TestHarness"
+
+  extmodule BlackBox_Ztesch_TestHarness:
+    output a: UInt<1>
+    defname = Ztesch
+    parameter X = "Ztesch_TestHarness"
+
+  extmodule BlackBox_Thud_TestHarness:
+    output a: UInt<1>
+    defname = Thud
+    parameter X = "Thud_TestHarness"
+  extmodule BlackBox_Thud_DUT:
+    output a: UInt<1>
+    defname = Thud
+    parameter X = "Thud_DUT"
+
+  public module TestHarness:
 
     inst dut of DUT
 
@@ -213,6 +267,10 @@ circuit TestHarness: %[[
     inst blackBox_Quz_TestHarness of BlackBox_Quz_TestHarness
     inst blackBox_Corge_TestHarness of BlackBox_Corge_TestHarness
     inst blackBox_Grault_TestHarness of BlackBox_Grault_TestHarness
+
+    layerblock Assert:
+      inst blackBox_Ztesch_TestHarness of BlackBox_Ztesch_TestHarness
+      inst blackBox_Thud_TestHarness of BlackBox_Thud_TestHarness
 
   module DUT:
 
@@ -226,9 +284,67 @@ circuit TestHarness: %[[
     inst blackBox_Corge_DUT of BlackBox_Corge_DUT
     inst blackBox_Grault_DUT of BlackBox_Grault_DUT
 
+    layerblock Assert:
+      inst blackBox_Bazola_DUT of BlackBox_Bazola_DUT
+      inst blackBox_Thud_DUT of BlackBox_Thud_DUT
+
   module GrandCentral:
 
     inst blackBox_Foo_GCT of BlackBox_Foo_GCT
     inst blackBox_Baz_GCT of BlackBox_Baz_GCT
     inst blackBox_Quz_GCT of BlackBox_Quz_GCT
     inst blackBox_Grault_GCT of BlackBox_Grault_GCT
+
+; // -----
+
+; This test is checking the behavior of how blackboxes which _cannot_
+; deduplicate with each other because they have differing parameters, but must
+; be "deduplicated" on disk.  The only thing marking them as needing to
+; deduplicate is that the have the same "name" field in their annotations.  This
+; should write files to the LCA of the two directories that the external modules
+; are supposed to be written to.  Specifically, this is checking for correct
+; interactions between `AssignOutputDirs` and `BlackBoxReader`.
+;
+; CHECK-LABEL: module BlackBoxLCA
+;
+; CHECK: FILE "Bar.sv"
+
+FIRRTL version 4.0.0
+circuit BlackBoxLCA: %[[
+  {
+    "class": "firrtl.transforms.BlackBoxInlineAnno",
+    "target": "~BlackBoxLCA|Foo",
+    "name": "Bar.sv",
+    "text": "Bar definition that takes parameters"
+  },
+  {
+    "class": "firrtl.transforms.BlackBoxInlineAnno",
+    "target": "~BlackBoxLCA|Bar",
+    "name": "Bar.sv",
+    "text": "Bar definition that takes parameters"
+  }
+]]
+  layer A, bind, "A":
+  layer B, bind, "B":
+
+  extmodule Bar:
+    input a: UInt<1>
+    defname = Bar
+    parameter x = 1
+
+  extmodule Foo:
+    input a: UInt<1>
+    defname = Bar
+    parameter x = 0
+
+
+  public module BlackBoxLCA:
+    input a: UInt<1>
+
+    layerblock A:
+      inst foo of Foo
+      connect foo.a, a
+
+    layerblock B:
+      inst bar of Bar
+      connect bar.a, a

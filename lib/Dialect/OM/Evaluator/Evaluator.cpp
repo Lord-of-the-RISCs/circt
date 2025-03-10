@@ -56,9 +56,7 @@ LogicalResult circt::om::evaluator::EvaluatorValue::finalize() {
 
 Type circt::om::evaluator::EvaluatorValue::getType() const {
   return llvm::TypeSwitch<const EvaluatorValue *, Type>(this)
-      .Case<AttributeValue>([](auto *attr) -> Type {
-        return cast<TypedAttr>(attr->getAttr()).getType();
-      })
+      .Case<AttributeValue>([](auto *attr) -> Type { return attr->getType(); })
       .Case<ObjectValue>([](auto *object) { return object->getObjectType(); })
       .Case<ListValue>([](auto *list) { return list->getListType(); })
       .Case<MapValue>([](auto *map) { return map->getMapType(); })
@@ -130,6 +128,14 @@ FailureOr<evaluator::EvaluatorValuePtr> circt::om::Evaluator::getOrCreateValue(
                 .Case([&](ConstantOp op) {
                   return evaluateConstant(op, actualParams, loc);
                 })
+                .Case([&](IntegerBinaryArithmeticOp op) {
+                  // Create a partially evaluated AttributeValue of
+                  // om::IntegerType in case we need to delay evaluation.
+                  evaluator::EvaluatorValuePtr result =
+                      std::make_shared<evaluator::AttributeValue>(
+                          op.getResult().getType(), loc);
+                  return success(result);
+                })
                 .Case<ObjectFieldOp>([&](auto op) {
                   // Create a reference value since the value pointed by object
                   // field op is not created yet.
@@ -161,9 +167,12 @@ FailureOr<evaluator::EvaluatorValuePtr> circt::om::Evaluator::getOrCreateValue(
                           evaluator::PathValue::getEmptyPath(loc));
                   return success(result);
                 })
-                .Case<ListCreateOp, TupleCreateOp, MapCreateOp, ObjectFieldOp,
-                      ObjectOp>([&](auto op) {
+                .Case<ListCreateOp, ListConcatOp, TupleCreateOp, MapCreateOp,
+                      ObjectFieldOp>([&](auto op) {
                   return getPartiallyEvaluatedValue(op.getType(), loc);
+                })
+                .Case<ObjectOp>([&](auto op) {
+                  return getPartiallyEvaluatedValue(op.getType(), op.getLoc());
                 })
                 .Default([&](Operation *op) {
                   auto error = op->emitError("unable to evaluate value");
@@ -248,15 +257,18 @@ circt::om::Evaluator::evaluateObjectInstance(StringAttr className,
       worklist.push({result, actualParams});
     }
 
-  for (auto field : cls.getOps<ClassFieldOp>()) {
-    StringAttr name = field.getNameAttr();
-    Value value = field.getValue();
+  auto fieldNames = cls.getFieldNames();
+  auto operands = cls.getFieldsOp()->getOperands();
+  for (size_t i = 0; i < fieldNames.size(); ++i) {
+    auto name = fieldNames[i];
+    auto value = operands[i];
+    auto fieldLoc = cls.getFieldLocByIndex(i);
     FailureOr<evaluator::EvaluatorValuePtr> result =
-        evaluateValue(value, actualParams, field.getLoc());
+        evaluateValue(value, actualParams, fieldLoc);
     if (failed(result))
       return result;
 
-    fields[name] = result.value();
+    fields[cast<StringAttr>(name)] = result.value();
   }
 
   // If the there is an instance, we must update the object value.
@@ -339,6 +351,9 @@ circt::om::Evaluator::evaluateValue(Value value, ActualParameters actualParams,
             .Case([&](ConstantOp op) {
               return evaluateConstant(op, actualParams, loc);
             })
+            .Case([&](IntegerBinaryArithmeticOp op) {
+              return evaluateIntegerBinaryArithmetic(op, actualParams, loc);
+            })
             .Case([&](ObjectOp op) {
               return evaluateObjectInstance(op, actualParams);
             })
@@ -347,6 +362,9 @@ circt::om::Evaluator::evaluateValue(Value value, ActualParameters actualParams,
             })
             .Case([&](ListCreateOp op) {
               return evaluateListCreate(op, actualParams, loc);
+            })
+            .Case([&](ListConcatOp op) {
+              return evaluateListConcat(op, actualParams, loc);
             })
             .Case([&](TupleCreateOp op) {
               return evaluateTupleCreate(op, actualParams, loc);
@@ -392,6 +410,85 @@ circt::om::Evaluator::evaluateConstant(ConstantOp op,
                                        Location loc) {
   return success(std::make_shared<circt::om::evaluator::AttributeValue>(
       op.getValue(), loc));
+}
+
+// Evaluator dispatch function for integer binary arithmetic.
+FailureOr<EvaluatorValuePtr>
+circt::om::Evaluator::evaluateIntegerBinaryArithmetic(
+    IntegerBinaryArithmeticOp op, ActualParameters actualParams, Location loc) {
+  // Get the op's EvaluatorValue handle, in case it hasn't been evaluated yet.
+  auto handle = getOrCreateValue(op.getResult(), actualParams, loc);
+
+  // If it's fully evaluated, we can return it.
+  if (handle.value()->isFullyEvaluated())
+    return handle;
+
+  // Evaluate operands if necessary, and return the partially evaluated value if
+  // they aren't ready.
+  auto lhsResult = evaluateValue(op.getLhs(), actualParams, loc);
+  if (failed(lhsResult))
+    return lhsResult;
+  if (!lhsResult.value()->isFullyEvaluated())
+    return handle;
+
+  auto rhsResult = evaluateValue(op.getRhs(), actualParams, loc);
+  if (failed(rhsResult))
+    return rhsResult;
+  if (!rhsResult.value()->isFullyEvaluated())
+    return handle;
+
+  // Extract the integer attributes.
+  auto extractAttr = [](evaluator::EvaluatorValue *value) {
+    return std::move(
+        llvm::TypeSwitch<evaluator::EvaluatorValue *, om::IntegerAttr>(value)
+            .Case([](evaluator::AttributeValue *val) {
+              return val->getAs<om::IntegerAttr>();
+            })
+            .Case([](evaluator::ReferenceValue *val) {
+              return cast<evaluator::AttributeValue>(
+                         val->getStrippedValue()->get())
+                  ->getAs<om::IntegerAttr>();
+            }));
+  };
+
+  om::IntegerAttr lhs = extractAttr(lhsResult.value().get());
+  om::IntegerAttr rhs = extractAttr(rhsResult.value().get());
+  assert(lhs && rhs &&
+         "expected om::IntegerAttr for IntegerBinaryArithmeticOp operands");
+
+  // Extend values if necessary to match bitwidth. Most interesting arithmetic
+  // on APSInt asserts that both operands are the same bitwidth, but the
+  // IntegerAttrs we are working with may have used the smallest necessary
+  // bitwidth to represent the number they hold, and won't necessarily match.
+  APSInt lhsVal = lhs.getValue().getAPSInt();
+  APSInt rhsVal = rhs.getValue().getAPSInt();
+  if (lhsVal.getBitWidth() > rhsVal.getBitWidth())
+    rhsVal = rhsVal.extend(lhsVal.getBitWidth());
+  else if (rhsVal.getBitWidth() > lhsVal.getBitWidth())
+    lhsVal = lhsVal.extend(rhsVal.getBitWidth());
+
+  // Perform arbitrary precision signed integer binary arithmetic.
+  FailureOr<APSInt> result = op.evaluateIntegerOperation(lhsVal, rhsVal);
+
+  if (failed(result))
+    return op->emitError("failed to evaluate integer operation");
+
+  // Package the result as a new om::IntegerAttr.
+  MLIRContext *ctx = op->getContext();
+  auto resultAttr =
+      om::IntegerAttr::get(ctx, mlir::IntegerAttr::get(ctx, result.value()));
+
+  // Finalize the op result value.
+  auto *handleValue = cast<evaluator::AttributeValue>(handle.value().get());
+  auto resultStatus = handleValue->setAttr(resultAttr);
+  if (failed(resultStatus))
+    return resultStatus;
+
+  auto finalizeStatus = handleValue->finalize();
+  if (failed(finalizeStatus))
+    return finalizeStatus;
+
+  return handle;
 }
 
 /// Evaluator dispatch function for Object instances.
@@ -487,6 +584,45 @@ circt::om::Evaluator::evaluateListCreate(ListCreateOp op,
   }
 
   // Return the list.
+  llvm::cast<evaluator::ListValue>(list.value().get())
+      ->setElements(std::move(values));
+  return list;
+}
+
+/// Evaluator dispatch function for List concatenation.
+FailureOr<evaluator::EvaluatorValuePtr>
+circt::om::Evaluator::evaluateListConcat(ListConcatOp op,
+                                         ActualParameters actualParams,
+                                         Location loc) {
+  // Evaluate the List concat op itself, in case it hasn't been evaluated yet.
+  SmallVector<evaluator::EvaluatorValuePtr> values;
+  auto list = getOrCreateValue(op, actualParams, loc);
+
+  // Extract the ListValue, either directly or through an object reference.
+  auto extractList = [](evaluator::EvaluatorValue *value) {
+    return std::move(
+        llvm::TypeSwitch<evaluator::EvaluatorValue *, evaluator::ListValue *>(
+            value)
+            .Case([](evaluator::ListValue *val) { return val; })
+            .Case([](evaluator::ReferenceValue *val) {
+              return cast<evaluator::ListValue>(val->getStrippedValue()->get());
+            }));
+  };
+
+  for (auto operand : op.getOperands()) {
+    auto result = evaluateValue(operand, actualParams, loc);
+    if (failed(result))
+      return result;
+    if (!result.value()->isFullyEvaluated())
+      return list;
+
+    // Append each EvaluatorValue from the sublist.
+    evaluator::ListValue *subList = extractList(result.value().get());
+    for (auto subValue : subList->getElements())
+      values.push_back(subValue);
+  }
+
+  // Return the concatenated list.
   llvm::cast<evaluator::ListValue>(list.value().get())
       ->setElements(std::move(values));
   return list;
@@ -728,7 +864,7 @@ evaluator::PathValue evaluator::PathValue::getEmptyPath(Location loc) {
 StringAttr evaluator::PathValue::getAsString() const {
   // If the module is null, then this is a path to a deleted object.
   if (!targetKind)
-    return StringAttr::get(getContext(), "OMDeleted");
+    return StringAttr::get(getContext(), "OMDeleted:");
   SmallString<64> result;
   switch (targetKind.getValue()) {
   case TargetKind::DontTouch:
@@ -777,4 +913,28 @@ void evaluator::PathValue::setBasepath(const BasePathValue &basepath) {
   newPath.append(oldPath.begin(), oldPath.end());
   path = PathAttr::get(path.getContext(), newPath);
   markFullyEvaluated();
+}
+
+//===----------------------------------------------------------------------===//
+// AttributeValue
+//===----------------------------------------------------------------------===//
+
+LogicalResult circt::om::evaluator::AttributeValue::setAttr(Attribute attr) {
+  if (cast<TypedAttr>(attr).getType() != this->type)
+    return mlir::emitError(getLoc(), "cannot set AttributeValue of type ")
+           << this->type << " to Attribute " << attr;
+  if (isFullyEvaluated())
+    return mlir::emitError(
+        getLoc(),
+        "cannot set AttributeValue that has already been fully evaluated");
+  this->attr = attr;
+  markFullyEvaluated();
+  return success();
+}
+
+LogicalResult circt::om::evaluator::AttributeValue::finalizeImpl() {
+  if (!isFullyEvaluated())
+    return mlir::emitError(
+        getLoc(), "cannot finalize AttributeValue that is not fully evaluated");
+  return success();
 }

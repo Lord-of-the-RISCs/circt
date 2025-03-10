@@ -14,8 +14,6 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "mlir/Support/LogicalResult.h"
 
 using namespace circt;
 using namespace firrtl;
@@ -30,7 +28,7 @@ LogicalResult circt::firrtl::applyWiring(const AnnoPathValue &target,
 
   // Convert target to Value
   Value targetValue;
-  if (auto portTarget = target.ref.dyn_cast<PortAnnoTarget>()) {
+  if (auto portTarget = dyn_cast<PortAnnoTarget>(target.ref)) {
     auto portNum = portTarget.getImpl().getPortNo();
     if (auto module = dyn_cast<FModuleOp>(portTarget.getOp())) {
       if (clazz == wiringSourceAnnoClass) {
@@ -63,7 +61,7 @@ LogicalResult circt::firrtl::applyWiring(const AnnoPathValue &target,
       return mlir::emitError(state.circuit.getLoc())
              << "Annotation has invalid target: " << anno;
     }
-  } else if (auto opResult = target.ref.dyn_cast<OpAnnoTarget>()) {
+  } else if (auto opResult = dyn_cast<OpAnnoTarget>(target.ref)) {
     if (target.isOpOfType<WireOp, RegOp, RegResetOp>()) {
       auto *targetBase = opResult.getOp();
       builder.setInsertionPointAfter(targetBase);

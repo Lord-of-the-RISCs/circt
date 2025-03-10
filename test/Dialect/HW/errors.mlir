@@ -501,3 +501,30 @@ hw.module @Foo () {
   hw.instance_choice "inst" option "foo" @DoesNotExist () -> ()
 }
 
+// -----
+
+// Don't crash if hw.array attribute fails to parse as integer
+// expected-error @below {{floating point value not valid for specified type}}
+hw.module @arrayTypeError(in %in: !hw.array<44.44axi0>) { }
+
+// -----
+
+// Don't crash if element type of inout fails to parse.
+hw.module @elementTypeError() {
+  // expected-error @below {{expected ':'}}
+  "builtin.unrealized_conversion_cast"() : () -> !hw.inout<struct<foo>>
+}
+
+// -----
+
+hw.module @elementTypeError() {
+  // expected-error @below {{'hw.aggregate_constant' op unknown element type '!seq.clock'}}
+  %0 = hw.aggregate_constant [#hw.output_file<"dummy.sv">] : !hw.array<1x!seq.clock>
+}
+
+// -----
+
+hw.module @elementTypeError() {
+  // expected-error @below {{'hw.aggregate_constant' op typed attr doesn't match the return type '!seq.clock'}}
+  %0 = hw.aggregate_constant [32: i16] : !hw.array<1x!seq.clock>
+}

@@ -1,4 +1,4 @@
-// RUN: circt-opt -canonicalize='top-down=true region-simplify=true' %s | FileCheck %s
+// RUN: circt-opt -canonicalize='top-down=true region-simplify=aggressive' %s | FileCheck %s
 
 // CHECK-LABEL: func @if_dead_condition(%arg0: i1) {
 // CHECK-NEXT:    [[FD:%.*]] = hw.constant -2147483646 : i32
@@ -56,6 +56,9 @@ func.func @if_dead_condition(%arg0: i1) {
   return
 }
 
+// CHECK-LABEL: sv.macro.decl @SYNTHESIS
+sv.macro.decl @SYNTHESIS
+
 // CHECK-LABEL: func @empy_op(%arg0: i1) {
 // CHECK-NOT:     sv.if
 // CHECK-NOT:     sv.ifdef
@@ -68,11 +71,11 @@ func.func @empy_op(%arg0: i1) {
   sv.initial {
     sv.if %arg0 {}
     sv.if %arg0 {} else {}
-    sv.ifdef.procedural "SYNTHESIS" {}
-    sv.ifdef.procedural "SYNTHESIS" {} else {}
+    sv.ifdef.procedural @SYNTHESIS {}
+    sv.ifdef.procedural @SYNTHESIS {} else {}
   }
-  sv.ifdef "SYNTHESIS" {}
-  sv.ifdef "SYNTHESIS" {} else {}
+  sv.ifdef @SYNTHESIS {}
+  sv.ifdef @SYNTHESIS {} else {}
   sv.always posedge %arg0 {}
   sv.initial {}
   return
@@ -106,7 +109,7 @@ func.func @invert_if(%arg0: i1, %arg1 : i1) {
 // CHECK-NEXT:    [[FD:%.*]] = hw.constant -2147483646 : i32
 // CHECK-NEXT:    sv.initial  {
 // CHECK-NEXT:      sv.if %arg0  {
-// CHECK-NEXT:      } else {  
+// CHECK-NEXT:      } else {
 // CHECK-NEXT:        sv.fwrite [[FD]], "Foo"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    }
@@ -316,5 +319,13 @@ hw.module @MergeAssignments(in %a: !hw.array<4xi1>, in %clock: i1, out d: !hw.ar
 // CHECK-NEXT: hw.output
 hw.module @Sampled(in %in: i1) {
   %2 = sv.system.sampled %in : i1
+  hw.output
+}
+
+// CHECK-LABEL: @Issue7563
+// CHECK-NEXT: hw.output
+hw.module @Issue7563(in %in: i8) {
+  %r = sv.reg : !hw.inout<i8>
+  sv.assign %r, %in : i8
   hw.output
 }

@@ -10,15 +10,16 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Dialect/SV/SVOps.h"
-#include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/EquivalenceClasses.h"
@@ -26,6 +27,13 @@
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-lower-xmr"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_LOWERXMR
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -68,9 +76,53 @@ struct XMRNode {
   os << ", next=" << node.next << ")";
   return os;
 }
+
+/// Track information about operations being created in a module.  This is used
+/// to generate more compact code and reuse operations where possible.
+class ModuleState {
+
+public:
+  ModuleState(FModuleOp &moduleOp) : body(moduleOp.getBodyBlock()) {}
+
+  /// Return the existing XMRRefOp for this type, symbol, and suffix for this
+  /// module.  Otherwise, create a new one.  The first XMRRefOp will be created
+  /// at the beginning of the module.  Subsequent XMRRefOps will be created
+  /// immediately following the first one.
+  Value getOrCreateXMRRefOp(Type type, FlatSymbolRefAttr symbol,
+                            StringAttr suffix, ImplicitLocOpBuilder &builder) {
+    // Return the saved XMRRefOp.
+    auto it = xmrRefCache.find({type, symbol, suffix});
+    if (it != xmrRefCache.end())
+      return it->getSecond();
+
+    // Create a new XMRRefOp.
+    OpBuilder::InsertionGuard guard(builder);
+    if (xmrRefPoint.isSet())
+      builder.restoreInsertionPoint(xmrRefPoint);
+    else
+      builder.setInsertionPointToStart(body);
+
+    Value xmr = builder.create<XMRRefOp>(type, symbol, suffix);
+    xmrRefCache.insert({{type, symbol, suffix}, xmr});
+
+    xmrRefPoint = builder.saveInsertionPoint();
+    return xmr;
+  };
+
+private:
+  /// The module's body.  This is used to set the insertion point for the first
+  /// created operation.
+  Block *body;
+
+  /// Map used to know if we created this XMRRefOp before.
+  DenseMap<std::tuple<Type, SymbolRefAttr, StringAttr>, Value> xmrRefCache;
+
+  /// The saved insertion point for XMRRefOps.
+  OpBuilder::InsertPoint xmrRefPoint;
+};
 } // end anonymous namespace
 
-class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
+class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
 
   void runOnOperation() override {
     // Populate a CircuitNamespace that can be used to generate unique
@@ -87,8 +139,8 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
     SmallVector<Operation *> forceAndReleaseOps;
     // The dataflow function, that propagates the reachable RefSendOp across
     // RefType Ops.
-    auto transferFunc = [&](Operation &op) -> LogicalResult {
-      return TypeSwitch<Operation *, LogicalResult>(&op)
+    auto transferFunc = [&](Operation *op) -> LogicalResult {
+      return TypeSwitch<Operation *, LogicalResult>(op)
           .Case<RefSendOp>([&](RefSendOp send) {
             // Get a reference to the actual signal to which the XMR will be
             // generated.
@@ -248,62 +300,73 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
     SmallVector<FModuleOp> publicModules;
 
     // Traverse the modules in post order.
-    for (auto node : llvm::post_order(&instanceGraph)) {
-      auto module = dyn_cast<FModuleOp>(*node->getModule());
-      if (!module)
-        continue;
-      LLVM_DEBUG(llvm::dbgs()
-                 << "Traversing module:" << module.getModuleNameAttr() << "\n");
 
-      if (module.isPublic())
-        publicModules.push_back(module);
+    DenseSet<InstanceGraphNode *> visited;
+    for (auto *root : instanceGraph) {
+      for (auto *node : llvm::post_order_ext(root, visited)) {
+        auto module = dyn_cast<FModuleOp>(*node->getModule());
+        if (!module)
+          continue;
+        LLVM_DEBUG(llvm::dbgs() << "Traversing module:"
+                                << module.getModuleNameAttr() << "\n");
 
-      for (Operation &op : module.getBodyBlock()->getOperations())
-        if (transferFunc(op).failed())
+        moduleStates.insert({module, ModuleState(module)});
+
+        if (module.isPublic())
+          publicModules.push_back(module);
+
+        auto result = module.walk([&](Operation *op) {
+          if (transferFunc(op).failed())
+            return WalkResult::interrupt();
+          return WalkResult::advance();
+        });
+
+        if (result.wasInterrupted())
           return signalPassFailure();
 
-      // Clear any enabled layers.
-      module.setLayersAttr(ArrayAttr::get(module.getContext(), {}));
+        // Clear any enabled layers.
+        module.setLayersAttr(ArrayAttr::get(module.getContext(), {}));
 
-      // Since we walk operations pre-order and not along dataflow edges,
-      // ref.sub may not be resolvable when we encounter them (they're not just
-      // unification). This can happen when refs go through an output port or
-      // input instance result and back into the design. Handle these by walking
-      // them, resolving what we can, until all are handled or nothing can be
-      // resolved.
-      while (!indexingOps.empty()) {
-        // Grab the set of unresolved ref.sub's.
-        decltype(indexingOps) worklist;
-        worklist.swap(indexingOps);
+        // Since we walk operations pre-order and not along dataflow edges,
+        // ref.sub may not be resolvable when we encounter them (they're not
+        // just unification). This can happen when refs go through an output
+        // port or input instance result and back into the design. Handle these
+        // by walking them, resolving what we can, until all are handled or
+        // nothing can be resolved.
+        while (!indexingOps.empty()) {
+          // Grab the set of unresolved ref.sub's.
+          decltype(indexingOps) worklist;
+          worklist.swap(indexingOps);
 
-        for (auto op : worklist) {
-          auto inputEntry =
-              getRemoteRefSend(op.getInput(), /*errorIfNotFound=*/false);
-          // If we can't resolve, add back and move on.
-          if (!inputEntry)
-            indexingOps.push_back(op);
-          else
-            addReachingSendsEntry(op.getResult(), op.getOperation(),
-                                  inputEntry);
+          for (auto op : worklist) {
+            auto inputEntry =
+                getRemoteRefSend(op.getInput(), /*errorIfNotFound=*/false);
+            // If we can't resolve, add back and move on.
+            if (!inputEntry)
+              indexingOps.push_back(op);
+            else
+              addReachingSendsEntry(op.getResult(), op.getOperation(),
+                                    inputEntry);
+          }
+          // If nothing was resolved, give up.
+          if (worklist.size() == indexingOps.size()) {
+            auto op = worklist.front();
+            getRemoteRefSend(op.getInput());
+            op.emitError(
+                  "indexing through probe of unknown origin (input probe?)")
+                .attachNote(op.getInput().getLoc())
+                .append("indexing through this reference");
+            return signalPassFailure();
+          }
         }
-        // If nothing was resolved, give up.
-        if (worklist.size() == indexingOps.size()) {
-          auto op = worklist.front();
-          getRemoteRefSend(op.getInput());
-          op.emitError(
-                "indexing through probe of unknown origin (input probe?)")
-              .attachNote(op.getInput().getLoc())
-              .append("indexing through this reference");
-          return signalPassFailure();
-        }
+
+        // Record all the RefType ports to be removed later.
+        size_t numPorts = module.getNumPorts();
+        for (size_t portNum = 0; portNum < numPorts; ++portNum)
+          if (isa<RefType>(module.getPortType(portNum))) {
+            setPortToRemove(module, portNum, numPorts);
+          }
       }
-
-      // Record all the RefType ports to be removed later.
-      size_t numPorts = module.getNumPorts();
-      for (size_t portNum = 0; portNum < numPorts; ++portNum)
-        if (isa<RefType>(module.getPortType(portNum))) {
-          setPortToRemove(module, portNum, numPorts);
-        }
     }
 
     LLVM_DEBUG({
@@ -385,15 +448,16 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
     while (remoteOpPath) {
       lastIndex = *remoteOpPath;
       auto entr = refSendPathList[*remoteOpPath];
-      TypeSwitch<XMRNode::SymOrIndexOp>(entr.info)
-          .Case<Attribute>([&](auto attr) {
-            // If the path is a singular verbatim expression, the attribute of
-            // the send path list entry will be null.
-            if (attr)
-              refSendPath.push_back(attr);
-          })
-          .Case<Operation *>(
-              [&](auto *op) { indexing.push_back(cast<RefSubOp>(op)); });
+      if (entr.info)
+        TypeSwitch<XMRNode::SymOrIndexOp>(entr.info)
+            .Case<Attribute>([&](auto attr) {
+              // If the path is a singular verbatim expression, the attribute of
+              // the send path list entry will be null.
+              if (attr)
+                refSendPath.push_back(attr);
+            })
+            .Case<Operation *>(
+                [&](auto *op) { indexing.push_back(cast<RefSubOp>(op)); });
       remoteOpPath = entr.next;
     }
     auto iter = xmrPathSuffix.find(lastIndex);
@@ -474,7 +538,10 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
               if (failed(resolveReference(op.getDest(), builder, ref, str)))
                 return failure();
 
-              Value xmr = builder.create<XMRRefOp>(destType, ref, str);
+              Value xmr =
+                  moduleStates.find(op->template getParentOfType<FModuleOp>())
+                      ->getSecond()
+                      .getOrCreateXMRRefOp(destType, ref, str, builder);
               op.getDestMutable().assign(xmr);
               return success();
             })
@@ -602,10 +669,13 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
   }
 
   LogicalResult handlePublicModuleRefPorts(FModuleOp module) {
-    auto builder = ImplicitLocOpBuilder::atBlockBegin(
-        module.getLoc(), getOperation().getBodyBlock());
+    auto *body = getOperation().getBodyBlock();
 
+    // Find all the output reference ports.
     SmallString<128> circuitRefPrefix;
+    SmallVector<std::tuple<StringAttr, StringAttr, ArrayAttr>> ports;
+    auto declBuilder =
+        ImplicitLocOpBuilder::atBlockBegin(module.getLoc(), body);
     for (size_t portIndex = 0, numPorts = module.getNumPorts();
          portIndex != numPorts; ++portIndex) {
       auto refType = type_dyn_cast<RefType>(module.getPortType(portIndex));
@@ -613,11 +683,10 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
           module.getPortDirection(portIndex) != Direction::Out)
         continue;
       auto portValue =
-          module.getArgument(portIndex).cast<mlir::TypedValue<RefType>>();
-
+          cast<mlir::TypedValue<RefType>>(module.getArgument(portIndex));
       mlir::FlatSymbolRefAttr ref;
       SmallString<128> stringLeaf;
-      if (failed(resolveReferencePath(portValue, builder, ref, stringLeaf)))
+      if (failed(resolveReferencePath(portValue, declBuilder, ref, stringLeaf)))
         return failure();
 
       SmallString<128> formatString;
@@ -631,19 +700,24 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
         getRefABIPrefix(module, circuitRefPrefix);
       auto macroName =
           getRefABIMacroForPort(module, portIndex, circuitRefPrefix);
-      builder.create<sv::MacroDeclOp>(macroName, ArrayAttr(), StringAttr());
-
-      auto macroDefOp = builder.create<sv::MacroDefOp>(
-          FlatSymbolRefAttr::get(macroName),
-          builder.getStringAttr(formatString),
-          builder.getArrayAttr(ref ? ref : ArrayRef<Attribute>{}));
-
-      // The macro will be exported to a file with the format:
-      // ref_<module-name>.sv
-      macroDefOp->setAttr("output_file",
-                          hw::OutputFileAttr::getFromFilename(
-                              &getContext(), circuitRefPrefix + ".sv"));
+      declBuilder.create<sv::MacroDeclOp>(macroName, ArrayAttr(), StringAttr());
+      ports.emplace_back(macroName, declBuilder.getStringAttr(formatString),
+                         ref ? declBuilder.getArrayAttr({ref}) : ArrayAttr{});
     }
+
+    // Create a file only if the module has at least one ref port.
+    if (ports.empty())
+      return success();
+
+    // The macros will be exported to a `ref_<module-name>.sv` file.
+    // In the IR, the file is inserted before the module.
+    auto fileBuilder = ImplicitLocOpBuilder(module.getLoc(), module);
+    fileBuilder.create<emit::FileOp>(circuitRefPrefix + ".sv", [&] {
+      for (auto [macroName, formatString, symbols] : ports) {
+        fileBuilder.create<sv::MacroDefOp>(FlatSymbolRefAttr::get(macroName),
+                                           formatString, symbols);
+      }
+    });
 
     return success();
   }
@@ -751,6 +825,7 @@ class LowerXMRPass : public LowerXMRBase<LowerXMRPass> {
     refPortsToRemoveMap.clear();
     dataflowAt.clear();
     refSendPathList.clear();
+    moduleStates.clear();
   }
 
   bool isZeroWidth(FIRRTLBaseType t) { return t.getBitWidthOrSentinel() == 0; }
@@ -838,6 +913,9 @@ private:
 
   /// The insertion point where the pass inserts HierPathOps.
   OpBuilder::InsertPoint pathInsertPoint = {};
+
+  /// Per-module helpers for creating operations within modules.
+  DenseMap<FModuleOp, ModuleState> moduleStates;
 };
 
 std::unique_ptr<mlir::Pass> circt::firrtl::createLowerXMRPass() {

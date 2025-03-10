@@ -256,7 +256,7 @@ hw.module @ForStatement(in %aaaaaaaaaaa: i5, in %xxxxxxxxxxxxxxx : i2, in %yyyyy
     // CHECK-NEXT:      _RANDOM[iiiiiiiiiiiiiiiiiiiiiiiii] = `RANDOM;{{.*}}
     // CHECK-NEXT:    end{{.*}}
     sv.for %iiiiiiiiiiiiiiiiiiiiiiiii = %lowerBound to %upperBound step %step : i2 {
-      %RANDOM = sv.macro.ref.se @RANDOM() : () -> i32
+      %RANDOM = sv.macro.ref.expr.se @RANDOM() : () -> i32
       %index = sv.array_index_inout %_RANDOM[%iiiiiiiiiiiiiiiiiiiiiiiii] : !hw.inout<uarray<3xi32>>, i2
       sv.bpassign %index, %RANDOM : i32
     }
@@ -266,6 +266,7 @@ hw.module @ForStatement(in %aaaaaaaaaaa: i5, in %xxxxxxxxxxxxxxx : i2, in %yyyyy
 // -----
 
 sv.macro.decl @TEST_COND
+sv.macro.decl @TEST_COND_
 
 // CHECK-LABEL:module TestCond{{.*}}
 // CHECK-NEXT:  `ifdef TEST_COND_{{.*}}
@@ -274,7 +275,7 @@ sv.macro.decl @TEST_COND
 // CHECK-NEXT:    `define TEST_COND 1
 // CHECK-NEXT:  `endif // TEST_COND_
 hw.module @TestCond() {
-  sv.ifdef "TEST_COND_" {
+  sv.ifdef @TEST_COND_ {
    sv.macro.def @TEST_COND "TEST_COND_"
   } else {
    sv.macro.def @TEST_COND "1"

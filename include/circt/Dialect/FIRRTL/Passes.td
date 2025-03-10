@@ -41,6 +41,8 @@ def LowerFIRRTLAnnotations : Pass<"firrtl-lower-annotations", "firrtl::CircuitOp
       "Ignore unknown annotations.">,
     Option<"noRefTypePorts", "no-ref-type-ports", "bool", "false",
       "Create normal ports, not ref type ports.">,
+    Option<"allowAddingPortsOnPublic", "allow-adding-ports-on-public-modules", "bool", "false",
+      "Allow public modules to gain additional ports as a result of wiring.">,
   ];
   let dependentDialects = ["hw::HWDialect"];
   let statistics = [
@@ -54,6 +56,8 @@ def LowerFIRRTLAnnotations : Pass<"firrtl-lower-annotations", "firrtl::CircuitOp
       "Number of unhandled annotations">,
     Statistic<"numReusedHierPathOps", "num-reused-hierpath",
       "Number of reused HierPathOp's">,
+    Statistic<"numPublicPortsWired", "num-public-ports-wired",
+      "Number of ports on public modules added due to wiring">,
   ];
 }
 
@@ -193,7 +197,11 @@ def AddSeqMemPorts : Pass<"firrtl-add-seqmem-ports", "firrtl::CircuitOp"> {
     the extra ports.
   }];
   let constructor = "circt::firrtl::createAddSeqMemPortsPass()";
-  let dependentDialects = ["sv::SVDialect", "hw::HWDialect"];
+  let dependentDialects = [
+    "emit::EmitDialect",
+    "sv::SVDialect",
+    "hw::HWDialect"
+  ];
   let statistics = [
     Statistic<"numAddedPorts", "num-added-ports", "Number of extra ports added">,
   ];
@@ -210,7 +218,12 @@ def CreateSiFiveMetadata : Pass<"firrtl-emit-metadata", "mlir::ModuleOp"> {
     Option<"replSeqMemFile", "repl-seq-mem-file", "std::string", "",
       "File to which emit seq meme metadata">
   ];
-  let dependentDialects = ["hw::HWDialect", "om::OMDialect"];
+  let dependentDialects = [
+      "emit::EmitDialect",
+      "hw::HWDialect",
+      "om::OMDialect",
+      "sv::SVDialect",
+  ];
 }
 
 def FlattenMemory : Pass<"firrtl-flatten-memory", "firrtl::FModuleOp"> {
@@ -240,19 +253,6 @@ def LowerMemory : Pass<"firrtl-lower-memory", "firrtl::CircuitOp"> {
   ];
 }
 
-def WireDFT : Pass<"firrtl-dft", "firrtl::CircuitOp"> {
-  let summary = "Wires test enables to clock gates for DFT infrastructure";
-  let description = [{
-    This pass will take a 1-bit signal targeted by
-    `DFTTestModeEnableAnnotation` and wires it to the `test_en` port of every
-    module named `EICG_wrapper`. This will create ports in any intermediate
-    module on the path from the signal to the `EICG_wrapper` modules.  This
-    pass is used to enable the "Design For Testing" style of design when the
-    intermediate modules were not originally built with DFT in mind.
-  }];
-  let constructor = "circt::firrtl::createWireDFTPass()";
-}
-
 def Dedup : Pass<"firrtl-dedup", "firrtl::CircuitOp"> {
   let summary = "Deduplicate modules which are structurally equivalent";
   let description = [{
@@ -272,17 +272,23 @@ def Dedup : Pass<"firrtl-dedup", "firrtl::CircuitOp"> {
   let constructor = "circt::firrtl::createDedupPass()";
 }
 
-def EmitOMIR : Pass<"firrtl-emit-omir", "firrtl::CircuitOp"> {
-  let summary = "Emit OMIR annotations";
+def EliminateWires : Pass<"firrtl-eliminate-wires", "firrtl::FModuleOp"> {
+  let summary = "Eliminate Unneeded Wires";
   let description = [{
-    This pass gathers the `OMIRAnnotation`s in the design, updates the contained
-    targets with the trackers that were scattered throughout the design upon
-    reading the OMIR, and serializes the resulting data into a JSON file.
+    This pass eliminates wires for which the write dominates the reads and
+    for which there are no other preservation reasons.
   }];
-  let constructor = "circt::firrtl::createEmitOMIRPass()";
-  let options = [Option<"outputFilename", "file", "std::string", "",
-      "Output file for the JSON-serialized OMIR data">];
-  let dependentDialects = ["sv::SVDialect", "hw::HWDialect"];
+  let statistics = [
+    Statistic<"erasedWires", "num-erased-wires",
+      "Number of wires erased">,
+    Statistic<"complexWriteWires", "num-complex-wires",
+      "Number of wires not erased due to complex writes">,
+    Statistic<"notDomWires", "num-not-dominating-wires",
+      "Number of wires not erased due to dominance issues">,
+    Statistic<"complexTypeWires", "num-not-passive-wires",
+      "Number of wires not erased due to type issues">
+  ];
+  let constructor = "circt::firrtl::createEliminateWiresPass()";
 }
 
 def LowerMatches : Pass<"firrtl-lower-matches", "firrtl::FModuleOp"> {
@@ -374,11 +380,13 @@ def InferResets : Pass<"firrtl-infer-resets", "firrtl::CircuitOp"> {
   let summary = "Infer reset synchronicity and add implicit resets";
   let description = [{
     This pass infers whether resets are synchronous or asynchronous, and extends
-    reset-less registers with an asynchronous reset based on the following
+    reset-less registers with a reset based on the following
     annotations:
 
-    - `sifive.enterprise.firrtl.FullAsyncResetAnnotation`
-    - `sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation`
+    - `circt.FullResetAnnotation`
+    - `circt.ExcludeFromFullResetAnnotation`
+    - `sifive.enterprise.firrtl.FullAsyncResetAnnotation` (deprecated)
+    - `sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation` (deprecated)
   }];
   let constructor = "circt::firrtl::createInferResetsPass()";
 }
@@ -429,30 +437,11 @@ def BlackBoxReader : Pass<"firrtl-blackbox-reader", "CircuitOp"> {
       "directory where the input file was located, to allow for annotations "
       "relative to the input file.">
   ];
-  let dependentDialects = ["sv::SVDialect", "hw::HWDialect"];
-}
-
-def PrefixModules : Pass<"firrtl-prefix-modules", "firrtl::CircuitOp"> {
-  let summary = "Prefixes names of modules and mems in a hierarchy";
-  let description = [{
-    This pass looks for modules annotated with the
-    `NestedPrefixModulesAnnotation` and prefixes the names of all modules
-    instantiated underneath it.  If `inclusive` is true, it includes the target
-    module in the renaming.  If `inclusive` is false, it will only rename
-    modules instantiated underneath the target module.  If a module is required
-    to have two different prefixes, it will be cloned.
-
-    The supported annotation is:
-    ```
-      {
-        class = "sifive.enterprise.firrtl.NestedPrefixModulesAnnotation",
-        prefix = "MyPrefix_",
-        inclusive = true
-      }
-    ```
-
-  }];
-  let constructor = "circt::firrtl::createPrefixModulesPass()";
+  let dependentDialects = [
+      "emit::EmitDialect",
+      "hw::HWDialect",
+      "sv::SVDialect"
+  ];
 }
 
 def PrintFIRRTLFieldSourcePass
@@ -576,7 +565,11 @@ def ExtractInstances : Pass<"firrtl-extract-instances", "firrtl::CircuitOp"> {
     - `ExtractClockGatesFileAnnotation`
   }];
   let constructor = "circt::firrtl::createExtractInstancesPass()";
-  let dependentDialects = ["sv::SVDialect", "circt::hw::HWDialect"];
+  let dependentDialects = [
+    "emit::EmitDialect",
+    "circt::hw::HWDialect",
+    "sv::SVDialect",
+  ];
 }
 
 def MemToRegOfVec : Pass<"firrtl-mem-to-reg-of-vec", "firrtl::CircuitOp"> {
@@ -651,25 +644,56 @@ def RandomizeRegisterInit :
   let constructor = "circt::firrtl::createRandomizeRegisterInitPass()";
 }
 
+def CreateCompanionAssume : Pass<"firrtl-create-companion-assume", "firrtl::FModuleOp"> {
+  let summary = "Create companion assume statements for assertions";
+  let description = [{
+    This pass generates companion assume statements gated by macros to assertions.
+    If the assertion is UNR only one, a special form of assume (AssumeEdgedPredicateIntrinsicOp)
+    is used. Otherwise a concurrent assume is used
+  }];
+  let constructor = "circt::firrtl::createCreateCompanionAssume()";
+}
+
 def LowerXMR : Pass<"firrtl-lower-xmr", "firrtl::CircuitOp"> {
   let summary = "Lower ref ports to XMR";
   let description = [{
     This pass lowers RefType ops and ports to verbatim encoded XMRs.
   }];
   let constructor = "circt::firrtl::createLowerXMRPass()";
-  let dependentDialects = ["sv::SVDialect"];
+  let dependentDialects = [
+    "emit::EmitDialect",
+    "sv::SVDialect"
+  ];
 }
 
-def LowerIntrinsics : Pass<"firrtl-lower-intrinsics", "firrtl::CircuitOp"> {
-  let summary = "Lower intrinsics";
+def LowerIntmodules : Pass<"firrtl-lower-intmodules", "firrtl::CircuitOp"> {
+  let summary = "Lower instances instances of intrinsic modules to ops.";
   let description = [{
-    This pass lowers intrinsics encoded as extmodule with annotation and
-    intmodule to their implementation or op.
+    This pass replaces instances of intrinsic modules (intmodule) with
+    `firrtl.int.generic` operations, and removes the intmodule's from
+    the circuit.
+
+    Use this before running LowerIntrinsics.
   }];
-  let constructor = "circt::firrtl::createLowerIntrinsicsPass()";
+  let constructor = "circt::firrtl::createLowerIntmodulesPass()";
   let options = [
     Option<"fixupEICGWrapper", "fixup-eicg-wrapper", "bool", "false",
       "Lower `EICG_wrapper` modules into clock gate intrinsics">,
+  ];
+  let statistics = [
+    Statistic<"numInstances", "num-instances", "Number of intmodules instances lowered">,
+    Statistic<"numIntmodules", "num-intmodules", "Number of intmodules lowered">,
+  ];
+}
+
+def LowerIntrinsics : Pass<"firrtl-lower-intrinsics", "firrtl::FModuleOp"> {
+  let summary = "Lower intrinsics";
+  let description = [{
+    This pass lowers generic intrinsic ops to their implementation or op.
+  }];
+  let constructor = "circt::firrtl::createLowerIntrinsicsPass()";
+  let statistics = [
+    Statistic<"numConverted", "num-converted", "Number of intrinsic operations lowered">,
   ];
 }
 
@@ -697,7 +721,7 @@ def ResolveTraces : Pass<"firrtl-resolve-traces", "firrtl::CircuitOp"> {
   let constructor = "circt::firrtl::createResolveTracesPass()";
   let options = [Option<"outputAnnotationFilename", "file", "std::string", "",
       "Output file for the JSON-serialized Trace Annotations">];
-  let dependentDialects = ["sv::SVDialect"];
+  let dependentDialects = ["emit::EmitDialect", "sv::SVDialect"];
 }
 
 def InnerSymbolDCE : Pass<"firrtl-inner-symbol-dce", "mlir::ModuleOp"> {
@@ -793,38 +817,13 @@ def LayerSink : Pass<"firrtl-layer-sink", "firrtl::FModuleOp"> {
   ];
 }
 
-def HoistPassthrough : Pass<"firrtl-hoist-passthrough", "firrtl::CircuitOp"> {
-  let summary = "Hoist passthrough logic";
+def AdvancedLayerSink : Pass<"firrtl-advanced-layer-sink", "firrtl::CircuitOp"> {
+  let summary = "Sink operations into layer blocks";
   let description = [{
-    This pass hoists simple passthrough connections up.
+    This pass sinks ops into layers, whenever possible, to minimize unused
+    hardware in the design.
   }];
-  let constructor = "circt::firrtl::createHoistPassthroughPass()";
-  let options = [
-    Option<"hoistHWDrivers", "hoist-hw", "bool", "true",
-      "Hoist HW drivers.">
-  ];
-  let statistics = [
-    Statistic<"numUTurnsHoisted", "num-u-turns",
-      "Number of u-turns hoisted">,
-    Statistic<"numRefDrivers", "num-ref-drivers",
-      "Number of ref-type drivers processed">,
-    Statistic<"numHWDrivers", "num-hw-drivers",
-      "Number of hw-type drivers processed">
-  ];
-}
-
-def ProbeDCE : Pass<"firrtl-probe-dce", "firrtl::CircuitOp"> {
-  let summary = "Delete dead probe ports and operations.";
-  let description = [{
-    Simple pass to delete dead probe ports and operations.
-    Diagnoses illegal or unsupported input probe uses.
-    Post-condition: no input probe ports.
-  }];
-  let constructor = "circt::firrtl::createProbeDCEPass()";
-  let statistics = [
-    Statistic<"numErasedPorts", "num-erased-ports", "Number of ports erased">,
-    Statistic<"numErasedOps", "num-erased-ops", "Number of operations erased">
-  ];
+  let constructor = "::circt::firrtl::createAdvancedLayerSinkPass()";
 }
 
 def MaterializeDebugInfo :
@@ -851,8 +850,24 @@ def Lint :
   let constructor = "circt::firrtl::createLintingPass()";
 }
 
-def SpecializeOption :
-    Pass<"firrtl-specialize-option", "firrtl::CircuitOp"> {
+def SpecializeLayers : Pass<"firrtl-specialize-layers", "firrtl::CircuitOp"> {
+  let summary = "Specialize a configurable design for a given layer";
+  let description = [{
+    This pass performs specialization of layers, layerblocks, and probe
+    operations by permanantly enabling or disabling layers.  The layers are
+    specified by attributes on the `firrtl.circuit` operation in the
+    `enable_layers` and `disable_layers` attributes which are both lists of
+    SymbolRefAttrs.  When a layer is specialized, it will be removed from the
+    circuit and all references to it should be cleaned up.  If a layer is
+    disabled, all layerblock are referencing that layer will be deleted, and all
+    probe colored by that layer will be removed.  When a layer is enabled, all
+    contents of the layer will be inlined in to the outer context, and probes
+    colored by that layer will no longer be colored.
+  }];
+  let constructor = "circt::firrtl::createSpecializeLayersPass()";
+}
+
+def SpecializeOption : Pass<"firrtl-specialize-option", "firrtl::CircuitOp"> {
   let summary = "Specialize a configurable design for a given option.";
   let description = [{
     If the design has option groups, instead of preserving the information
@@ -862,13 +877,89 @@ def SpecializeOption :
   let constructor = "circt::firrtl::createSpecializeOptionPass()";
 
   let options = [
-    ListOption<"select", "select", "std::string", 
-               "Options to specialize, in option=case format">,
+    Option<"selectDefaultInstanceChoice", "select-default-for-unspecified-instance-choice", "bool", "false",
+      "Specialize instance choice to default, if no option selected.">,
   ];
   let statistics = [
     Statistic<"numInstances", "num-instances",
       "Number of instances specialized">
   ];
+}
+
+def ModuleSummary : Pass<"firrtl-module-summary", "firrtl::CircuitOp"> {
+  let summary = "Print a summary of modules.";
+  let description = [{
+    The pass produces a summary of modules.
+  }];
+  let constructor = "circt::firrtl::createModuleSummaryPass()";
+}
+
+def LowerDPI : Pass<"firrtl-lower-dpi", "firrtl::CircuitOp"> {
+    let summary = "Lower DPI intrinsic into Sim DPI operations";
+    let constructor = "circt::firrtl::createLowerDPIPass()";
+    let dependentDialects = ["hw::HWDialect", "seq::SeqDialect", "sim::SimDialect"];
+  }
+
+def AssignOutputDirs : Pass<"firrtl-assign-output-dirs", "firrtl::CircuitOp"> {
+  let summary = "Assign output directories to modules.";
+  let description = [{
+    While some modules are assigned output directories by the user, many modules
+    "don't care" what output directory they are placed into. This pass uses the
+    instance graph to assign these modules to the "deepest" output directory
+    possible.
+  }];
+  let constructor = "circt::firrtl::createAssignOutputDirsPass()";
+  let options = [
+    Option<"outputDirOption", "output-dir", "std::string", "",
+      "The default output directory.">
+  ];
+}
+
+def ProbesToSignals : Pass<"firrtl-probes-to-signals", "firrtl::CircuitOp"> {
+  let summary = "Convert probes to signals.";
+  let description = [{
+    This pass transforms the design to replace probes with non-probe signals
+    that are explicitly routed through the design instead of remote access.
+    The result will not be ABI-compatible but provide similar behavior without the
+    use of potentially unsynthesizable cross-module references.
+
+    The pass will do a complete conversion or produce an error.
+
+    Not all FIRRTL designs with probes can be equivalently represented
+    with non-probes.
+
+    Run after LowerOpenAggs, ExpandWhens (so ref.define can always be replaced),
+    and any colored probes are removed through specialization.
+
+    Due to differences in width and reset inference, it is suggested to run
+    those first as well but not required.
+
+    RWProbes and related operations are not supported.
+  }];
+  let constructor = "circt::firrtl::createProbesToSignalsPass()";
+}
+
+def CheckRecursiveInstantiation : Pass<"firrtl-check-recursive-instantiation",
+    "firrtl::CircuitOp"> {
+  let summary = "Check for illegal recursive instantiation";
+  let description = [{
+    This pass checks for illegal recursive module instantion.  Recursive
+    instantiation is when a module instantiates itself, either directly or
+    indirectly through other modules it instantiates.  Recursive module
+    instantiation is illegal because it would require infinite hardware to
+    synthesize. Recursive class instantiation is illegal as it would create an
+    infinite loop.
+  }];
+  let constructor = "circt::firrtl::createCheckRecursiveInstantiation()";
+}
+
+def CheckLayers : Pass<"firrtl-check-layers", "firrtl::CircuitOp"> {
+  let summary = "Check for illegal layers instantiated under layers";
+  let description = [{
+    This pass checks for illegal instantiation of a module with a layer
+    underneath another layer.
+  }];
+  let constructor = "circt::firrtl::createCheckLayers()";
 }
 
 #endif // CIRCT_DIALECT_FIRRTL_PASSES_TD

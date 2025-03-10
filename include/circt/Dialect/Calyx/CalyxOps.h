@@ -60,11 +60,15 @@ public:
       return success();
 
     // If the operation has the static attribute, verify it is zero.
-    APInt staticValue = staticAttribute.cast<IntegerAttr>().getValue();
+    APInt staticValue = cast<IntegerAttr>(staticAttribute).getValue();
     assert(staticValue == 0 && "If combinational, it should take 0 cycles.");
 
     return success();
   }
+};
+
+enum class FloatingPointStandard {
+  IEEE754,
 };
 
 /// The direction of a Component or Cell port. this is similar to the

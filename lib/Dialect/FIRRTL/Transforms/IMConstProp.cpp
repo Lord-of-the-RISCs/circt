@@ -11,19 +11,27 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
-#include "circt/Dialect/FIRRTL/FIRRTLFieldSource.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Support/APInt.h"
+#include "mlir/IR/Iterators.h"
 #include "mlir/IR/Threading.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/ScopedPrinter.h"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_IMCONSTPROP
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -57,7 +65,7 @@ static bool isDeletableWireOrRegOrNode(Operation *op) {
     return true;
 
   // Otherwise, don't delete if has anything keeping it around or unknown.
-  return AnnotationSet(op).canBeDeleted() && !hasDontTouch(op) &&
+  return AnnotationSet(op).empty() && !hasDontTouch(op) &&
          hasDroppableName(op) && !cast<Forceable>(op).isForceable();
 }
 
@@ -174,7 +182,8 @@ static llvm::raw_ostream &operator<<(llvm::raw_ostream &os,
 }
 
 namespace {
-struct IMConstPropPass : public IMConstPropBase<IMConstPropPass> {
+struct IMConstPropPass
+    : public circt::firrtl::impl::IMConstPropBase<IMConstPropPass> {
 
   void runOnOperation() override;
   void rewriteModuleBody(FModuleOp module);
@@ -360,12 +369,44 @@ void IMConstPropPass::runOnOperation() {
 
   instanceGraph = &getAnalysis<InstanceGraph>();
 
-  // Mark the input ports of public modules as being overdefined.
-  for (auto module : circuit.getBodyBlock()->getOps<FModuleOp>()) {
-    if (module.isPublic()) {
-      markBlockExecutable(module.getBodyBlock());
-      for (auto port : module.getBodyBlock()->getArguments())
-        markOverdefined(port);
+  // Mark input ports as overdefined where appropriate.
+  for (auto &op : circuit.getOps()) {
+    // Inputs of public modules are overdefined.
+    if (auto module = dyn_cast<FModuleOp>(op)) {
+      if (module.isPublic()) {
+        markBlockExecutable(module.getBodyBlock());
+        for (auto port : module.getBodyBlock()->getArguments())
+          markOverdefined(port);
+      }
+      continue;
+    }
+
+    // Otherwise we check whether the top-level operation contains any
+    // references to modules. Symbol uses in NLAs are ignored.
+    if (isa<hw::HierPathOp>(op))
+      continue;
+
+    // Inputs of modules referenced by unknown operations are overdefined, since
+    // we don't know how those operations affect the input port values. This
+    // handles things like `firrtl.formal`, which may may assign symbolic values
+    // to input ports of a private module.
+    auto symbolUses = SymbolTable::getSymbolUses(&op);
+    if (!symbolUses)
+      continue;
+    for (const auto &use : *symbolUses) {
+      if (auto symRef = dyn_cast<FlatSymbolRefAttr>(use.getSymbolRef())) {
+        if (auto *igNode = instanceGraph->lookupOrNull(symRef.getAttr())) {
+          if (auto module = dyn_cast<FModuleOp>(*igNode->getModule())) {
+            LLVM_DEBUG(llvm::dbgs()
+                       << "Unknown use of " << module.getModuleNameAttr()
+                       << " in " << op.getName()
+                       << ", marking inputs as overdefined\n");
+            markBlockExecutable(module.getBodyBlock());
+            for (auto port : module.getBodyBlock()->getArguments())
+              markOverdefined(port);
+          }
+        }
+      }
     }
   }
 
@@ -473,6 +514,8 @@ void IMConstPropPass::markBlockExecutable(Block *block) {
         .Case<InstanceOp>([&](auto instance) { markInstanceOp(instance); })
         .Case<ObjectOp>([&](auto obj) { markObjectOp(obj); })
         .Case<MemOp>([&](auto mem) { markMemOp(mem); })
+        .Case<LayerBlockOp>(
+            [&](auto layer) { markBlockExecutable(layer.getBody(0)); })
         .Default([&](auto _) {
           if (isa<mlir::UnrealizedConversionCastOp, VerbatimExprOp,
                   VerbatimWireOp, SubaccessOp>(op) ||
@@ -709,7 +752,7 @@ void IMConstPropPass::visitConnectLike(FConnectLike connect,
       return mergeLatticeValue(fieldRefDestConnected, srcValue);
     }
 
-    auto dest = fieldRefDest.getValue().cast<mlir::OpResult>();
+    auto dest = cast<mlir::OpResult>(fieldRefDest.getValue());
 
     // For wires and registers, we drive the value of the wire itself, which
     // automatically propagates to users.
@@ -907,7 +950,7 @@ void IMConstPropPass::visitOperation(Operation *op, FieldRef changedField) {
         resultLattice = LatticeValue::getOverdefined();
     } else { // Folding to an operand results in its value.
       resultLattice =
-          latticeValues[getOrCacheFieldRefFromValue(foldResult.get<Value>())];
+          latticeValues[getOrCacheFieldRefFromValue(cast<Value>(foldResult))];
     }
 
     mergeLatticeValue(getOrCacheFieldRefFromValue(op->getResult(i)),
@@ -997,88 +1040,92 @@ void IMConstPropPass::rewriteModuleBody(FModuleOp module) {
   for (auto &port : body->getArguments())
     replaceValueIfPossible(port);
 
-  // TODO: Walk 'when's preorder with `walk`.
-
   // Walk the IR bottom-up when folding.  We often fold entire chains of
   // operations into constants, which make the intermediate nodes dead.  Going
   // bottom up eliminates the users of the intermediate ops, allowing us to
   // aggressively delete them.
+  //
+  // TODO: Handle WhenOps correctly.
   bool aboveCursor = false;
-  for (auto &op : llvm::make_early_inc_range(llvm::reverse(*body))) {
-    auto dropIfDead = [&](Operation &op, const Twine &debugPrefix) {
-      if (op.use_empty() &&
-          (wouldOpBeTriviallyDead(&op) || isDeletableWireOrRegOrNode(&op))) {
-        LLVM_DEBUG(
-            { logger.getOStream() << debugPrefix << " : " << op << "\n"; });
-        ++numErasedOp;
-        op.erase();
-        return true;
-      }
-      return false;
-    };
+  module.walk<mlir::WalkOrder::PostOrder, mlir::ReverseIterator>(
+      [&](Operation *op) {
+        auto dropIfDead = [&](Operation *op, const Twine &debugPrefix) {
+          if (op->use_empty() &&
+              (wouldOpBeTriviallyDead(op) || isDeletableWireOrRegOrNode(op))) {
+            LLVM_DEBUG(
+                { logger.getOStream() << debugPrefix << " : " << op << "\n"; });
+            ++numErasedOp;
+            op->erase();
+            return true;
+          }
+          return false;
+        };
 
-    if (aboveCursor) {
-      // Drop dead constants we materialized.
-      dropIfDead(op, "Trivially dead materialized constant");
-      continue;
-    }
-    // Stop once hit the generated constants.
-    if (&op == cursor) {
-      cursor.erase();
-      aboveCursor = true;
-      continue;
-    }
-
-    // Connects to values that we found to be constant can be dropped.
-    if (auto connect = dyn_cast<FConnectLike>(op)) {
-      if (auto *destOp = connect.getDest().getDefiningOp()) {
-        auto fieldRef = getOrCacheFieldRefFromValue(connect.getDest());
-        // Don't remove a field-level connection even if the src value is
-        // constant. If other elements of the aggregate value are not constant,
-        // the aggregate value cannot be replaced. We can forward the constant
-        // to its users, so IMDCE (or SV/HW canonicalizer) should remove the
-        // aggregate if entire aggregate is dead.
-        auto type = type_dyn_cast<FIRRTLType>(connect.getDest().getType());
-        if (!type)
-          continue;
-        auto baseType = type_dyn_cast<FIRRTLBaseType>(type);
-        if (baseType && !baseType.isGround())
-          continue;
-        if (isDeletableWireOrRegOrNode(destOp) && !isOverdefined(fieldRef)) {
-          connect.erase();
-          ++numErasedOp;
+        if (aboveCursor) {
+          // Drop dead constants we materialized.
+          dropIfDead(op, "Trivially dead materialized constant");
+          return WalkResult::advance();
         }
-      }
-      continue;
-    }
+        // Stop once hit the generated constants.
+        if (op == cursor) {
+          cursor.erase();
+          aboveCursor = true;
+          return WalkResult::advance();
+        }
 
-    // We only fold single-result ops and instances in practice, because they
-    // are the expressions.
-    if (op.getNumResults() != 1 && !isa<InstanceOp>(op))
-      continue;
+        // Connects to values that we found to be constant can be dropped.
+        if (auto connect = dyn_cast<FConnectLike>(op)) {
+          if (auto *destOp = connect.getDest().getDefiningOp()) {
+            auto fieldRef = getOrCacheFieldRefFromValue(connect.getDest());
+            // Don't remove a field-level connection even if the src value is
+            // constant. If other elements of the aggregate value are not
+            // constant, the aggregate value cannot be replaced. We can forward
+            // the constant to its users, so IMDCE (or SV/HW canonicalizer)
+            // should remove the aggregate if entire aggregate is dead.
+            auto type = type_dyn_cast<FIRRTLType>(connect.getDest().getType());
+            if (!type)
+              return WalkResult::advance();
+            auto baseType = type_dyn_cast<FIRRTLBaseType>(type);
+            if (baseType && !baseType.isGround())
+              return WalkResult::advance();
+            if (isDeletableWireOrRegOrNode(destOp) &&
+                !isOverdefined(fieldRef)) {
+              connect.erase();
+              ++numErasedOp;
+            }
+          }
+          return WalkResult::advance();
+        }
 
-    // If this operation is already dead, then go ahead and remove it.
-    if (dropIfDead(op, "Trivially dead"))
-      continue;
+        // We only fold single-result ops and instances in practice, because
+        // they are the expressions.
+        if (op->getNumResults() != 1 && !isa<InstanceOp>(op))
+          return WalkResult::advance();
 
-    // Don't "fold" constants (into equivalent), also because they
-    // may have name hints we'd like to preserve.
-    if (op.hasTrait<mlir::OpTrait::ConstantLike>())
-      continue;
+        // If this operation is already dead, then go ahead and remove it.
+        if (dropIfDead(op, "Trivially dead"))
+          return WalkResult::advance();
 
-    // If the op had any constants folded, replace them.
-    builder.setInsertionPoint(&op);
-    bool foldedAny = false;
-    for (auto result : op.getResults())
-      foldedAny |= replaceValueIfPossible(result);
+        // Don't "fold" constants (into equivalent), also because they
+        // may have name hints we'd like to preserve.
+        if (op->hasTrait<mlir::OpTrait::ConstantLike>())
+          return WalkResult::advance();
 
-    if (foldedAny)
-      ++numFoldedOp;
+        // If the op had any constants folded, replace them.
+        builder.setInsertionPoint(op);
+        bool foldedAny = false;
+        for (auto result : op->getResults())
+          foldedAny |= replaceValueIfPossible(result);
 
-    // If the operation folded to a constant then we can probably nuke it.
-    if (foldedAny && dropIfDead(op, "Made dead"))
-      continue;
-  }
+        if (foldedAny)
+          ++numFoldedOp;
+
+        // If the operation folded to a constant then we can probably nuke it.
+        if (foldedAny && dropIfDead(op, "Made dead"))
+          return WalkResult::advance();
+
+        return WalkResult::advance();
+      });
 }
 
 std::unique_ptr<mlir::Pass> circt::firrtl::createIMConstPropPass() {

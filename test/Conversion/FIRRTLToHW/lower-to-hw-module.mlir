@@ -4,7 +4,7 @@
 // CHECK-NOT: firrtl.circuit
 
 // We should get a large header boilerplate.
-// CHECK:   sv.ifdef "PRINTF_COND" {
+// CHECK:   sv.ifdef @PRINTF_COND {
 // CHECK-NEXT:   sv.macro.def @PRINTF_COND_ "(`PRINTF_COND)"
 // CHECK-NEXT:  } else  {
 firrtl.circuit "Simple" {
@@ -71,9 +71,9 @@ firrtl.circuit "Simple" {
     // CHECK: %myext.out = hw.instance "myext" @MyParameterizedExtModule<DEFAULT: i64 = 0, DEPTH: f64 = 3.242000e+01, FORMAT: none = "xyz_timeout=%d\0A", WIDTH: i8 = 32>(in: %reset: i1) -> (out: i8)
     %myext:2 = firrtl.instance myext @MyParameterizedExtModule(in in: !firrtl.uint<1>, out out: !firrtl.uint<8>)
 
-    // CHECK: [[FD:%.*]] = hw.constant -2147483646 : i32
-    // CHECK: sv.fwrite [[FD]], "%x"(%xyz.out4) : i4
-    // CHECK: sv.fwrite [[FD]], "Something interesting! %x"(%myext.out) : i8
+    // CHECK: %PRINTF_FD_ = sv.macro.ref.expr @PRINTF_FD_() : () -> i32
+    // CHECK: sv.fwrite %PRINTF_FD_, "%x"(%xyz.out4) : i4
+    // CHECK: sv.fwrite %PRINTF_FD_, "Something interesting! %x"(%myext.out) : i8
 
     firrtl.connect %myext#0, %reset : !firrtl.uint<1>, !firrtl.uint<1>
 
@@ -90,7 +90,7 @@ firrtl.circuit "Simple" {
   }
 
   // CHECK-LABEL: hw.module private @PortMadness(
-  // CHECK: in %inA : i4, in %inB : i4, in %inC : i4, 
+  // CHECK: in %inA : i4, in %inB : i4, in %inC : i4,
   // CHECK: out outA : i4, out outB : i4, out outC : i4, out outD : i4, in %inE : i3, out outE : i4) {
   firrtl.module private @PortMadness(in %inA: !firrtl.uint<4>,
                              in %inB: !firrtl.uint<4>,

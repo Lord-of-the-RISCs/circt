@@ -1,5 +1,7 @@
 // RUN: circt-opt %s -test-apply-lowering-options='options=emitBindComments' -export-verilog -verify-diagnostics | FileCheck %s --strict-whitespace
 
+sv.macro.decl @SYNTHESIS
+
 // CHECK-LABEL: module inputs_only(
 // CHECK-NEXT:   input a,{{.*}}
 // CHECK-NEXT:         b
@@ -31,10 +33,10 @@ hw.module @no_ports() {
 // CHECK-NEXT:    output [1:0]  orvout
 // CHECK-NEXT:  );
 
-hw.module @Expressions(in %in4: i4, in %clock: i1, 
-  out out1a: i1, out out1b: i1, out out1c: i1, 
+hw.module @Expressions(in %in4: i4, in %clock: i1,
+  out out1a: i1, out out1b: i1, out out1c: i1,
   out out1d: i1, out out1e: i1, out out1f: i1, out out1g: i1,
-   out out4: i4, out out4s: i4, out out16: i16, out out16s: i16, 
+   out out4: i4, out out4s: i4, out out16: i16, out out16s: i16,
    out sext17: i17, out orvout: i2) {
   %c1_i4 = hw.constant 1 : i4
   %c2_i4 = hw.constant 2 : i4
@@ -250,9 +252,9 @@ hw.module @Precedence(in %a: i4, in %b: i4, in %c: i4, out out1: i1, out out: i1
 
 // CHECK-LABEL: module CmpSign(
 hw.module @CmpSign(in %a: i4, in %b: i4, in %c: i4, in %d: i4,
-  out o0: i1, out o1: i1, out o2: i1, out o3: i1, 
+  out o0: i1, out o1: i1, out o2: i1, out o3: i1,
   out o4: i1, out o5: i1, out o6: i1, out o7: i1,
-  out o8: i1, out o9: i1, out o10: i1, out o11: i1, 
+  out o8: i1, out o9: i1, out o10: i1, out o11: i1,
   out o12: i1, out o13: i1, out o14: i1, out o15: i1) {
   // CHECK: assign o0 = a < b;
   %0 = comb.icmp ult %a, %b : i4
@@ -400,6 +402,9 @@ hw.module @InlineDeclAssignment(in %a: i1) {
   sv.assign %c, %0 : i1
 }
 
+sv.macro.decl @foo
+sv.macro.decl @bar
+
 // CHECK-LABEL: module ordered_region
 // CHECK-NEXT: input a
 // CHECK-NEXT: );
@@ -407,14 +412,14 @@ hw.module @InlineDeclAssignment(in %a: i1) {
 hw.module @ordered_region(in %a: i1) {
   sv.ordered {
     // CHECK-NEXT: `ifdef foo
-    sv.ifdef "foo" {
+    sv.ifdef @foo {
       // CHECK-NEXT: wire_0 = a;
       %wire = sv.wire : !hw.inout<i1>
       sv.assign %wire, %a : i1
     }
     // CHECK-NEXT: `endif
     // CHECK-NEXT: `ifdef bar
-    sv.ifdef "bar" {
+    sv.ifdef @bar {
       // CHECK-NEXT: wire_1 = a;
       %wire = sv.wire : !hw.inout<i1>
       sv.assign %wire, %a : i1
@@ -484,7 +489,8 @@ hw.module @ArrayParamsInst() {
     uarr: %uarr : !hw.uarray<2 x i8>) -> ()
 }
 // CHECK:       wire [1:0][7:0] [[G0:_.*]] = '{8'h1, 8'h2};
-// CHECK:       wire [7:0]      [[G1:_.*]][0:1] = '{8'h1, 8'h2};
+// CHECK:       wire [7:0]      [[G1:_.*]][0:1];
+// CHECK:       assign [[G1]] = '{8'h1, 8'h2};
 // CHECK:       ArrayParams #(
 // CHECK:         .param(2)
 // CHECK:       ) arrays (
@@ -525,7 +531,7 @@ hw.module @Stop(in %clock: i1, in %reset: i1) {
   // CHECK:   `endif
   // CHECK: end // always @(posedge)
   sv.always posedge %clock  {
-    sv.ifdef.procedural "SYNTHESIS"  {
+    sv.ifdef.procedural @SYNTHESIS {
     } else  {
       %0 = sv.verbatim.expr "`STOP_COND_" : () -> i1
       %1 = comb.and %0, %reset : i1
@@ -552,7 +558,7 @@ hw.module @Print(in %clock: i1, in %reset: i1, in %a: i4, in %b: i4) {
   %0 = comb.concat %false, %a : i1, i4
   %1 = comb.shl %0, %c1_i5 : i5
   sv.always posedge %clock  {
-    %2 = sv.macro.ref @PRINTF_COND_() : () -> i1
+    %2 = sv.macro.ref.expr @PRINTF_COND_() : () -> i1
     %3 = comb.and %2, %reset : i1
     sv.if %3  {
       sv.fwrite %fd, "Hi %x %x\0A"(%1, %b) : i5, i4
@@ -692,7 +698,7 @@ hw.module @BindEmission() {
   // CHECK-NEXT: /* This instance is elsewhere emitted as a bind statement
   // CHECK-NEXT:    BindEmissionInstance BindEmissionInstance ();
   // CHECK-NEXT: */
-  hw.instance "BindEmissionInstance" sym @__BindEmissionInstance__ @BindEmissionInstance() -> ()  {doNotPrint = true}
+  hw.instance "BindEmissionInstance" sym @__BindEmissionInstance__ @BindEmissionInstance() -> ()  {doNotPrint}
   hw.output
 }
 
@@ -703,7 +709,7 @@ hw.module @BindEmission2() {
   // CHECK-NEXT: /* This instance is elsewhere emitted as a bind statement
   // CHECK-NEXT:    BindEmissionInstance BindEmissionInstance ();
   // CHECK-NEXT: */
-  hw.instance "BindEmissionInstance" sym @BindEmissionInstance @BindEmissionInstance() -> ()  {doNotPrint = true}
+  hw.instance "BindEmissionInstance" sym @BindEmissionInstance @BindEmissionInstance() -> ()  {doNotPrint}
   hw.output
 }
 
@@ -726,7 +732,7 @@ hw.module @bind_rename_port(in %.io_req_ready.output: i1, in %reset: i1 { hw.ver
 // CHECK-LABEL: module SiFive_MulDiv
 hw.module @SiFive_MulDiv(in %clock: i1, in %reset: i1, out io_req_ready: i1) {
   %false = hw.constant false
-  hw.instance "InvisibleBind_assert" sym @__ETC_SiFive_MulDiv_assert @bind_rename_port(".io_req_ready.output": %false: i1, reset: %reset: i1, clock: %clock: i1) -> () {doNotPrint = true}
+  hw.instance "InvisibleBind_assert" sym @__ETC_SiFive_MulDiv_assert @bind_rename_port(".io_req_ready.output": %false: i1, reset: %reset: i1, clock: %clock: i1) -> () {doNotPrint}
   hw.output %false : i1
   //      CHECK: bind_rename_port InvisibleBind_assert (
   // CHECK-NEXT:   ._io_req_ready_output (1'h0),
@@ -735,33 +741,52 @@ hw.module @SiFive_MulDiv(in %clock: i1, in %reset: i1, out io_req_ready: i1) {
   // CHECK-NEXT: );
 }
 
-sv.bind.interface <@BindInterface::@__Interface__> {output_file = #hw.output_file<"BindTest/BindInterface.sv", excludeFromFileList>}
+emit.file "BindTest/BindInterface.sv" {
+  sv.bind.interface <@BindInterface::@__Interface__>
+}
+
 sv.interface @Interface {
   sv.interface.signal @a : i1
   sv.interface.signal @b : i1
 }
 
-  hw.module.extern @W422_Bar(out clock: i1, out reset: i1)
-  hw.module.extern @W422_Baz(out q: i1)
+hw.module.extern @W422_Bar(out clock: i1, out reset: i1)
+
+hw.module.extern @W422_Baz(out q: i1)
+
 // CHECK-LABEL: module W422_Foo
 // CHECK-NOT: GEN
-  hw.module @W422_Foo() {
-    %false = hw.constant false
-    %bar.clock, %bar.reset = hw.instance "bar" @W422_Bar() -> (clock: i1, reset: i1)
-    %baz.q = hw.instance "baz" @W422_Baz() -> (q: i1)
-    %q = sv.reg sym @__q__  : !hw.inout<i1>
-    sv.always posedge %bar.clock, posedge %bar.reset {
-      sv.if %bar.reset {
-        sv.passign %q, %false : i1
-      } else {
-        sv.passign %q, %baz.q : i1
-      }
+hw.module @W422_Foo() {
+  %false = hw.constant false
+  %bar.clock, %bar.reset = hw.instance "bar" @W422_Bar() -> (clock: i1, reset: i1)
+  %baz.q = hw.instance "baz" @W422_Baz() -> (q: i1)
+  %q = sv.reg sym @__q__  : !hw.inout<i1>
+  sv.always posedge %bar.clock, posedge %bar.reset {
+    sv.if %bar.reset {
+      sv.passign %q, %false : i1
+    } else {
+      sv.passign %q, %baz.q : i1
     }
-    hw.output
   }
+  hw.output
+}
+
+sv.macro.decl @MacroWithoutVerilogName
+sv.macro.decl @MacroWithVerilogName["A"]
+// CHECK-LABEL: module ModuleUsingMacroWithVerilogName(
+hw.module @ModuleUsingMacroWithVerilogName(in %a : i1) {
+  // CHECK: `ifdef MacroWithoutVerilogName
+  sv.ifdef @MacroWithoutVerilogName {
+    %b = hw.wire %a : i1
+  }
+  // CHECK: `ifdef A
+  sv.ifdef @MacroWithVerilogName {
+    %b = hw.wire %a : i1
+  }
+}
 
 hw.module @BindInterface() {
-  %bar = sv.interface.instance sym @__Interface__ {doNotPrint = true} : !sv.interface<@Interface>
+  %bar = sv.interface.instance sym @__Interface__ {doNotPrint} : !sv.interface<@Interface>
   hw.output
 }
 

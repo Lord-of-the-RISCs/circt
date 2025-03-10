@@ -35,15 +35,6 @@ firrtl.circuit "Foo" {
     firrtl.connect %out, %invalid_ui : !firrtl.uint, !firrtl.uint
     firrtl.connect %out, %c42_ui : !firrtl.uint, !firrtl.uint
 
-    // Check that the invalid values are duplicated, and a corner case where the
-    // wire won't be updated with a width until after updating the invalid value
-    // above.
-    // CHECK: %invalid_ui2 = firrtl.invalidvalue : !firrtl.uint<2>
-    %w = firrtl.wire : !firrtl.uint
-    %c2_ui = firrtl.constant 2 : !firrtl.uint
-    firrtl.connect %w, %invalid_ui : !firrtl.uint, !firrtl.uint
-    firrtl.connect %w, %c2_ui : !firrtl.uint, !firrtl.uint
-
     // Check that invalid values are inferred to width zero if not used in a
     // connect.
     // CHECK: firrtl.invalidvalue : !firrtl.uint<0>
@@ -364,20 +355,18 @@ firrtl.circuit "Foo" {
   firrtl.module @MuxOp() {
     // CHECK: %0 = firrtl.wire : !firrtl.uint<2>
     // CHECK: %1 = firrtl.wire : !firrtl.uint<3>
-    // CHECK: %2 = firrtl.wire : !firrtl.uint<1>
+    // CHECK: %2 = firrtl.wire : !firrtl.uint<0>
     // CHECK: %3 = firrtl.mux{{.*}} -> !firrtl.uint<3>
     %0 = firrtl.wire : !firrtl.uint
     %1 = firrtl.wire : !firrtl.uint
     %2 = firrtl.wire : !firrtl.uint
     %3 = firrtl.mux(%2, %0, %1) : (!firrtl.uint, !firrtl.uint, !firrtl.uint) -> !firrtl.uint
-    // CHECK: %4 = firrtl.wire : !firrtl.uint<1>
-    %c1_ui1 = firrtl.constant 1 : !firrtl.uint<1>
-    %4 = firrtl.wire : !firrtl.uint
-    %5 = firrtl.mux(%4, %c1_ui1, %c1_ui1) : (!firrtl.uint, !firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
     %c1_ui2 = firrtl.constant 1 : !firrtl.uint<2>
     %c2_ui3 = firrtl.constant 2 : !firrtl.uint<3>
+    %c0_ui0 = firrtl.constant 0 : !firrtl.uint<0>
     firrtl.connect %0, %c1_ui2 : !firrtl.uint, !firrtl.uint<2>
     firrtl.connect %1, %c2_ui3 : !firrtl.uint, !firrtl.uint<3>
+    firrtl.connect %2, %c0_ui0 : !firrtl.uint, !firrtl.uint<0>
   }
 
   // see https://github.com/llvm/circt/issues/3070
@@ -416,22 +405,22 @@ firrtl.circuit "Foo" {
     firrtl.connect %ui, %c0_ui5 : !firrtl.uint, !firrtl.uint<5>
     firrtl.connect %si, %c0_si5 : !firrtl.sint, !firrtl.sint<5>
 
-    // CHECK: firrtl.connect %u0, %0 : !firrtl.uint<8>, !firrtl.uint<8>
+    // CHECK: firrtl.connect %u0, %0 : !firrtl.uint<8>
     %u0 = firrtl.wire : !firrtl.uint
     firrtl.connect %u0, %0 : !firrtl.uint, !firrtl.uint
-    // CHECK: firrtl.connect %s1, %1 : !firrtl.sint<8>, !firrtl.sint<8>
+    // CHECK: firrtl.connect %s1, %1 : !firrtl.sint<8>
     %s1 = firrtl.wire : !firrtl.sint
     firrtl.connect %s1, %1 : !firrtl.sint, !firrtl.sint
-    // CHECK: firrtl.connect %u2, %2 : !firrtl.uint<2>, !firrtl.uint<2>
+    // CHECK: firrtl.connect %u2, %2 : !firrtl.uint<2>
     %u2 = firrtl.wire : !firrtl.uint
     firrtl.connect %u2, %2 : !firrtl.uint, !firrtl.uint
-    // CHECK: firrtl.connect %s3, %3 : !firrtl.sint<2>, !firrtl.sint<2>
+    // CHECK: firrtl.connect %s3, %3 : !firrtl.sint<2>
     %s3 = firrtl.wire : !firrtl.sint
     firrtl.connect %s3, %3 : !firrtl.sint, !firrtl.sint
-    // CHECK: firrtl.connect %u4, %4 : !firrtl.uint<0>, !firrtl.uint<0>
+    // CHECK: firrtl.connect %u4, %4 : !firrtl.uint<0>
     %u4 = firrtl.wire : !firrtl.uint
     firrtl.connect %u4, %4 : !firrtl.uint, !firrtl.uint
-    // CHECK: firrtl.connect %s5, %5 : !firrtl.sint<1>, !firrtl.sint<1>
+    // CHECK: firrtl.connect %s5, %5 : !firrtl.sint<1>
     %s5 = firrtl.wire : !firrtl.sint
     firrtl.connect %s5, %5 : !firrtl.sint, !firrtl.sint
   }
@@ -468,6 +457,7 @@ firrtl.circuit "Foo" {
     }
     firrtl.assert %clk, %true, %true, "foo" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>
     firrtl.assume %clk, %true, %true, "foo" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>
+    firrtl.int.unclocked_assume %true, %true, "foo" : !firrtl.uint<1>, !firrtl.uint<1>
     firrtl.cover %clk, %true, %true, "foo" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>
   }
 
@@ -478,8 +468,8 @@ firrtl.circuit "Foo" {
     // CHECK: %c200_si9 = firrtl.constant 200 : !firrtl.sint<9>
     // CHECK: %0 = firrtl.tail %x, 5 : (!firrtl.sint<9>) -> !firrtl.uint<4>
     // CHECK: %1 = firrtl.asSInt %0 : (!firrtl.uint<4>) -> !firrtl.sint<4>
-    // CHECK: firrtl.connect %y, %1 : !firrtl.sint<4>, !firrtl.sint<4>
-    // CHECK: firrtl.connect %x, %c200_si9 : !firrtl.sint<9>, !firrtl.sint<9>
+    // CHECK: firrtl.connect %y, %1 : !firrtl.sint<4>
+    // CHECK: firrtl.connect %x, %c200_si9 : !firrtl.sint<9>
     %x = firrtl.wire : !firrtl.sint
     %c200_si = firrtl.constant 200 : !firrtl.sint
     firrtl.connect %y, %x : !firrtl.sint<4>, !firrtl.sint
@@ -494,7 +484,7 @@ firrtl.circuit "Foo" {
     firrtl.connect %w, %c1_ui1 : !firrtl.uint, !firrtl.uint<1>
     %w1 = firrtl.wire  : !firrtl.uint<0>
     // CHECK: %0 = firrtl.tail %w, 1 : (!firrtl.uint<1>) -> !firrtl.uint<0>
-    // CHECK: firrtl.connect %w1, %0 : !firrtl.uint<0>, !firrtl.uint<0>
+    // CHECK: firrtl.connect %w1, %0 : !firrtl.uint<0>
     firrtl.connect %w1, %w : !firrtl.uint<0>, !firrtl.uint
   }
 
@@ -647,7 +637,7 @@ firrtl.circuit "Foo" {
 
   // CHECK-LABEL: @InferBundlePort
   firrtl.module @InferBundlePort(in %in: !firrtl.bundle<a: uint<2>, b: uint<3>>, out %out: !firrtl.bundle<a: uint, b: uint>) {
-    // CHECK: firrtl.connect %out, %in : !firrtl.bundle<a: uint<2>, b: uint<3>>, !firrtl.bundle<a: uint<2>, b: uint<3>>
+    // CHECK: firrtl.connect %out, %in : !firrtl.bundle<a: uint<2>, b: uint<3>>
     firrtl.connect %out, %in : !firrtl.bundle<a: uint, b: uint>, !firrtl.bundle<a: uint<2>, b: uint<3>>
   }
 
@@ -677,7 +667,7 @@ firrtl.circuit "Foo" {
 
   // CHECK-LABEL: @InferVectorPort
   firrtl.module @InferVectorPort(in %in: !firrtl.vector<uint<4>, 2>, out %out: !firrtl.vector<uint, 2>) {
-    // CHECK: firrtl.connect %out, %in : !firrtl.vector<uint<4>, 2>, !firrtl.vector<uint<4>, 2>
+    // CHECK: firrtl.connect %out, %in : !firrtl.vector<uint<4>, 2>
     firrtl.connect %out, %in : !firrtl.vector<uint, 2>, !firrtl.vector<uint<4>, 2>
   }
 
@@ -922,11 +912,11 @@ firrtl.circuit "Foo" {
   firrtl.module @ForeignTypes(in %a: !firrtl.uint<42>, out %b: !firrtl.uint) {
     %0 = firrtl.wire : index
     %1 = firrtl.wire : index
-    firrtl.strictconnect %0, %1 : index
+    firrtl.matchingconnect %0, %1 : index
     firrtl.connect %b, %a : !firrtl.uint, !firrtl.uint<42>
     // CHECK-NEXT: [[W0:%.+]] = firrtl.wire : index
     // CHECK-NEXT: [[W1:%.+]] = firrtl.wire : index
-    // CHECK-NEXT: firrtl.strictconnect [[W0]], [[W1]] : index
+    // CHECK-NEXT: firrtl.matchingconnect [[W0]], [[W1]] : index
   }
 
   // CHECK-LABEL: @Issue4859
@@ -956,9 +946,7 @@ firrtl.circuit "Foo" {
   firrtl.module @Property(in %a: !firrtl.string) { }
 
   // CHECK-LABEL: module @MuxIntrinsics
-  // CHECK-SAME: %sel: !firrtl.uint<1>
-  // CHECK-SAME: %sel2: !firrtl.uint<2>
-  firrtl.module @MuxIntrinsics(in %sel: !firrtl.uint, in %sel2: !firrtl.uint, in %high: !firrtl.uint<1>, in %low: !firrtl.uint<1>, out %out1: !firrtl.uint, out %out2: !firrtl.uint) {
+  firrtl.module @MuxIntrinsics(in %sel_0w: !firrtl.uint<0>, in %sel_1w: !firrtl.uint<1>, in %high: !firrtl.uint<1>, in %low: !firrtl.uint<1>, out %out1: !firrtl.uint, out %out2: !firrtl.uint) {
     %c3_ui4 = firrtl.constant 3 : !firrtl.uint<4>
     %c3_ui3 = firrtl.constant 3 : !firrtl.uint<3>
     %c2_ui2 = firrtl.constant 2 : !firrtl.uint<2>
@@ -966,12 +954,16 @@ firrtl.circuit "Foo" {
     %c1_ui2 = firrtl.constant 1 : !firrtl.uint<2>
     %c0_ui1 = firrtl.constant 0 : !firrtl.uint<1>
     %c1 = firrtl.constant 0: !firrtl.uint
+    %sel = firrtl.wire : !firrtl.uint
+    firrtl.connect %sel, %sel_0w : !firrtl.uint, !firrtl.uint<0>
     // CHECK: firrtl.int.mux2cell
-    // CHECK-SAME: (!firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
+    // CHECK-SAME: (!firrtl.uint<0>, !firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
     %0 = firrtl.int.mux2cell(%sel, %c0_ui1, %c1) : (!firrtl.uint, !firrtl.uint<1>, !firrtl.uint) -> !firrtl.uint
     firrtl.connect %out1, %0: !firrtl.uint, !firrtl.uint
+    %sel2 = firrtl.wire : !firrtl.uint
+    firrtl.connect %sel2, %sel_1w : !firrtl.uint, !firrtl.uint<1>
     // CHECK: firrtl.int.mux4cell
-    // CHECK-SAME: (!firrtl.uint<2>, !firrtl.uint<1>, !firrtl.uint<2>, !firrtl.uint<3>, !firrtl.uint<1>) -> !firrtl.uint<3>
+    // CHECK-SAME: (!firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<2>, !firrtl.uint<3>, !firrtl.uint<1>) -> !firrtl.uint<3>
     %1 = firrtl.int.mux4cell(%sel2, %c1_ui1, %c2_ui2, %c3_ui3, %c1) : (!firrtl.uint, !firrtl.uint<1>, !firrtl.uint<2>, !firrtl.uint<3>, !firrtl.uint) -> !firrtl.uint
     firrtl.connect %out2, %1: !firrtl.uint, !firrtl.uint
   }
@@ -986,7 +978,7 @@ firrtl.circuit "Foo" {
     // CHECK-SAME: rwprobe<uint<1>>
     // CHECK-SAME: rwprobe<uint<2>>
     %c_in, %c_p, %c_p2 = firrtl.instance c @RWProbePortChild(in in: !firrtl.bundle<a: vector<uint, 2>, b: uint>, out p: !firrtl.rwprobe<uint>, out p2: !firrtl.rwprobe<uint>)
-    // CHECK-NEXT: !firrtl.bundle<a: vector<uint<1>, 2>, b: uint<2>>, !firrtl.bundle<a: vector<uint<1>, 2>, b: uint<2>>
+    // CHECK-NEXT: firrtl.connect %c_in, %in : !firrtl.bundle<a: vector<uint<1>, 2>, b: uint<2>>
    firrtl.connect %c_in, %in : !firrtl.bundle<a: vector<uint, 2>, b: uint>, !firrtl.bundle<a: vector<uint<1>, 2>, b: uint<2>>
     // CHECK-NEXT: rwprobe<uint<1>>
     firrtl.ref.define %p, %c_p : !firrtl.rwprobe<uint>

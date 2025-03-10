@@ -22,7 +22,10 @@
 #include "mlir/Tools/mlir-translate/Translation.h"
 #include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/FormatVariadic.h"
+#include <bitset>
+#include <string>
 
 using namespace circt;
 using namespace calyx;
@@ -119,9 +122,9 @@ private:
               static constexpr std::string_view sCompile = "compile";
               return {sCompile};
             })
-        .Case<MemoryOp, NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp,
-              GtLibOp, LtLibOp, EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp,
-              RshLibOp, SliceLibOp, PadLibOp, MuxLibOp>(
+        .Case<NotLibOp, AndLibOp, OrLibOp, XorLibOp, SubLibOp, GtLibOp, LtLibOp,
+              EqLibOp, NeqLibOp, GeLibOp, LeLibOp, LshLibOp, RshLibOp,
+              SliceLibOp, PadLibOp, MuxLibOp>(
             [&](auto op) -> FailureOr<StringRef> {
               static constexpr std::string_view sCore = "core";
               return {sCore};
@@ -134,9 +137,41 @@ private:
                   "binary_operators";
               return {sBinaryOperators};
             })
-        .Case<SeqMemoryOp>([&](auto op) -> FailureOr<StringRef> {
-          static constexpr std::string_view sMemories = "memories";
+        .Case<MemoryOp>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sMemories = "memories/comb";
           return {sMemories};
+        })
+        .Case<SeqMemoryOp>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sMemories = "memories/seq";
+          return {sMemories};
+        })
+        .Case<ConstantOp>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloat = "float";
+          return {sFloat};
+        })
+        .Case<AddFOpIEEE754>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloatingPoint = "float/addFN";
+          return {sFloatingPoint};
+        })
+        .Case<MulFOpIEEE754>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloatingPoint = "float/mulFN";
+          return {sFloatingPoint};
+        })
+        .Case<CompareFOpIEEE754>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloatingPoint = "float/compareFN";
+          return {sFloatingPoint};
+        })
+        .Case<FpToIntOpIEEE754>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloatingPoint = "float/fpToInt";
+          return {sFloatingPoint};
+        })
+        .Case<IntToFpOpIEEE754>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloatingPoint = "float/intToFp";
+          return {sFloatingPoint};
+        })
+        .Case<DivSqrtOpIEEE754>([&](auto op) -> FailureOr<StringRef> {
+          static constexpr std::string_view sFloatingPoint = "float/divSqrtFN";
+          return {sFloatingPoint};
         })
         .Default([&](auto op) {
           auto diag = op->emitOpError() << "not supported for emission";
@@ -180,7 +215,7 @@ struct Emitter {
     for (auto sourceLoc : llvm::enumerate(metadata)) {
       // <index>: <source-location>\n
       os << std::to_string(sourceLoc.index()) << colon();
-      os << sourceLoc.value().cast<StringAttr>().getValue() << endl();
+      os << cast<StringAttr>(sourceLoc.value()).getValue() << endl();
     }
 
     os << metadataRBrace();
@@ -249,6 +284,9 @@ struct Emitter {
   // Invoke emission
   void emitInvoke(InvokeOp invoke);
 
+  // Floating point Constant emission
+  void emitConstant(ConstantOp constant);
+
   // Emits a library primitive with template parameters based on all in- and
   // output ports.
   // e.g.:
@@ -273,6 +311,9 @@ struct Emitter {
   //   f = std_foo(1);
   void emitLibraryPrimTypedByFirstOutputPort(
       Operation *op, std::optional<StringRef> calyxLibName = {});
+
+  // Emits a library floating point primitives
+  void emitLibraryFloatingPoint(Operation *op);
 
 private:
   /// Used to track which imports are required for this program.
@@ -320,7 +361,7 @@ private:
     bool isBooleanAttribute =
         llvm::find(booleanAttributes, identifier) != booleanAttributes.end();
 
-    if (attr.getValue().isa<UnitAttr>()) {
+    if (isa<UnitAttr>(attr.getValue())) {
       assert(isBooleanAttribute &&
              "Non-boolean attributes must provide an integer value.");
       if (!atFormat) {
@@ -328,7 +369,7 @@ private:
       } else {
         buffer << addressSymbol() << identifier;
       }
-    } else if (auto intAttr = attr.getValue().dyn_cast<IntegerAttr>()) {
+    } else if (auto intAttr = dyn_cast<IntegerAttr>(attr.getValue())) {
       APInt value = intAttr.getValue();
       if (!atFormat) {
         buffer << quote() << identifier << quote() << equals() << value;
@@ -434,14 +475,14 @@ private:
 
   /// Emits the value of a guard or assignment.
   void emitValue(Value value, bool isIndented) {
-    if (auto blockArg = value.dyn_cast<BlockArgument>()) {
+    if (auto blockArg = dyn_cast<BlockArgument>(value)) {
       // Emit component block argument.
       StringAttr portName = getPortInfo(blockArg).name;
       (isIndented ? indent() : os) << portName.getValue();
       return;
     }
 
-    auto definingOp = value.getDefiningOp();
+    auto *definingOp = value.getDefiningOp();
     assert(definingOp && "Value does not have a defining operation.");
 
     TypeSwitch<Operation *>(definingOp)
@@ -634,6 +675,7 @@ void Emitter::emitComponent(ComponentInterface op) {
           .Case<MemoryOp>([&](auto op) { emitMemory(op); })
           .Case<SeqMemoryOp>([&](auto op) { emitSeqMemory(op); })
           .Case<hw::ConstantOp>([&](auto op) { /*Do nothing*/ })
+          .Case<calyx::ConstantOp>([&](auto op) { emitConstant(op); })
           .Case<SliceLibOp, PadLibOp, ExtSILibOp>(
               [&](auto op) { emitLibraryPrimTypedByAllPorts(op); })
           .Case<LtLibOp, GtLibOp, EqLibOp, NeqLibOp, GeLibOp, LeLibOp, SltLibOp,
@@ -653,6 +695,9 @@ void Emitter::emitComponent(ComponentInterface op) {
             emitLibraryPrimTypedByFirstOutputPort(
                 op, /*calyxLibName=*/{"std_sdiv_pipe"});
           })
+          .Case<AddFOpIEEE754, MulFOpIEEE754, CompareFOpIEEE754,
+                FpToIntOpIEEE754, IntToFpOpIEEE754, DivSqrtOpIEEE754>(
+              [&](auto op) { emitLibraryFloatingPoint(op); })
           .Default([&](auto op) {
             emitOpError(op, "not supported for emission inside component");
           });
@@ -697,7 +742,7 @@ void Emitter::emitPrimitiveExtern(hw::HWModuleExternOp op) {
   if (!op.getParameters().empty()) {
     os << LSquare();
     llvm::interleaveComma(op.getParameters(), os, [&](Attribute param) {
-      auto paramAttr = param.cast<hw::ParamDeclAttr>();
+      auto paramAttr = cast<hw::ParamDeclAttr>(param);
       os << paramAttr.getName().str();
     });
     os << RSquare();
@@ -726,10 +771,8 @@ void Emitter::emitPrimitivePorts(hw::HWModuleExternOp op) {
       // We only care about the bit width in the emitted .futil file.
       // Emit parameterized or non-parameterized bit width.
       if (hw::isParametricType(port.type)) {
-        hw::ParamDeclRefAttr bitWidth =
-            port.type.template cast<hw::IntType>()
-                .getWidth()
-                .template dyn_cast<hw::ParamDeclRefAttr>();
+        hw::ParamDeclRefAttr bitWidth = dyn_cast<hw::ParamDeclRefAttr>(
+            cast<hw::IntType>(port.type).getWidth());
         os << bitWidth.getName().str();
       } else {
         unsigned int bitWidth = port.type.getIntOrFloatBitWidth();
@@ -760,11 +803,11 @@ void Emitter::emitPrimitive(PrimitiveOp op) {
 
   if (op.getParameters().has_value()) {
     llvm::interleaveComma(*op.getParameters(), os, [&](Attribute param) {
-      auto paramAttr = param.cast<hw::ParamDeclAttr>();
+      auto paramAttr = cast<hw::ParamDeclAttr>(param);
       auto value = paramAttr.getValue();
-      if (auto intAttr = value.dyn_cast<IntegerAttr>()) {
+      if (auto intAttr = dyn_cast<IntegerAttr>(value)) {
         os << intAttr.getInt();
-      } else if (auto fpAttr = value.dyn_cast<FloatAttr>()) {
+      } else if (auto fpAttr = dyn_cast<FloatAttr>(value)) {
         os << fpAttr.getValue().convertToFloat();
       } else {
         llvm_unreachable("Primitive parameter type not supported");
@@ -801,14 +844,14 @@ void Emitter::emitMemory(MemoryOp memory) {
            << std::to_string(dimension) << LParen() << memory.getWidth()
            << comma();
   for (Attribute size : memory.getSizes()) {
-    APInt memSize = size.cast<IntegerAttr>().getValue();
+    APInt memSize = cast<IntegerAttr>(size).getValue();
     memSize.print(os, /*isSigned=*/false);
     os << comma();
   }
 
   ArrayAttr addrSizes = memory.getAddrSizes();
   for (size_t i = 0, e = addrSizes.size(); i != e; ++i) {
-    APInt addrSize = addrSizes[i].cast<IntegerAttr>().getValue();
+    APInt addrSize = cast<IntegerAttr>(addrSizes[i]).getValue();
     addrSize.print(os, /*isSigned=*/false);
     if (i + 1 == e)
       continue;
@@ -824,19 +867,22 @@ void Emitter::emitSeqMemory(SeqMemoryOp memory) {
                         "supported by the native Calyx compiler.");
     return;
   }
-  indent() << getAttributes(memory, /*atFormat=*/true) << memory.instanceName()
-           << space() << equals() << space() << "seq_mem_d"
-           << std::to_string(dimension) << LParen() << memory.getWidth()
-           << comma();
+  bool isRef = !memory->hasAttr("external");
+  indent();
+  if (isRef)
+    os << "ref ";
+  os << getAttributes(memory, /*atFormat=*/true) << memory.instanceName()
+     << space() << equals() << space() << "seq_mem_d"
+     << std::to_string(dimension) << LParen() << memory.getWidth() << comma();
   for (Attribute size : memory.getSizes()) {
-    APInt memSize = size.cast<IntegerAttr>().getValue();
+    APInt memSize = cast<IntegerAttr>(size).getValue();
     memSize.print(os, /*isSigned=*/false);
     os << comma();
   }
 
   ArrayAttr addrSizes = memory.getAddrSizes();
   for (size_t i = 0, e = addrSizes.size(); i != e; ++i) {
-    APInt addrSize = addrSizes[i].cast<IntegerAttr>().getValue();
+    APInt addrSize = cast<IntegerAttr>(addrSizes[i]).getValue();
     addrSize.print(os, /*isSigned=*/false);
     if (i + 1 == e)
       continue;
@@ -848,6 +894,20 @@ void Emitter::emitSeqMemory(SeqMemoryOp memory) {
 void Emitter::emitInvoke(InvokeOp invoke) {
   StringRef callee = invoke.getCallee();
   indent() << "invoke " << callee;
+  auto refCellsMap = invoke.getRefCellsMap();
+  if (!refCellsMap.empty()) {
+    os << "[";
+    llvm::interleaveComma(refCellsMap, os, [&](Attribute attr) {
+      auto dictAttr = cast<DictionaryAttr>(attr);
+      llvm::interleaveComma(dictAttr, os, [&](NamedAttribute namedAttr) {
+        auto refCellName = namedAttr.getName().str();
+        auto externalMem =
+            cast<FlatSymbolRefAttr>(namedAttr.getValue()).getValue();
+        os << refCellName << " = " << externalMem;
+      });
+    });
+    os << "]";
+  }
   ArrayAttr portNames = invoke.getPortNames();
   ArrayAttr inputNames = invoke.getInputNames();
   /// Because the ports of all components of calyx.invoke are inside a (),
@@ -897,6 +957,23 @@ void Emitter::emitInvoke(InvokeOp invoke) {
   os << RParen() << semicolonEndL();
 }
 
+void Emitter::emitConstant(ConstantOp constantOp) {
+  TypedAttr attr = constantOp.getValueAttr();
+  assert(isa<FloatAttr>(attr) && "must be a floating point constant");
+  auto fltAttr = cast<FloatAttr>(attr);
+  APFloat value = fltAttr.getValue();
+  auto type = cast<FloatType>(fltAttr.getType());
+  double doubleValue = value.convertToDouble();
+  auto floatBits = value.getSizeInBits(type.getFloatSemantics());
+  indent() << constantOp.getName().str() << space() << equals() << space()
+           << "std_float_const";
+  // Currently defaults to IEEE-754 representation [1].
+  // [1]: https://github.com/calyxir/calyx/blob/main/primitives/float.futil
+  static constexpr int32_t IEEE754 = 0;
+  os << LParen() << std::to_string(IEEE754) << comma() << floatBits << comma()
+     << std::to_string(doubleValue) << RParen() << semicolonEndL();
+}
+
 /// Calling getName() on a calyx operation will return "calyx.${opname}". This
 /// function returns whatever is left after the first '.' in the string,
 /// removing the 'calyx' prefix.
@@ -934,6 +1011,83 @@ void Emitter::emitLibraryPrimTypedByFirstOutputPort(
            << LParen() << bitWidth << RParen() << semicolonEndL();
 }
 
+unsigned getFPBitWidth(CellInterface &cell) {
+  if (isa<IntToFpOpIEEE754>(cell.getOperation())) {
+    // `std_intToFp` has the float point value in the first output port.
+    return cell.getOutputPorts()[0].getType().getIntOrFloatBitWidth();
+  }
+
+  auto inputPorts = cell.getInputPorts();
+  assert(inputPorts.size() >= 2 && "There should be at least two input ports");
+
+  // magic number for the index of `left/right` input port for
+  // `AddF`/`MulF`/`CompareF`; `in` input port for `FpToInt`.
+  size_t inputPortIndex = inputPorts.size() - 2;
+  return cell.getInputPorts()[inputPortIndex].getType().getIntOrFloatBitWidth();
+}
+
+unsigned getIntWidth(Operation *op, CellInterface &cell, bool isIntToFp) {
+  auto inputPorts = cell.getInputPorts();
+  assert(inputPorts.size() >= 2);
+
+  size_t integerIndex = inputPorts.size() - 2;
+  if (!isIntToFp) {
+    // FpToInt case: output width determines integer width.
+    return cell.getOutputPorts()[0].getType().getIntOrFloatBitWidth();
+  }
+  return cell.getInputPorts()[integerIndex].getType().getIntOrFloatBitWidth();
+}
+
+void Emitter::emitLibraryFloatingPoint(Operation *op) {
+  auto cell = cast<CellInterface>(op);
+
+  unsigned fpBitWidth = getFPBitWidth(cell);
+  unsigned expWidth, sigWidth;
+  switch (fpBitWidth) {
+  case 16:
+    expWidth = 5;
+    sigWidth = 11;
+    break;
+  case 32:
+    expWidth = 8;
+    sigWidth = 24;
+    break;
+  case 64:
+    expWidth = 11;
+    sigWidth = 53;
+    break;
+  case 128:
+    expWidth = 15;
+    sigWidth = 113;
+    break;
+  default:
+    op->emitError("The supported bitwidths are 16, 32, 64, and 128");
+    return;
+  }
+
+  std::string opName;
+  if (auto fpOp = dyn_cast<calyx::FloatingPointOpInterface>(op)) {
+    opName = fpOp.getCalyxLibraryName();
+  }
+
+  indent() << getAttributes(op, /*atFormat=*/true) << cell.instanceName()
+           << space() << equals() << space() << opName << LParen();
+
+  if (isa<calyx::IntToFpOpIEEE754>(op)) {
+    unsigned intWidth = getIntWidth(op, cell, /*isIntToFp=*/true);
+    os << intWidth << comma();
+  }
+
+  os << expWidth << comma() << sigWidth << comma() << fpBitWidth;
+
+  if (auto fpToIntOp = dyn_cast<calyx::FpToIntOpIEEE754>(op)) {
+    unsigned intWidth = getIntWidth(op, cell, /*isIntToFp=*/false);
+    os << comma() << intWidth;
+  }
+
+  os << RParen() << semicolonEndL();
+}
+
 void Emitter::emitAssignment(AssignOp op) {
 
   emitValue(op.getDest(), /*isIndented=*/true);
@@ -952,8 +1106,8 @@ void Emitter::emitWires(WiresOp op) {
       TypeSwitch<Operation *>(&bodyOp)
           .Case<GroupInterface>([&](auto op) { emitGroup(op); })
           .Case<AssignOp>([&](auto op) { emitAssignment(op); })
-          .Case<hw::ConstantOp, comb::AndOp, comb::OrOp, comb::XorOp, CycleOp>(
-              [&](auto op) { /* Do nothing. */ })
+          .Case<hw::ConstantOp, calyx::ConstantOp, comb::AndOp, comb::OrOp,
+                comb::XorOp, CycleOp>([&](auto op) { /* Do nothing. */ })
           .Default([&](auto op) {
             emitOpError(op, "not supported for emission inside wires section");
           });

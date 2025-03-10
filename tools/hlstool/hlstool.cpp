@@ -12,7 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "mlir/Conversion/Passes.h"
+#include "mlir/Conversion/AffineToStandard/AffineToStandard.h"
+#include "mlir/Conversion/SCFToControlFlow/SCFToControlFlow.h"
 #include "mlir/Dialect/Affine/IR/AffineOps.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
@@ -45,6 +46,7 @@
 #include "circt/Conversion/SCFToCalyx.h"
 #include "circt/Dialect/Calyx/CalyxDialect.h"
 #include "circt/Dialect/Calyx/CalyxPasses.h"
+#include "circt/Dialect/DC/DCPasses.h"
 #include "circt/Dialect/ESI/ESIDialect.h"
 #include "circt/Dialect/ESI/ESIPasses.h"
 #include "circt/Dialect/SV/SVDialect.h"
@@ -55,8 +57,6 @@
 #include "circt/Support/LoweringOptionsParser.h"
 #include "circt/Support/Version.h"
 #include "circt/Transforms/Passes.h"
-
-#include <iostream>
 
 using namespace llvm;
 using namespace mlir;
@@ -219,6 +219,9 @@ static cl::opt<bool> withESI("with-esi",
                              cl::desc("Create ESI compatible modules"),
                              cl::init(false), cl::cat(mainCategory));
 
+static cl::opt<bool> withDC("dc", cl::desc("Use the DC flow"), cl::init(false),
+                            cl::cat(mainCategory));
+
 static LoweringOptionsOption loweringOptions(mainCategory);
 
 // --------------------------------------------------------------------------
@@ -229,7 +232,7 @@ static LoweringOptionsOption loweringOptions(mainCategory);
 static std::unique_ptr<Pass> createSimpleCanonicalizerPass() {
   mlir::GreedyRewriteConfig config;
   config.useTopDownTraversal = true;
-  config.enableRegionSimplification = false;
+  config.enableRegionSimplification = mlir::GreedySimplifyRegionLevel::Disabled;
   return mlir::createCanonicalizerPass(config);
 }
 
@@ -238,7 +241,7 @@ static void loadDHLSPipeline(OpPassManager &pm) {
   pm.addPass(circt::createFlattenMemRefPass());
   pm.nest<func::FuncOp>().addPass(
       circt::handshake::createHandshakeLegalizeMemrefsPass());
-  pm.addPass(mlir::createConvertSCFToCFPass());
+  pm.addPass(mlir::createSCFToControlFlowPass());
   pm.nest<handshake::FuncOp>().addPass(createSimpleCanonicalizerPass());
 
   // DHLS conversion
@@ -322,7 +325,7 @@ static LogicalResult doHLSFlowDynamic(
   // Software lowering
   addIRLevel(IRLevel::PreCompile, [&]() {
     pm.addPass(mlir::createLowerAffinePass());
-    pm.addPass(mlir::createConvertSCFToCFPass());
+    pm.addPass(mlir::createSCFToControlFlowPass());
   });
 
   addIRLevel(IRLevel::Core, [&]() { loadDHLSPipeline(pm); });
@@ -333,7 +336,21 @@ static LogicalResult doHLSFlowDynamic(
 
   addIRLevel(IRLevel::RTL, [&]() {
     pm.nest<handshake::FuncOp>().addPass(createSimpleCanonicalizerPass());
-    pm.addPass(circt::createHandshakeToHWPass());
+    if (withDC) {
+      pm.addPass(circt::createHandshakeToDC({"clock", "reset"}));
+      // This pass sometimes resolves an error in the
+      pm.addPass(createSimpleCanonicalizerPass());
+      pm.nest<hw::HWModuleOp>().addPass(
+          circt::dc::createDCMaterializeForksSinksPass());
+      // TODO: We assert without a canonicalizer pass here. Debug.
+      pm.addPass(createSimpleCanonicalizerPass());
+      pm.addPass(circt::createDCToHWPass());
+      pm.addPass(createSimpleCanonicalizerPass());
+      pm.addPass(circt::createMapArithToCombPass());
+      pm.addPass(createSimpleCanonicalizerPass());
+    } else {
+      pm.addPass(circt::createHandshakeToHWPass());
+    }
     pm.addPass(createSimpleCanonicalizerPass());
     loadESILoweringPipeline(pm);
   });

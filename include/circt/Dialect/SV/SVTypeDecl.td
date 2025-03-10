@@ -77,9 +77,9 @@ def InterfaceOp : SVOp<"interface",
 
 def SignalTypeAttr : TypeAttrBase<"::mlir::Type", "Any SV/HW type"> {
   let predicate = And<[
-      CPred<"$_self.isa<::mlir::TypeAttr>()">,
+      CPred<"llvm::isa<::mlir::TypeAttr>($_self)">,
       CPred<"::circt::hw::getBitWidth(" #
-              "$_self.cast<::mlir::TypeAttr>().getValue()) != -1">
+              "llvm::cast<::mlir::TypeAttr>($_self).getValue()) != -1">
   ]>;
 }
 
@@ -212,7 +212,8 @@ def ModportType : SVType<"Modport"> {
 
 def InterfaceInstanceOp : SVOp<"interface.instance", [
       HasCustomSSAName,
-      DeclareOpInterfaceMethods<InnerSymbol, ["getTargetResultIndex"]>
+      DeclareOpInterfaceMethods<InnerSymbol, ["getTargetResultIndex"]>,
+      DeclareOpInterfaceMethods<SymbolUserOpInterface>
     ]> {
   let summary = "Instantiate an interface";
   let description = [{
@@ -223,7 +224,8 @@ def InterfaceInstanceOp : SVOp<"interface.instance", [
   }];
 
   let arguments = (ins StrAttr:$name,
-                       OptionalAttr<InnerSymAttr>:$inner_sym);
+                       OptionalAttr<InnerSymAttr>:$inner_sym,
+                       UnitAttr:$doNotPrint);
   let results = (outs InterfaceType : $result);
 
   let assemblyFormat = [{
@@ -240,7 +242,9 @@ def InterfaceInstanceOp : SVOp<"interface.instance", [
   let hasVerifier = 1;
 
   let extraClassDeclaration = [{
-    InterfaceType getInterfaceType() { return getType().cast<InterfaceType>(); }
+    InterfaceType getInterfaceType() {
+      return llvm::cast<InterfaceType>(getType());
+    }
 
     /// Lookup the interface that this is an instance of.  This returns null on
     /// invalid IR.
@@ -257,7 +261,9 @@ def InterfaceInstanceOp : SVOp<"interface.instance", [
   }];
 }
 
-def GetModportOp: SVOp<"modport.get", [Pure]> {
+def GetModportOp: SVOp<"modport.get", [Pure,
+      DeclareOpInterfaceMethods<SymbolUserOpInterface>
+    ]> {
   let summary = "Get a modport out of an interface instance";
   let description = [{
     Use this to extract a modport view to an instantiated interface. For
@@ -275,8 +281,6 @@ def GetModportOp: SVOp<"modport.get", [Pure]> {
 
   let assemblyFormat =
     "$iface $field attr-dict `:` qualified(type($iface)) `->` qualified(type($result))";
-
-  let hasVerifier = 1;
 
   let builders = [
     OpBuilder<(ins "Value":$value, "::llvm::StringRef":$field)>

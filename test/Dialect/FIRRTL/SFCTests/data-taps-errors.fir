@@ -1,5 +1,6 @@
 ; RUN: firtool %s --split-input-file -verify-diagnostics
 
+FIRRTL version 4.0.0
 circuit TapBetweenWhens : %[[
   {
     "class":"sifive.enterprise.grandcentral.DataTapsAnnotation",
@@ -12,26 +13,27 @@ circuit TapBetweenWhens : %[[
     ]
   }
 ]]
-  module TapBetweenWhens :
+  public module TapBetweenWhens :
     input c1: UInt<1>
     input c2: UInt<1>
-    output o: UInt
+    output o: UInt<1>
 
     when c1:
       ; expected-error @below {{This value is involved with a Wiring Problem where the destination}}
       wire val : UInt<3>
-      val <= UInt(1)
+      connect val, UInt(1)
 
-    o is invalid
+    invalidate o
 
     when c2:
       ; expected-note @below {{The destination is here.}}
       wire tap: UInt<3>
-      tap is invalid
-      o <= tap
+      invalidate tap
+      connect o, tap
 
 ; // -----
 
+FIRRTL version 4.0.0
 circuit NoSafeInsertionPoint : %[[
   {
     "class":"sifive.enterprise.grandcentral.DataTapsAnnotation",
@@ -44,22 +46,23 @@ circuit NoSafeInsertionPoint : %[[
     ]
   }
 ]]
-  module NoSafeInsertionPoint :
+  public module NoSafeInsertionPoint :
     input c: UInt<1>
     output o: UInt<1>
 
     when c:
       ; expected-error @below {{This value is involved with a Wiring Problem where the destination}}
       wire val : UInt<3>
-      val <= UInt(1)
+      connect val, UInt(1)
 
     ; expected-note @below {{The destination is here.}}
     wire tap: UInt<3>
-    tap is invalid
-    o <= tap
+    invalidate tap
+    connect o, tap
 
 ; // -----
 
+FIRRTL version 4.0.0
 ; expected-error @below {{Unable to apply annotation}}
 circuit Top : %[[
   {
@@ -134,10 +137,10 @@ circuit Top : %[[
   module Child :
 
     inst localparam of BlackBox
-    localparam is invalid
+    invalidate localparam.sink
 
     wire tap : UInt<1>
-    tap is invalid
+    invalidate tap
 
   module ChildWrapper :
 
@@ -146,27 +149,27 @@ circuit Top : %[[
   module Bar :
 
     wire inv : UInt<1>
-    inv is invalid
+    invalidate inv
 
   module Foo :
 
     inst b of Bar
 
-  module Top:
+  public module Top:
 
     inst foo of Foo
 
     wire tap : UInt<1>
-    tap is invalid
+    invalidate tap
 
     wire tap2 : UInt<1>
-    tap2 is invalid
+    invalidate tap2
 
     wire tap3 : UInt<1>
-    tap3 is invalid
+    invalidate tap3
 
     wire legacy_tap : UInt<1>
-    legacy_tap is invalid
+    invalidate legacy_tap
 
     inst unsigned of ChildWrapper
 

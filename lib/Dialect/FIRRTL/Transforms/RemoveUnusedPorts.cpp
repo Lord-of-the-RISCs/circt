@@ -6,27 +6,32 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
-
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
-#include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Support/Debug.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "llvm/ADT/APSInt.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "firrtl-remove-unused-ports"
 
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_REMOVEUNUSEDPORTS
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
+
 using namespace circt;
 using namespace firrtl;
 
 namespace {
 struct RemoveUnusedPortsPass
-    : public RemoveUnusedPortsBase<RemoveUnusedPortsPass> {
+    : public circt::firrtl::impl::RemoveUnusedPortsBase<RemoveUnusedPortsPass> {
   void runOnOperation() override;
   void removeUnusedModulePorts(FModuleOp module,
                                InstanceGraphNode *instanceGraphNode);
@@ -68,9 +73,8 @@ void RemoveUnusedPortsPass::removeUnusedModulePorts(
     auto arg = module.getArgument(index);
 
     // If the port is don't touch or has unprocessed annotations, we cannot
-    // remove the port. Maybe we can allow annotations though.
-    if ((hasDontTouch(arg) || !port.annotations.canBeDeleted()) &&
-        !ignoreDontTouch)
+    // remove the port.
+    if ((hasDontTouch(arg) || !port.annotations.empty()) && !ignoreDontTouch)
       continue;
 
     // TODO: Handle inout ports.

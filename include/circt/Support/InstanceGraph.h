@@ -200,17 +200,39 @@ public:
   InstanceGraph(const InstanceGraph &) = delete;
   virtual ~InstanceGraph() = default;
 
-  /// Look up an InstanceGraphNode for a module.
-  InstanceGraphNode *lookup(ModuleOpInterface op);
+  /// Lookup an module by name. Returns null if no module with the given name
+  /// exists in the instance graph.
+  InstanceGraphNode *lookupOrNull(StringAttr name);
 
-  /// Lookup an module by name.
-  InstanceGraphNode *lookup(StringAttr name);
+  /// Look up an InstanceGraphNode for a module. Returns null if the module has
+  /// not been added to the instance graph.
+  InstanceGraphNode *lookupOrNull(ModuleOpInterface op) {
+    return lookup(op.getModuleNameAttr());
+  }
+
+  /// Look up an InstanceGraphNode for a module. Aborts if the module does not
+  /// exist.
+  InstanceGraphNode *lookup(ModuleOpInterface op) {
+    auto *node = lookupOrNull(op);
+    assert(node != nullptr && "Module not in InstanceGraph!");
+    return node;
+  }
+
+  /// Lookup an module by name. Aborts if the module does not exist.
+  InstanceGraphNode *lookup(StringAttr name) {
+    auto *node = lookupOrNull(name);
+    assert(node != nullptr && "Module not in InstanceGraph!");
+    return node;
+  }
 
   /// Lookup an InstanceGraphNode for a module.
   InstanceGraphNode *operator[](ModuleOpInterface op) { return lookup(op); }
 
   /// Check if child is instantiated by a parent.
-  bool isAncestor(ModuleOpInterface child, ModuleOpInterface parent);
+  bool isAncestor(
+      ModuleOpInterface child, ModuleOpInterface parent,
+      llvm::function_ref<bool(InstanceRecord *)> skipInstance =
+          [](InstanceRecord *_) { return false; });
 
   /// Get the node corresponding to the top-level module of a circuit.
   virtual InstanceGraphNode *getTopLevelNode() { return nullptr; }
@@ -330,6 +352,8 @@ struct InstancePathCache {
   explicit InstancePathCache(InstanceGraph &instanceGraph)
       : instanceGraph(instanceGraph) {}
   ArrayRef<InstancePath> getAbsolutePaths(ModuleOpInterface op);
+  ArrayRef<InstancePath> getAbsolutePaths(ModuleOpInterface op,
+                                          InstanceGraphNode *top);
 
   /// Replace an InstanceOp. This is required to keep the cache updated.
   void replaceInstance(InstanceOpInterface oldOp, InstanceOpInterface newOp);

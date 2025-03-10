@@ -4,7 +4,7 @@
 firrtl.circuit "Deleted" {
 firrtl.module @Deleted() {
     // CHECK: %0 = firrtl.path reference distinct[0]<>
-    %0 = firrtl.unresolved_path "OMDeleted"
+    %0 = firrtl.unresolved_path "OMDeleted:"
 }
 }
 
@@ -15,7 +15,7 @@ firrtl.circuit "Deleted" {
 firrtl.module @Deleted(out %path : !firrtl.path) {
     // CHECK: %0 = firrtl.path reference distinct[0]<>
     // CHECK: propassign %path, %0 : !firrtl.path
-    %0 = firrtl.unresolved_path "OMDeleted"
+    %0 = firrtl.unresolved_path "OMDeleted:"
     firrtl.propassign %path, %0 : !firrtl.path
 }
 }
@@ -91,18 +91,42 @@ firrtl.module @Child() {
 
 // -----
 
+// CHECK-LABEL: firrtl.circuit "LocalPath"
+firrtl.circuit "LocalPath" {
+// CHECK: firrtl.module @LocalPath()
+firrtl.module @LocalPath() {
+    // CHECK: %0 = firrtl.path instance distinct[0]<>
+    %0 = firrtl.unresolved_path "OMInstanceTarget:~LocalPath|Child"
+
+    // CHECK: %1 = firrtl.path reference distinct[1]<>
+    %1 = firrtl.unresolved_path "OMReferenceTarget:~LocalPath|Child>wire"
+
+    // CHECK: firrtl.instance child0 @Child()
+    // CHECK: firrtl.instance child1 @Child()
+    firrtl.instance child0 @Child()
+    firrtl.instance child1 @Child()
+}
+// CHECK: firrtl.module @Child() attributes {annotations = [{class = "circt.tracker", id = distinct[0]<>}]}
+firrtl.module @Child() {
+    // CHECK: %wire = firrtl.wire {annotations = [{class = "circt.tracker", id = distinct[1]<>}]} : !firrtl.uint<8>
+    %wire = firrtl.wire : !firrtl.uint<8>
+}
+}
+
+// -----
+
 // CHECK-LABEL: firrtl.circuit "PathMinimization"
 firrtl.circuit "PathMinimization" {
 // CHECK: firrtl.module @PathMinimization()
 firrtl.module @PathMinimization() {
     // CHECK: %0 = firrtl.path reference distinct[0]<>
-    // CHECK: firrtl.instance child @Child()
+    // CHECK: firrtl.instance child {{.+}} @Child()
     %0 = firrtl.unresolved_path "OMReferenceTarget:~PathMinimization|PathMinimization/child:Child>wire"
     firrtl.instance child @Child()
 }
 // CHECK: firrtl.module @Child()
 firrtl.module @Child() {
-    // CHECK: %wire = firrtl.wire {annotations = [{class = "circt.tracker", id = distinct[0]<>}]} : !firrtl.uint<8>
+    // CHECK: %wire = firrtl.wire {annotations = [{{{.+}} class = "circt.tracker", id = distinct[0]<>}]} : !firrtl.uint<8>
     %wire = firrtl.wire : !firrtl.uint<8>
 }
 }
@@ -116,16 +140,16 @@ firrtl.module @TargetInstance() {
     // CHECK: %0 = firrtl.path reference distinct[0]<>
     // CHECK: %1 = firrtl.path instance distinct[1]<>
     // CHECK: %2 = firrtl.path member_instance distinct[2]<>
-    // CHECK: firrtl.instance child @Child()
+    // CHECK: firrtl.instance child {{.+}} @Child()
     %0 = firrtl.unresolved_path "OMReferenceTarget:~TargetInstance|TargetInstance/child:Child"
     %1 = firrtl.unresolved_path "OMInstanceTarget:~TargetInstance|TargetInstance/child:Child"
     %2 = firrtl.unresolved_path "OMMemberInstanceTarget:~TargetInstance|TargetInstance/child:Child"
     firrtl.instance child @Child()
 }
 // CHECK: firrtl.module @Child() attributes {annotations = [
-// CHECK-SAME: {class = "circt.tracker", id = distinct[0]<>},
-// CHECK-SAME: {class = "circt.tracker", id = distinct[1]<>},
-// CHECK-SAME: {class = "circt.tracker", id = distinct[2]<>}
+// CHECK-SAME: {{{.+}} class = "circt.tracker", id = distinct[0]<>},
+// CHECK-SAME: {{{.+}} class = "circt.tracker", id = distinct[1]<>},
+// CHECK-SAME: {{{.+}} class = "circt.tracker", id = distinct[2]<>}
 // CHECK-SAME: ]}
 firrtl.module @Child() { }
 }
@@ -137,11 +161,11 @@ firrtl.circuit "TargetInstancePort" {
 // CHECK: firrtl.module @TargetInstancePort() {
 firrtl.module @TargetInstancePort() {
     // CHECK: %0 = firrtl.path reference distinct[0]<>
-    // CHECK: firrtl.instance child @Child(in in: !firrtl.uint<8>)
+    // CHECK: firrtl.instance child {{.+}} @Child(in in: !firrtl.uint<8>)
     %0 = firrtl.unresolved_path "OMReferenceTarget:~TargetInstancePort|TargetInstancePort/child:Child>in"
     firrtl.instance child @Child(in in : !firrtl.uint<8>)
 }
-// CHECK: firrtl.module @Child(in %in: !firrtl.uint<8> [{class = "circt.tracker", id = distinct[0]<>}])
+// CHECK: firrtl.module @Child(in %in: !firrtl.uint<8> [{{{.+}} class = "circt.tracker", id = distinct[0]<>}])
 firrtl.module @Child(in %in : !firrtl.uint<8>) { }
 }
 

@@ -1,4 +1,4 @@
-// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-annotations))' --split-input-file %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline='builtin.module(firrtl.circuit(firrtl-lower-annotations{allow-adding-ports-on-public-modules=true}))'  --verify-diagnostics --split-input-file %s | FileCheck %s
 
 // circt.test copies the annotation to the target
 // circt.testNT puts the targetless annotation on the circuit
@@ -488,7 +488,7 @@ firrtl.circuit "Foo" attributes {rawAnnotations = [
   firrtl.extmodule @Bar(in bar: !firrtl.uint<1>)
   firrtl.module @Foo(in %foo: !firrtl.uint<1>) {
     %bar_bar = firrtl.instance bar  @Bar(in bar: !firrtl.uint<1>)
-    firrtl.strictconnect %bar_bar, %foo : !firrtl.uint<1>
+    firrtl.matchingconnect %bar_bar, %foo : !firrtl.uint<1>
   }
 }
 
@@ -585,7 +585,7 @@ firrtl.circuit "instportAnno" attributes {rawAnnotations = [
 ]} {
   firrtl.module @Baz(out %a: !firrtl.uint<1>) {
     %invalid_ui1 = firrtl.invalidvalue : !firrtl.uint<1>
-    firrtl.strictconnect %a, %invalid_ui1 : !firrtl.uint<1>
+    firrtl.matchingconnect %a, %invalid_ui1 : !firrtl.uint<1>
   }
   firrtl.module @Bar() {
     %baz_a = firrtl.instance baz @Baz(out a: !firrtl.uint<1>)
@@ -734,10 +734,46 @@ firrtl.circuit "Test" attributes {rawAnnotations = [
 // -----
 
 firrtl.circuit "Test" attributes {rawAnnotations =[
-  {class = "circt.ConventionAnnotation", target = "~Test|Test", convention = "scalarized"}
+  {class = "circt.ConventionAnnotation", target = "~Test|Test", convention = "scalarized"},
+  {class = "circt.BodyTypeLoweringAnnotation", target = "~Test|Test", convention = "scalarized", includeHierarchy = false}
   ]} {
-  // CHECK: attributes {convention = #firrtl<convention scalarized>}
+  // CHECK: attributes {body_type_lowering = #firrtl<convention scalarized>, convention = #firrtl<convention scalarized>}
   firrtl.module @Test() attributes {convention = #firrtl<convention internal>} {}
+}
+
+// -----
+
+firrtl.circuit "Test" attributes {rawAnnotations = [
+    {class = "circt.ConventionAnnotation", target = "~Test|Test", convention = "scalarized"},
+    {class = "circt.BodyTypeLoweringAnnotation", target = "~Test|Test", convention = "scalarized", includeHierarchy = true}
+  ]} {
+  // CHECK: @Test() attributes {body_type_lowering = #firrtl<convention scalarized>, convention = #firrtl<convention scalarized>}
+  firrtl.module @Test() attributes {convention = #firrtl<convention internal>} {
+    firrtl.instance child @Child()
+  }
+
+  // CHECK: @Child() attributes {body_type_lowering = #firrtl<convention scalarized>}
+  firrtl.module @Child() attributes {convention = #firrtl<convention internal>} {}
+
+  // CHECK: @Child2() {
+  firrtl.module @Child2() attributes {convention = #firrtl<convention internal>} {}
+}
+
+// -----
+
+firrtl.circuit "Test" attributes {rawAnnotations =[
+  {class = "chisel3.ModulePrefixAnnotation", target = "~Test|Test>comb", prefix = "Prefix_"},
+  {class = "chisel3.ModulePrefixAnnotation", target = "~Test|Test>seq", prefix = "Prefix_"},
+  {class = "chisel3.ModulePrefixAnnotation", target = "~Test|Test>mem", prefix = "Prefix_"}
+  ]} {
+  firrtl.module @Test() {
+    // CHECK: %comb = chirrtl.combmem {prefix = "Prefix_"} : !chirrtl.cmemory<vector<uint<1>, 2>, 256>
+    %comb = chirrtl.combmem : !chirrtl.cmemory<vector<uint<1>, 2>, 256>
+    // CHECK: %seq = chirrtl.seqmem Undefined {prefix = "Prefix_"} : !chirrtl.cmemory<vector<uint<1>, 2>, 256>
+    %seq = chirrtl.seqmem Undefined : !chirrtl.cmemory<vector<uint<1>, 2>, 256>
+    // CHECK: %mem_w = firrtl.mem Undefined {depth = 8 : i64, name = "mem", portNames = ["w"], prefix = "Prefix_", readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<3>, en: uint<1>, clk: clock, data: uint<4>, mask: uint<1>> 
+    %mem_w = firrtl.mem Undefined  {depth = 8 : i64, name = "mem", portNames = ["w"], readLatency = 0 : i32, writeLatency = 1 : i32} : !firrtl.bundle<addr: uint<3>, en: uint<1>, clk: clock, data: uint<4>, mask: uint<1>>
+  }
 }
 
 // -----
@@ -1096,80 +1132,12 @@ firrtl.circuit "GCTInterface"  attributes {
 // CHECK:      %7 = firrtl.subfield %6[_0] : !firrtl.bundle<_0: uint<1>, _1: uint<1>>
 // CHECK:      %8 = firrtl.subfield %forceable_reg[_2] : !firrtl.bundle<_0: bundle<_0: uint<1>, _1: uint<1>>, _2: vector<uint<1>, 2>>
 // CHECK:      %9 = firrtl.subindex %8[1] : !firrtl.vector<uint<1>, 2>
-// CHECK:      firrtl.strictconnect %view_companion_view_register__2_0__bore, %1 : !firrtl.uint<1>
-// CHECK:      firrtl.strictconnect %view_companion_view_register__2_1__bore, %3 : !firrtl.uint<1>
-// CHECK:      firrtl.strictconnect %view_companion_view_register__0_inst__1__bore, %5 : !firrtl.uint<1>
-// CHECK:      firrtl.strictconnect %view_companion_view_register__0_inst__0__bore, %7 : !firrtl.uint<1>
-// CHECK:      firrtl.strictconnect %view_companion_view_forceable_reg_element__bore, %9 : !firrtl.uint<1>
-// CHECK:      firrtl.strictconnect %view_companion_view_port__bore, %a : !firrtl.uint<1>
-
-// -----
-
-firrtl.circuit "Foo"  attributes {rawAnnotations = [
-  {
-    class = "sifive.enterprise.grandcentral.ViewAnnotation",
-    companion = "~Foo|Bar_companion",
-    name = "Bar",
-    parent = "~Foo|Foo",
-    view =
-      {
-        class = "sifive.enterprise.grandcentral.AugmentedBundleType",
-        defName = "View",
-        elements = [
-          {
-            description = "a string",
-            name = "string",
-            tpe =
-              {
-                class = "sifive.enterprise.grandcentral.AugmentedStringType",
-                value = "hello"
-              }
-          },
-          {
-            description = "a boolean",
-            name = "boolean",
-            tpe =
-              {
-                class = "sifive.enterprise.grandcentral.AugmentedBooleanType",
-                value = false
-              }
-          },
-          {
-            description = "an integer",
-            name = "integer",
-            tpe =
-              {
-                class = "sifive.enterprise.grandcentral.AugmentedIntegerType",
-                value = 42 : i64
-              }
-          },
-          {
-            description = "a double",
-            name = "double",
-            tpe =
-              {
-                class = "sifive.enterprise.grandcentral.AugmentedDoubleType",
-                value = 3.140000e+00 : f64
-              }
-          }
-        ]
-      }
-  }
-]} {
-  firrtl.module private @Bar_companion() {
-    firrtl.skip
-  }
-  firrtl.module @Foo() {
-     firrtl.instance Bar_companion @Bar_companion()
-   }
-}
-
-// CHECK-LABEL: firrtl.circuit "Foo"
-// CHECK-SAME: annotations = [{class = "[[_:.+]]AugmentedBundleType", [[_:.+]] elements = [{
-// CHECK-SAME: "sifive.enterprise.grandcentral.AugmentedStringType"
-// CHECK-SAME: "sifive.enterprise.grandcentral.AugmentedBooleanType"
-// CHECK-SAME: "sifive.enterprise.grandcentral.AugmentedIntegerType"
-// CHECK-SAME: "sifive.enterprise.grandcentral.AugmentedDoubleType"
+// CHECK:      firrtl.matchingconnect %view_companion_view_register__2_0__bore, %1 : !firrtl.uint<1>
+// CHECK:      firrtl.matchingconnect %view_companion_view_register__2_1__bore, %3 : !firrtl.uint<1>
+// CHECK:      firrtl.matchingconnect %view_companion_view_register__0_inst__1__bore, %5 : !firrtl.uint<1>
+// CHECK:      firrtl.matchingconnect %view_companion_view_register__0_inst__0__bore, %7 : !firrtl.uint<1>
+// CHECK:      firrtl.matchingconnect %view_companion_view_forceable_reg_element__bore, %9 : !firrtl.uint<1>
+// CHECK:      firrtl.matchingconnect %view_companion_view_port__bore, %a : !firrtl.uint<1>
 
 // -----
 
@@ -1267,12 +1235,12 @@ firrtl.circuit "GCTDataTap" attributes {rawAnnotations = [{
 // CHECK-DAG:    %tap_0 = firrtl.node %r
 //
 // CHECK-DAG:    %[[tap_1_0:[a-zA-Z0-9_]+]] = firrtl.subindex %tap_1[0]
-// CHECK-DAG:    firrtl.strictconnect %[[tap_1_0]], %r
+// CHECK-DAG:    firrtl.matchingconnect %[[tap_1_0]], %r
 //
 // CHECK-DAG:    %tap_2 = firrtl.node %[[w_a1]]
 //
 // CHECK-DAG:    %[[tap_3_0:[a-zA-Z0-9_]+]] = firrtl.subindex %tap_3[0]
-// CHECK-DAG:    firrtl.strictconnect %[[tap_3_0]], %[[w_a0]]
+// CHECK-DAG:    firrtl.matchingconnect %[[tap_3_0]], %[[w_a0]]
 //
 // CHECK-DAG:    %[[tap_4_port:[a-zA-Z0-9_]+]], %[[tap_5_port:[a-zA-Z0-9_]+]] = firrtl.instance BlackBox
 // CHECK-DAG:    %[[tap_4_resolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[tap_4_port]]
@@ -1280,7 +1248,7 @@ firrtl.circuit "GCTDataTap" attributes {rawAnnotations = [{
 //
 // CHECK-DAG:    %[[tap_5_resolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[tap_5_port]]
 // CHECK-DAG:    %[[tap_5_0:[a-zA-Z0-9_]+]] = firrtl.subindex %tap_5[0]
-// CHECK-DAG:    firrtl.strictconnect %[[tap_5_0]], %[[tap_5_resolve]]
+// CHECK-DAG:    firrtl.matchingconnect %[[tap_5_0]], %[[tap_5_resolve]]
 //
 // CHECK-DAG:    %[[tap_6_port:[a-zA-Z0-9_]+]] = firrtl.instance im @InnerMod
 // CHECK-DAG:    %[[tap_6_resolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[tap_6_port]]
@@ -1444,9 +1412,9 @@ firrtl.circuit "GrandCentralViewsBundle"  attributes {
     // CHECK-NEXT: %[[companion_port_0:[a-zA-Z0-9_]+]], %[[companion_port_1:[a-zA-Z0-9_]+]] = firrtl.instance companion
     firrtl.instance companion @Companion()
     // CHECK-NEXT: %[[bar_refPort_0_resolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[bar_refPort_0]]
-    // CHECK-NEXT: firrtl.strictconnect %[[companion_port_0]], %[[bar_refPort_0_resolve]]
+    // CHECK-NEXT: firrtl.matchingconnect %[[companion_port_0]], %[[bar_refPort_0_resolve]]
     // CHECK-NEXT: %[[bar_refPort_1_resolve:[a-zA-Z0-9_]+]] = firrtl.ref.resolve %[[bar_refPort_1]]
-    // CHECK-NEXT: firrtl.strictconnect %[[companion_port_1]], %[[bar_refPort_1_resolve]]
+    // CHECK-NEXT: firrtl.matchingconnect %[[companion_port_1]], %[[bar_refPort_1_resolve]]
   }
 }
 
@@ -1904,4 +1872,84 @@ firrtl.circuit "Top" attributes {
   firrtl.module @Top() {
     firrtl.instance dut @DUT()
   }
+}
+
+// -----
+
+// CHECK-LABEL: firrtl.circuit "Top"
+firrtl.circuit "Top" attributes {
+  rawAnnotations = [
+    {
+      class = "circt.OutputDirAnnotation",
+      dirname = "foobarbaz",
+      target = "~Top|Top"
+    }]
+  } {
+  // CHECK-LABEL: firrtl.module @Top
+  // CHECK-SAME:  attributes {output_file = #hw.output_file<"foobarbaz{{/|\\\\}}">}
+  firrtl.module @Top() {}
+}
+
+// -----
+
+// CHECK-LABEL: firrtl.circuit "Top"
+firrtl.circuit "Top" attributes {
+  rawAnnotations = [
+    {
+      class = "circt.OutputDirAnnotation",
+      dirname = "foobarbaz/",
+      target = "~Top|Top"
+    }]
+  } {
+  // CHECK-LABEL: firrtl.module @Top
+  // CHECK-SAME:  attributes {output_file = #hw.output_file<"foobarbaz{{/|\\\\}}">}
+  firrtl.module @Top() {}
+}
+
+// -----
+
+// CHECK-LABEL: firrtl.circuit "Top"
+firrtl.circuit "Top" attributes {
+  rawAnnotations = [
+    {
+      class = "circt.OutputDirAnnotation",
+      dirname = "foobarbaz/qux",
+      target = "~Top|Top"
+    }]
+  } {
+  // CHECK-LABEL: firrtl.module @Top
+  // CHECK-SAME:  attributes {output_file = #hw.output_file<"foobarbaz{{/|\\\\}}qux{{/|\\\\}}">}
+  firrtl.module @Top() {}
+}
+
+// -----
+// Check that FullAsyncResetAnnotation is lowered to FullResetAnnotation (and prints a warning)
+// CHECK-LABEL: firrtl.circuit "Top"
+firrtl.circuit "Top" attributes {
+  rawAnnotations = [
+    {
+      class = "sifive.enterprise.firrtl.FullAsyncResetAnnotation",
+      target = "~Top|Top>reset"
+    }]
+  } {
+  // CHECK-LABEL: firrtl.module @Top
+  // CHECK-SAME: (in %reset: !firrtl.asyncreset [{class = "circt.FullResetAnnotation", resetType = "async"}])
+  // expected-warning @+1 {{'sifive.enterprise.firrtl.FullAsyncResetAnnotation' is deprecated, use 'circt.FullResetAnnotation' instead}}
+  firrtl.module @Top(in %reset: !firrtl.asyncreset) {}
+}
+
+// -----
+// Check that IgnoreFullAsyncResetAnnotation is lowered to ExcludeFromFullResetAnnotation (and prints a warning)
+// CHECK-LABEL: firrtl.circuit "Top"
+firrtl.circuit "Top" attributes {
+  rawAnnotations = [
+    {
+      class = "sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation",
+      target = "~Top|Top"
+    }]
+  } {
+  // CHECK-LABEL: firrtl.module @Top
+  // CHECK-SAME: (in %reset: !firrtl.asyncreset) attributes {annotations = [{class = "circt.ExcludeFromFullResetAnnotation"}]}
+  // expected-warning @+1 {{'sifive.enterprise.firrtl.IgnoreFullAsyncResetAnnotation' is deprecated, use 'circt.ExcludeFromFullResetAnnotation' instead}}
+  firrtl.module @Top(in %reset: !firrtl.asyncreset) {}
 }

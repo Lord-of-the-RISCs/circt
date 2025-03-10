@@ -1,5 +1,16 @@
 // RUN: circt-opt %s -test-apply-lowering-options='options=explicitBitcast,maximumNumberOfTermsPerExpression=10,emitBindComments' -export-verilog -verify-diagnostics | FileCheck %s
 
+sv.macro.decl @SYNTHESIS
+sv.macro.decl @VERILATOR
+
+// CHECK-NOT: module ReservedName1(
+// CHECK-NOT:   input reservedName2{{$}}
+// CHECK-NOT:   reg reservedName3;
+sv.reserve_names ["ReservedName1", "reservedName2", "reservedName3"]
+hw.module @ReservedName1 (in %reservedName2 : i1) {
+  %reservedName3 = sv.reg : !hw.inout<i1>
+}
+
 // CHECK-LABEL: module M1
 // CHECK-NEXT:    #(parameter [41:0] param1) (
 hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
@@ -16,8 +27,9 @@ hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
   // CHECK: localparam [41:0]{{ *}} param_y = param1;
   %param_y = sv.localparam { value = #hw.param.decl.ref<"param1"> : i42 } : i42
 
-  // CHECK:        logic{{ *}} [7:0]{{ *}} logic_op = val;
+  // CHECK:        logic{{ *}} [7:0]{{ *}} logic_op;
   // CHECK-NEXT: struct packed {logic b; } logic_op_struct;
+  // CHECK-NEXT: assign logic_op = val;
   %logic_op = sv.logic : !hw.inout<i8>
   %logic_op_struct = sv.logic : !hw.inout<struct<b: i1>>
   sv.assign %logic_op, %val: i8
@@ -35,10 +47,10 @@ hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
 
     sv.bpassign %logic_op_procedural, %val: i8
   // CHECK-NEXT:   `ifndef SYNTHESIS
-    sv.ifdef.procedural "SYNTHESIS" {
+    sv.ifdef.procedural @SYNTHESIS {
     } else {
   // CHECK-NEXT:     if ((`PRINTF_COND_) & 1'bx & 1'bz & 1'bz & cond & forceWire)
-      %tmp = sv.macro.ref @PRINTF_COND_() : () -> i1
+      %tmp = sv.macro.ref.expr @PRINTF_COND_() : () -> i1
       %verb_tmp = sv.verbatim.expr "{{0}}" : () -> i1 {symbols = [#hw.innerNameRef<@M1::@wire1>] }
       %tmp1 = sv.constantX : i1
       %tmp2 = sv.constantZ : i1
@@ -254,6 +266,13 @@ hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
       // CHECK-NEXT: $fwrite(32'h80000002, "M: %x\n", `MACRO(8'(val + 8'h2A), val ^ 8'h2A));
       sv.fwrite %fd, "M: %x\n"(%text) : i8
 
+      // CHECK-NEXT: `INIT_RANDOM
+      sv.macro.ref @INIT_RANDOM
+      // CHECK-NEXT: `INIT_RANDOM(val)
+      sv.macro.ref @INIT_RANDOM (%val) : i8
+      // CHECK-NEXT: `INIT_RANDOM(val, val, val)
+      sv.macro.ref @INIT_RANDOM (%val, %val, %val) : i8, i8, i8
+
     }// CHECK-NEXT:   {{end$}}
   } {sv.attributes = [#sv.attribute<"sv attr">]}
   // CHECK-NEXT:  end // initial
@@ -294,7 +313,7 @@ hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
     // CHECK-NEXT: wire42 = `THING;
     sv.bpassign %wire42, %thing : i42
 
-    sv.ifdef.procedural "FOO" {
+    sv.ifdef.procedural @FOO {
       // CHECK-NEXT: `ifdef FOO
       %c1 = sv.verbatim.expr "\"THING\"" : () -> i1
       sv.fwrite %fd, "%d" (%c1) : i1
@@ -428,7 +447,7 @@ hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
     } // CHECK-NEXT: endcase
   }// CHECK-NEXT:   {{end // initial$}}
 
-  sv.ifdef "VERILATOR"  {          // CHECK-NEXT: `ifdef VERILATOR
+  sv.ifdef @VERILATOR  {           // CHECK-NEXT: `ifdef VERILATOR
     sv.verbatim "`define Thing2"   // CHECK-NEXT:   `define Thing2
   } else  {                        // CHECK-NEXT: `else
     sv.verbatim "`define Thing1"   // CHECK-NEXT:   `define Thing1
@@ -440,7 +459,7 @@ hw.module @M1<param1: i42>(in %clock : i1, in %cond : i1, in %val : i8) {
   sv.verbatim "`define STUFF \"{{0}} ({{1}})\"" (%wire42, %add) : !hw.inout<i42>, i8
 
   // CHECK-NEXT: `ifdef FOO
-  sv.ifdef "FOO" {
+  sv.ifdef @FOO {
     %c1 = sv.verbatim.expr "\"THING\"" : () -> i1
 
     // CHECK-NEXT: initial begin
@@ -470,10 +489,11 @@ hw.module @Aliasing(inout %a : i42, inout %b : i42, inout %c : i42) {
   sv.alias %a, %b, %c : !hw.inout<i42>, !hw.inout<i42>, !hw.inout<i42>
 }
 
-hw.module @reg_0(in %in4: i4, in %in8: i8, out a: i8, out b: i8) {
+hw.module @reg_0(in %in4: i4, in %in8: i8, in %in8_2: i8, out a: i8, out b: i8) {
   // CHECK-LABEL: module reg_0(
   // CHECK-NEXT:   input  [3:0] in4, //
   // CHECK-NEXT:   input  [7:0] in8, //
+  // CHECK-NEXT:                in8_2, //
   // CHECK-NEXT:   output [7:0] a, //
   // CHECK-NEXT:                b //
   // CHECK-NEXT:  );
@@ -507,6 +527,12 @@ hw.module @reg_0(in %in4: i4, in %in8: i8, out a: i8, out b: i8) {
   %subscript2 = sv.array_index_inout %myRegArray1[%in4] : !hw.inout<array<42 x i8>>, i4
   %memout = sv.read_inout %subscript2 : !hw.inout<i8>
 
+  %unpacked_array = sv.unpacked_array_create %in8, %in8_2 : (i8, i8) -> !hw.uarray<2xi8>
+  %unpacked_wire = sv.wire : !hw.inout<uarray<2xi8>>
+  // CHECK: wire [7:0] unpacked_wire[0:1];
+  // CHECK-NEXT: assign unpacked_wire = '{in8_2, in8};
+  sv.assign %unpacked_wire, %unpacked_array: !hw.uarray<2xi8>
+
   // CHECK-NEXT: assign a = myReg;
   // CHECK-NEXT: assign b = myRegArray1[in4];
   hw.output %regout, %memout : i8, i8
@@ -536,12 +562,12 @@ hw.module @reg_1(in %in4: i4, in %in8: i8, out a : i3, out b : i5) {
 }
 
 // CHECK-LABEL: module regWithInit(
-// CHECK:     reg        reg1 = 1'h0; 
+// CHECK:     reg        reg1 = 1'h0;
 // CHECK:     reg [31:0] reg2 = 32'(arg + arg);
 hw.module @regWithInit(in %arg : i32) {
   %c0_i1 = hw.constant 0 : i1
   %reg1 = sv.reg init %c0_i1 : !hw.inout<i1>
-  
+
   %init = comb.add %arg, %arg : i32
   %reg2 = sv.reg init %init : !hw.inout<i32>
 }
@@ -801,6 +827,8 @@ hw.module @issue720(in %clock: i1, in %arg1: i1, in %arg2: i1, in %arg3: i1) {
   hw.output
 }
 
+sv.macro.decl @FUN_AND_GAMES
+
 // CHECK-LABEL: module issue720ifdef(
 hw.module @issue720ifdef(in %clock: i1, in %arg1: i1, in %arg2: i1, in %arg3: i1) {
   // CHECK: always @(posedge clock) begin
@@ -816,7 +844,7 @@ hw.module @issue720ifdef(in %clock: i1, in %arg1: i1, in %arg2: i1, in %arg3: i1
     }
 
     // CHECK:    `ifdef FUN_AND_GAMES
-     sv.ifdef.procedural "FUN_AND_GAMES" {
+     sv.ifdef.procedural @FUN_AND_GAMES {
       // This forces a common subexpression to be output out-of-line
       // CHECK:      _GEN = arg1 & arg2;
       // CHECK:      if (_GEN)
@@ -874,7 +902,7 @@ hw.module @issue728ifdef(in %clock: i1, in %asdfasdfasdfasdfafa: i1, in %gasfdas
   // CHECK-NEXT: end // always @(posedge)
   sv.always posedge %clock  {
      sv.fwrite %fd, "force output"
-     sv.ifdef.procedural "FUN_AND_GAMES" {
+     sv.ifdef.procedural @FUN_AND_GAMES {
        %cond = comb.and %asdfasdfasdfasdfafa, %gasfdasafwjhijjafija, %asdfasdfasdfasdfafa, %gasfdasafwjhijjafija, %asdfasdfasdfasdfafa, %gasfdasafwjhijjafija : i1
        sv.if %cond  {
          sv.fwrite %fd, "this cond is split"
@@ -938,7 +966,7 @@ hw.module @ifdef_beginend(in %clock: i1, in %cond: i1, in %val: i8) {
   // CHECK: always @(posedge clock) begin
   sv.always posedge %clock  {
     // CHECK-NEXT: `ifndef SYNTHESIS
-    sv.ifdef.procedural "SYNTHESIS"  {
+    sv.ifdef.procedural @SYNTHESIS  {
     } // CHECK-NEXT: `endif
   } // CHECK-NEXT: end
 } // CHECK-NEXT: endmodule
@@ -1092,6 +1120,23 @@ hw.module @DontDuplicateSideEffectingVerbatim() {
   }
 }
 
+// Issue 6363
+// CHECK-LABEL: module DontInlineAssignmentForUnpackedArrays(
+hw.module @DontInlineAssignmentForUnpackedArrays(in %a: !hw.uarray<2xi1>) {
+// CHECK:      wire w[0:1];
+// CHECK-NEXT: assign w = a;
+   %w = sv.wire  : !hw.inout<uarray<2xi1>>
+   sv.assign %w, %a : !hw.uarray<2xi1>
+   // CHECK: logic u[0:1];
+   // CHECK-NEXT: u = a;
+   sv.initial {
+    %u = sv.logic  : !hw.inout<uarray<2xi1>>
+    sv.bpassign %u, %a : !hw.uarray<2xi1>
+   }
+
+   hw.output
+}
+
 hw.generator.schema @verbatim_schema, "Simple", ["ports", "write_latency", "read_latency"]
 hw.module.extern @verbatim_inout_2 ()
 // CHECK-LABEL: module verbatim_M1(
@@ -1160,7 +1205,7 @@ hw.module @InlineAutomaticLogicInit(in %a : i42, in %b: i42, in %really_really_l
     // CHECK: regValue = 42'([[GEN_1]] + b);
 
     // CHECK: `ifdef FOO
-    sv.ifdef.procedural "FOO" {
+    sv.ifdef.procedural @FOO {
       // CHECK: [[GEN_2]] = 42'(a + a);
       // tmp is multi-use so it needs a temporary, but cannot be emitted inline
       // because it is in an ifdef.
@@ -1215,8 +1260,8 @@ hw.module @InlineAutomaticLogicInit(in %a : i42, in %b: i42, in %really_really_l
     sv.bpassign %regValue, %manyThing : i42
 
     // CHECK: `ifdef FOO
-    sv.ifdef.procedural "FOO" {
-      sv.ifdef.procedural "BAR" {
+    sv.ifdef.procedural @FOO {
+      sv.ifdef.procedural @BAR {
         // Check that the temporary is inserted at the right level, not at the
         // level of the #ifdef.
         %manyMixed = comb.xor %thing, %thing, %thing, %thing, %thing, %thing,
@@ -1227,6 +1272,22 @@ hw.module @InlineAutomaticLogicInit(in %a : i42, in %b: i42, in %really_really_l
       }
     }
   }
+}
+
+// CHECK-LABEL:  module InlineNonProceduralContinuousNetAssignment(
+hw.module @InlineNonProceduralContinuousNetAssignment(in %a: i1) {
+  // CHECK:     wire  someWire = a;
+  // CHECK-NOT: assign
+  %someWire = sv.wire {hw.verilogName = "someWire"} : !hw.inout<i1>
+  sv.assign %someWire, %a : i1
+  // CHECK:      logic  someLogic;
+  // CHECK-NEXT: assign someLogic = a;
+  %someLogic = sv.logic {hw.verilogName = "someLogic"} : !hw.inout<i1>
+  sv.assign %someLogic, %a : i1
+  // CHECK:      reg  someReg;
+  // CHECK-NEXT: assign someReg = a;
+  %someReg = sv.reg {hw.verilogName = "someReg"} : !hw.inout<i1>
+  sv.assign %someReg, %a : i1
 }
 
 // Issue #2335: https://github.com/llvm/circt/issues/2335
@@ -1282,9 +1343,7 @@ hw.module @wait_order() {
   // CHECK-NEXT:   .b (wait_order_0.baz.x.y.z[42])
   // CHECK-NEXT: );
   // CHECK-NEXT: */
-  hw.instance "baz" sym @baz @XMRRef_Baz(a: %xmrRead: i2, b: %xmr2Read: i1) -> () {
-    doNotPrint = true
-  }
+  hw.instance "baz" sym @baz @XMRRef_Baz(a: %xmrRead: i2, b: %xmr2Read: i1) -> () {doNotPrint}
   // CHECK-NEXT: XMRRef_Qux qux (
   // CHECK-NEXT:   .a (wait_order_0.bar.new_0),
   // CHECK-NEXT:   .b (wait_order_0.baz.x.y.z[42])
@@ -1315,8 +1374,8 @@ hw.module @InlineBind(in %a_in: i8, out wire: i8){
   %0 = sv.wire : !hw.inout<i8>
   %1 = sv.read_inout %0: !hw.inout<i8>
   %2 = comb.add %a_in, %1 : i8
-  %3 = hw.instance "ext1" sym @foo1 @ExtModule(in: %2: i8) -> (out: i8) {doNotPrint=1}
-  %4 = hw.instance "ext2" sym @foo2 @ExtModule(in: %3: i8) -> (out: i8) {doNotPrint=1}
+  %3 = hw.instance "ext1" sym @foo1 @ExtModule(in: %2: i8) -> (out: i8) {doNotPrint}
+  %4 = hw.instance "ext2" sym @foo2 @ExtModule(in: %3: i8) -> (out: i8) {doNotPrint}
   hw.output %4: i8
 }
 
@@ -1335,7 +1394,7 @@ hw.module @MoveInstances(in %a_in: i8, out outc : i8){
   hw.output %outc : i8
 }
 
-// CHECK-LABEL: module extInst
+// CHECK-NOT: module extInst
 hw.module.extern @extInst(in %_h: i1, in %_i: i1, in %_j: i1, in %_k: i1, in %_z :i0)
 
 // CHECK-LABEL: module extInst2
@@ -1367,9 +1426,9 @@ hw.module @remoteInstDut(in %i: i1, in %j: i1, in %z: i0) {
   %output = sv.reg : !hw.inout<i1>
   %myreg_rd1 = sv.read_inout %output: !hw.inout<i1>
   %0 = hw.constant 1 : i1
-  hw.instance "a1" sym @bindInst @extInst(_h: %mywire_rd: i1, _i: %myreg_rd: i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint=1}
-  hw.instance "a2" sym @bindInst2 @extInst(_h: %mywire_rd: i1, _i: %myreg_rd: i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint=1}
-  hw.instance "signed" sym @bindInst3 @extInst2(signed: %mywire_rd1 : i1, _i: %myreg_rd1 : i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint=1}
+  hw.instance "a1" sym @bindInst @extInst(_h: %mywire_rd: i1, _i: %myreg_rd: i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint}
+  hw.instance "a2" sym @bindInst2 @extInst(_h: %mywire_rd: i1, _i: %myreg_rd: i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint}
+  hw.instance "signed" sym @bindInst3 @extInst2(signed: %mywire_rd1 : i1, _i: %myreg_rd1 : i1, _j: %j: i1, _k: %0: i1, _z: %z: i0) -> () {doNotPrint}
 // CHECK:      wire mywire
 // CHECK-NEXT: myreg
 // CHECK-NEXT: wire signed_0
@@ -1551,7 +1610,7 @@ hw.module @ProhibitReuseOfExistingInOut(in %a: i1, out out1: i1) {
   // CHECK-NEXT: assign out1 = [[GEN]];
   %0 = comb.or %a, %a : i1
   %mywire = sv.wire  : !hw.inout<i1>
-  sv.ifdef "FOO" {
+  sv.ifdef @FOO {
     sv.assign %mywire, %0 : i1
   }
   hw.output %0 : i1
@@ -1657,15 +1716,143 @@ hw.module @IndexPartSelect(out a : i3) {
   hw.output %c : i3
 }
 
+// Functions.
+sv.func private @function_declare1(in %in_0 : i2, out out_0: i2, in %in_1 : i2, out out_1 : i1)
+sv.func private @function_declare2(in %in_0 : i2, in %in_1 : i2, out out_0 : i1 {sv.func.explicitly_returned})
+sv.func private @function_declare3(in %in_0 : i2, out out_0 : i2, out out_1 : i1 {sv.func.explicitly_returned})
+sv.func private @function_declare4(in %in: i1, in %in_0 : i8, in %in_1 : i16, in %in_2: i32, in %in_3: i64, in %in_4: i128,
+                                   in %in_5: !hw.struct<a: !hw.array<2x!hw.array<2xi32>>, b: i64>,
+                                   in %in_6: !hw.uarray<2xi64>)
+
+// CHECK-LABEL: func_call
+hw.module @func_call(in %in_0 : i2, in %in_1 : i2, in %in_2: i1, out out: i1) {
+  %fd = hw.constant 0x80000002 : i32
+  // CHECK:      wire        _function_declare2_0;
+  // CHECK-NEXT: logic [1:0] _function_declare3_0;
+  // CHECK-NEXT: logic       _function_declare3_1;
+  // CHECK-NEXT: logic [1:0] _function_declare1_0;
+  // CHECK-NEXT: logic       _function_declare1_1;
+  // CHECK-NEXT: assign _function_declare2_0 = function_declare2(in_0, in_1);
+  %u1 = sv.func.call @function_declare2 (%in_0, %in_1) : (i2, i2) -> i1
+  // CHECK:      initial begin
+  // CHECK-NEXT:  function_declare1(in_0, _function_declare1_0, in_1, _function_declare1_1);
+  // CHECK-NEXT:  _function_declare3_1 = function_declare3(in_0, _function_declare3_0);
+  // CHECK-NEXT:  $fwrite(32'h80000002, "%x %x %x %x\n", _function_declare1_0, _function_declare1_1,
+  // CHECK-NEXT:          _function_declare3_0, _function_declare3_1);
+  // CHECK-NEXT: end
+  sv.initial {
+    %v1, %v2 = sv.func.call.procedural @function_declare1 (%in_0, %in_1) : (i2, i2) -> (i2, i1)
+    %v3, %v4 = sv.func.call.procedural @function_declare3 (%in_0, %in_1) : (i2, i2) -> (i2, i1)
+    sv.fwrite %fd, "%x %x %x %x\n"(%v1, %v2, %v3, %v4) : i2, i1, i2, i1
+  }
+  hw.output %u1: i1
+}
+
+// CHECK-LABEL: function automatic logic func_def(
+// CHECK-NEXT:    input  bit [1:0] in_0,
+// CHECK-NEXT:    output bit out_0,
+// CHECK-NEXT:    input  bit [1:0] in_1
+// CHECK-NEXT:  );
+// CHECK-EMPTY:
+// CHECK-NEXT:    logic [1:0] _GEN = 2'(in_0 + in_1);
+// CHECK-NEXT:    out_0 = _GEN[0];
+// CHECK-NEXT:    func_def = _GEN[1];
+// CHECK-NEXT:  endfunction
+sv.func @func_def(in %in_0 : i2, out out_0: i1, in %in_1: i2, out out_1 : i1 {sv.func.explicitly_returned}) {
+  %add = comb.add %in_0, %in_1: i2
+  %v0 =  comb.extract %add from 0 : (i2) -> i1
+  %v1 =  comb.extract %add from 1 : (i2) -> i1
+  sv.return %v0, %v1: i1, i1
+}
+
+// CHECK-LABEL: function automatic logic [31:0] recurse_add(
+// CHECK-NEXT:   input int n
+// CHECK-NEXT: );
+// CHECK-EMPTY:
+// CHECK-NEXT:   logic           [31:0] _recurse_add_0;
+// CHECK-NEXT:   logic           [31:0] result;
+// CHECK-NEXT:   if (n <= 32'h1)
+// CHECK-NEXT:     result = n;
+// CHECK-NEXT:   else begin
+// CHECK-NEXT:     _recurse_add_0 = recurse_add(32'(n - 32'h1));
+// CHECK-NEXT:     result = 32'(n + _recurse_add_0);
+// CHECK-NEXT:   end
+// CHECK-NEXT:   recurse_add = result
+// CHECK-NEXT: endfunction
+sv.func @recurse_add(in %n : i32, out out : i32 {sv.func.explicitly_returned}) {
+  %one = hw.constant 1 : i32
+  %cond = comb.icmp bin ule %n, %one: i32
+  %result = sv.logic : !hw.inout<i32>
+  sv.if %cond {
+    sv.bpassign %result, %n: i32
+  } else {
+    %n1 = comb.sub %n, %one: i32
+    %v = sv.func.call.procedural @recurse_add(%n1) : (i32) -> i32
+    %add = comb.add %n, %v: i32
+    sv.bpassign %result, %add: i32
+  }
+  %read = sv.read_inout %result: !hw.inout<i32>
+  sv.return %read : i32
+}
+
+// Emit DPI import.
+
+// CHECK-LABEL: import "DPI-C" context linkage_name = function void function_declare1(
+// CHECK-NEXT:    input bit [1:0] in_0,
+// CHECK-NEXT:                    out_0,
+// CHECK-NEXT:                    in_1,
+// CHECK-NEXT:    output bit      out_1
+// CHECK-NEXT: );
+sv.func.dpi.import linkage "linkage_name" @function_declare1
+
+// CHECK-LABEL: import "DPI-C" context function bit function_declare2(
+// CHECK-NEXT:    input bit [1:0] in_0,
+// CHECK-NEXT:                    in_1
+// CHECK-NEXT: );
+sv.func.dpi.import @function_declare2
+
+// CHECK-LABEL: import "DPI-C" context function void function_declare4(
+// CHECK-NEXT:   input bit         in,
+// CHECK-NEXT:   input byte        in_0,
+// CHECK-NEXT:   input shortint    in_1,
+// CHECK-NEXT:   input int         in_2,
+// CHECK-NEXT:   input longint     in_3,
+// CHECK-NEXT:   input bit [127:0] in_4
+// CHECK-NEXT:   input struct packed {bit [1:0][1:0][31:0] a; longint b; } in_5
+// CHECK-NEXT:   input longint in_6[0:1]
+// CHECK-NEXT: );
+sv.func.dpi.import @function_declare4
+
+sv.func private @open_array(in %array : !sv.open_uarray<i8>)
+// CHECK-LABEL: import "DPI-C" context function void open_array
+// CHECK-NEXT:  input byte array[]
+sv.func.dpi.import @open_array
+
+// CHECK-LABEL: test_open_array
+// CHECK: wire [7:0] _GEN[0:1];
+// CHECK-NEXT: assign _GEN = '{in_0, in_1};
+// CHECK-NEXT: always @(posedge clock)
+// CHECK-NEXT:   open_array(_GEN);
+hw.module @test_open_array(in %clock : i1, in %in_0 : i8, in %in_1 : i8) {
+  %0 = sv.unpacked_array_create %in_1, %in_0 : (i8, i8) -> !hw.uarray<2xi8>
+  %1 = sv.unpacked_open_array_cast %0 : (!hw.uarray<2xi8>) -> !sv.open_uarray<i8>
+  sv.always posedge %clock {
+    sv.func.call.procedural @open_array(%1) : (!sv.open_uarray<i8>) -> ()
+  }
+}
+
+sv.macro.decl @FOO
+sv.macro.decl @BAR
+
 // CHECK-LABEL: module ConditionalComments(
 hw.module @ConditionalComments() {
-  sv.ifdef "FOO"  {             // CHECK-NEXT: `ifdef FOO
+  sv.ifdef @FOO  {             // CHECK-NEXT: `ifdef FOO
     sv.verbatim "`define FOO_A" // CHECK-NEXT:   `define FOO_A
   } else  {                     // CHECK-NEXT: `else  // FOO
     sv.verbatim "`define FOO_B" // CHECK-NEXT:   `define FOO_B
   }                             // CHECK-NEXT: `endif // FOO
 
-  sv.ifdef "BAR"  {             // CHECK-NEXT: `ifndef BAR
+  sv.ifdef @BAR  {             // CHECK-NEXT: `ifndef BAR
   } else  {
     sv.verbatim "`define X"     // CHECK-NEXT:   `define X
   }                             // CHECK-NEXT: `endif // not def BAR
@@ -1673,6 +1860,7 @@ hw.module @ConditionalComments() {
 
 sv.macro.decl @RANDOM
 sv.macro.decl @PRINTF_COND_
+sv.macro.decl @INIT_RANDOM
 
 // CHECK-LABEL: module ForStatement
 hw.module @ForStatement(in %a: i5) {
@@ -1686,7 +1874,7 @@ hw.module @ForStatement(in %a: i5) {
     // CHECK-NEXT:   _RANDOM[i] = `RANDOM;
     // CHECK-NEXT: end
     sv.for %i = %c0_i2 to %c-1_i2 step %c1_i2 : i2 {
-      %RANDOM = sv.macro.ref.se @RANDOM() : ()->i32
+      %RANDOM = sv.macro.ref.expr.se @RANDOM() : ()->i32
       %index = sv.array_index_inout %_RANDOM[%i] : !hw.inout<uarray<3xi32>>, i2
       sv.bpassign %index, %RANDOM : i32
     }
@@ -1754,7 +1942,7 @@ sv.bind #hw.innerNameRef<@remoteInstDut::@bindInst2>
 // Regression test for a bug where bind emission would not use sanitized names.
 hw.module @NastyPortParent() {
   %false = hw.constant false
-  %0 = hw.instance "foo" sym @foo @NastyPort(".lots$of.dots": %false: i1) -> (".more.dots": i1) {doNotPrint = true}
+  %0 = hw.instance "foo" sym @foo @NastyPort(".lots$of.dots": %false: i1) -> (".more.dots": i1) {doNotPrint}
 }
 hw.module @NastyPort(in %.lots$of.dots: i1, out ".more.dots": i1) {
   %false = hw.constant false

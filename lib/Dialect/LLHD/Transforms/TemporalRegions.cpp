@@ -39,9 +39,9 @@ static bool allPredecessorTRsKnown(Block *block,
 }
 
 void llhd::TemporalRegionAnalysis::recalculate(Operation *operation) {
-  assert(isa<ProcOp>(operation) &&
-         "TemporalRegionAnalysis: operation needs to be llhd::ProcOp");
-  ProcOp proc = cast<ProcOp>(operation);
+  assert(isa<ProcessOp>(operation) &&
+         "TemporalRegionAnalysis: operation needs to be llhd::ProcessOp");
+  auto proc = cast<ProcessOp>(operation);
   int nextTRnum = -1;
   blockMap.clear();
   trMap.clear();
@@ -91,6 +91,11 @@ void llhd::TemporalRegionAnalysis::recalculate(Operation *operation) {
       // If at least one predecessor has a wait terminator or at least one
       // predecessor has an unknown temporal region or not all predecessors have
       // the same TR, create a new TR
+      // FIXME: `!allPredecessorTRsKnown` is a problem when there are CFG loops
+      // in the process. If there is no wait op along any of the CFG edges of
+      // such a loop we don't want to assign a new temporal region. However, we
+      // also cannot just assume here that we can just assign the same TR, so
+      // this might require a bigger change to the algorithm.
     } else if (!allPredecessorTRsKnown(block, workDone) ||
                anyPredecessorHasWait(block) ||
                !(std::adjacent_find(block->pred_begin(), block->pred_end(),
@@ -112,25 +117,26 @@ void llhd::TemporalRegionAnalysis::recalculate(Operation *operation) {
   numTRs = nextTRnum + 1;
 }
 
-int llhd::TemporalRegionAnalysis::getBlockTR(Block *block) {
+int llhd::TemporalRegionAnalysis::getBlockTR(Block *block) const {
   assert(blockMap.count(block) &&
          "This block is not present in the temporal regions map.");
-  return blockMap[block];
-}
-
-SmallVector<Block *, 8> llhd::TemporalRegionAnalysis::getBlocksInTR(int tr) {
-  if (!trMap.count(tr))
-    return SmallVector<Block *, 8>();
-  return trMap[tr];
+  return blockMap.at(block);
 }
 
 SmallVector<Block *, 8>
-llhd::TemporalRegionAnalysis::getExitingBlocksInTR(int tr) {
+llhd::TemporalRegionAnalysis::getBlocksInTR(int tr) const {
+  if (!trMap.count(tr))
+    return SmallVector<Block *, 8>();
+  return trMap.at(tr);
+}
+
+SmallVector<Block *, 8>
+llhd::TemporalRegionAnalysis::getExitingBlocksInTR(int tr) const {
   SmallVector<Block *, 8> blocks = getBlocksInTR(tr);
   SmallVector<Block *, 8> exitingBlocks;
   for (Block *block : blocks) {
-    for (auto succ : block->getSuccessors()) {
-      if (blockMap[succ] != blockMap[block] ||
+    for (auto *succ : block->getSuccessors()) {
+      if (blockMap.at(succ) != blockMap.at(block) ||
           isa<WaitOp>(block->getTerminator())) {
         exitingBlocks.push_back(block);
         break;

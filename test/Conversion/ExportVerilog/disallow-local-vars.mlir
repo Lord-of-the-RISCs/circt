@@ -4,13 +4,15 @@
 // This checks ExportVerilog's support for "disallowLocalVariables" which
 // prevents emitting 'automatic logic' and other local declarations.
 
+sv.macro.decl @FOO_MACRO
+
 // CHECK-LABEL: module side_effect_expr
 // DISALLOW-LABEL: module side_effect_expr
 hw.module @side_effect_expr(in %clock: i1, out a: i1, out a2: i1) {
 
   // CHECK: `ifdef FOO_MACRO
   // DISALLOW: `ifdef FOO_MACRO
-  sv.ifdef "FOO_MACRO" {
+  sv.ifdef @FOO_MACRO {
     // DISALLOW: logic logicOp;
     // DISALLOW: {{^    }}reg   [[SE_REG:[_A-Za-z0-9]+]];
 
@@ -169,6 +171,8 @@ hw.module @ReadInoutAggregate(in %clock: i1) {
   hw.output
 }
 
+sv.macro.decl @DEF
+
 // CHECK-LABEL: DefinedInDifferentBlock
 // CHECK: `ifdef DEF
 // CHECK-NEXT: initial begin
@@ -180,7 +184,7 @@ hw.module @ReadInoutAggregate(in %clock: i1) {
 // DISALLOW-NEXT:     $error("error")
 
 hw.module @DefinedInDifferentBlock(in %a: i1, in %b: i1) {
-  sv.ifdef "DEF" {
+  sv.ifdef @DEF {
     %0 = comb.icmp eq %a, %b : i1
     sv.initial {
       sv.if %0 {
@@ -234,4 +238,25 @@ hw.module @AggregateInline(in %clock: i1) {
   // DISALLOW: assign [[GEN]] = register.a[15:0]
   // CHECK: assign [[GEN]] = register.a[15:0]
   hw.output
+}
+
+// CHECK-LABEL: module hoist_reg
+// DISALLOW-LABEL: module hoist_reg
+hw.module @hoist_reg(in %dummy : i32, out out : i17) {
+  %res_reg = sv.reg : !hw.inout<i17>
+  // CHECK: initial
+  // CHECK: reg  [31:0] tmp;
+  // CHECK end // initial
+  // DISALLOW: reg  [31:0] tmp;
+  // DISALLOW: initial
+  sv.initial {
+    %tmp = sv.reg : !hw.inout<i32>
+    %17 = sv.read_inout %tmp : !hw.inout<i32>
+    %29 = comb.xor %dummy, %17 : i32
+    %32 = comb.extract %29 from 3 : (i32) -> i17
+    sv.passign %res_reg, %32 : i17
+  }
+
+  %res_reg_data = sv.read_inout %res_reg : !hw.inout<i17>
+  hw.output %res_reg_data : i17
 }

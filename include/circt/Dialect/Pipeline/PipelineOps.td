@@ -25,7 +25,6 @@ include "circt/Dialect/Seq/SeqTypes.td"
 
 class PipelineBase<string mnemonic, list<Trait> traits = []> :
   Op<Pipeline_Dialect, mnemonic, !listconcat(traits, [
-      Pure,
       RegionKindInterface,
       AttrSizedOperandSegments,
       DeclareOpInterfaceMethods<OpAsmOpInterface, [
@@ -42,7 +41,8 @@ class PipelineBase<string mnemonic, list<Trait> traits = []> :
       "TypeRange":$dataOutputs,
       "ValueRange":$inputs,
       "ArrayAttr":$inputNames, "ArrayAttr":$outputNames,
-      "Value":$clock, "Value":$reset, "Value":$go,
+      "Value":$clock, "Value":$go,
+      CArg<"Value", "{}">:$reset,
       CArg<"Value", "{}">:$stall,
       CArg<"StringAttr", "{}">:$name,
       CArg<"ArrayAttr", "{}">:$stallability
@@ -59,7 +59,7 @@ class PipelineBase<string mnemonic, list<Trait> traits = []> :
   // 1. Inputs
   // 2. Stall (opt)
   // 3. Clock
-  // 4. Reset
+  // 4. Reset (opt)
   // 5. Go
   let extraClassDeclaration = extraModuleClassDeclaration # [{
     // Returns the entry stage of this pipeline.
@@ -71,6 +71,11 @@ class PipelineBase<string mnemonic, list<Trait> traits = []> :
     // Returns true if this pipeline has a stall signal.
     bool hasStall() {
       return static_cast<bool>(getStall());
+    }
+
+    // Returns true if this pipeline has a reset signal.
+    bool hasReset() {
+      return static_cast<bool>(getReset());
     }
 
     mlir::Block::BlockArgListType getInnerInputs() {
@@ -126,7 +131,7 @@ def UnscheduledPipelineOp : PipelineBase<"unscheduled", [
 
   let arguments = (ins
     OptionalAttr<StrAttr>:$name, Variadic<AnyType>:$inputs, Optional<I1>:$stall,
-    ClockType:$clock, I1:$reset, I1:$go, StrArrayAttr:$inputNames,
+    ClockType:$clock, Optional<I1>:$reset, I1:$go, StrArrayAttr:$inputNames,
     StrArrayAttr:$outputNames
   );
   let regions = (region SizedRegion<1>: $body);
@@ -180,7 +185,7 @@ def ScheduledPipelineOp : PipelineBase<"scheduled"> {
     OptionalAttr<StrAttr>:$name,
     Variadic<AnyType>:$inputs,
     Optional<I1>:$stall,
-    ClockType:$clock, I1:$reset, I1:$go,
+    ClockType:$clock, Optional<I1>:$reset, I1:$go,
     StrArrayAttr:$inputNames, StrArrayAttr:$outputNames,
     OptionalAttr<BoolArrayAttr>:$stallability
   );
@@ -297,7 +302,7 @@ def StageOp : Op<Pipeline_Dialect, "stage", [
     // Returns the register name for a given register index.
     StringAttr getRegisterName(unsigned regIdx) {
       if(auto names = getOperation()->getAttrOfType<ArrayAttr>("registerNames")) {
-        auto name = names[regIdx].cast<StringAttr>();
+        auto name = llvm::cast<StringAttr>(names[regIdx]);
         if(!name.strref().empty())
           return name;
       }
@@ -308,7 +313,7 @@ def StageOp : Op<Pipeline_Dialect, "stage", [
     // Returns the passthrough name for a given passthrough index.
     StringAttr getPassthroughName(unsigned passthroughIdx) {
       if(auto names = getOperation()->getAttrOfType<ArrayAttr>("passthroughNames")) {
-        auto name = names[passthroughIdx].cast<StringAttr>();
+        auto name = llvm::cast<StringAttr>(names[passthroughIdx]);
         if(!name.strref().empty())
           return name;
       }

@@ -11,12 +11,11 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/SeqToSV.h"
-#include "../PassDetail.h"
 #include "FirMemLowering.h"
 #include "FirRegLowering.h"
 #include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/HW/ConversionPatterns.h"
-#include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/HW/HWTypes.h"
 #include "circt/Dialect/SV/SVAttributes.h"
@@ -24,13 +23,10 @@
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "circt/Support/Naming.h"
 #include "mlir/IR/Builders.h"
-#include "mlir/IR/DialectImplementation.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Threading.h"
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
-#include "llvm/ADT/IntervalMap.h"
-#include "llvm/ADT/TypeSwitch.h"
 
 #define DEBUG_TYPE "lower-seq-to-sv"
 
@@ -39,7 +35,7 @@ using namespace seq;
 using hw::HWModuleOp;
 using llvm::MapVector;
 
-namespace {
+namespace circt {
 #define GEN_PASS_DEF_LOWERSEQTOSV
 #include "circt/Conversion/Passes.h.inc"
 
@@ -53,18 +49,101 @@ struct SeqToSVPass : public impl::LowerSeqToSVBase<SeqToSVPass> {
   using LowerSeqToSVBase<SeqToSVPass>::LowerSeqToSVBase;
   using LowerSeqToSVBase<SeqToSVPass>::numSubaccessRestored;
 };
-} // anonymous namespace
+} // namespace circt
 
 namespace {
+struct ModuleLoweringState {
+  ModuleLoweringState(HWModuleOp module)
+      : immutableValueLowering(module), module(module) {}
+
+  struct ImmutableValueLowering {
+    ImmutableValueLowering(hw::HWModuleOp module) : module(module) {}
+
+    // Lower initial ops.
+    LogicalResult lower();
+    LogicalResult lower(seq::InitialOp initialOp);
+
+    Value
+    lookupImmutableValue(mlir::TypedValue<seq::ImmutableType> immut) const {
+      return mapping.lookup(immut);
+    }
+
+    sv::InitialOp getSVInitial() const { return svInitialOp; }
+
+  private:
+    sv::InitialOp svInitialOp = {};
+    // A mapping from a dummy immutable value to the actual initial value
+    // defined in SV initial op.
+    MapVector<mlir::TypedValue<seq::ImmutableType>, Value> mapping;
+
+    hw::HWModuleOp module;
+  } immutableValueLowering;
+
+  struct FragmentInfo {
+    bool needsRegFragment = false;
+  } fragment;
+
+  HWModuleOp module;
+};
+
+LogicalResult ModuleLoweringState::ImmutableValueLowering::lower() {
+  auto result = mergeInitialOps(module.getBodyBlock());
+  if (failed(result))
+    return failure();
+
+  auto initialOp = *result;
+  if (!initialOp)
+    return success();
+
+  return lower(initialOp);
+}
+
+LogicalResult
+ModuleLoweringState::ImmutableValueLowering::lower(seq::InitialOp initialOp) {
+  OpBuilder builder = OpBuilder::atBlockBegin(module.getBodyBlock());
+  if (!svInitialOp)
+    svInitialOp = builder.create<sv::InitialOp>(initialOp->getLoc());
+  // Initial ops are merged to single one and must not have operands.
+  assert(initialOp.getNumOperands() == 0 &&
+         "initial op should have no operands");
+
+  auto loc = initialOp.getLoc();
+  llvm::SmallVector<Value> results;
+
+  auto yieldOp = cast<seq::YieldOp>(initialOp.getBodyBlock()->getTerminator());
+
+  for (auto [result, operand] :
+       llvm::zip(initialOp.getResults(), yieldOp->getOperands())) {
+    auto placeholder =
+        builder
+            .create<mlir::UnrealizedConversionCastOp>(
+                loc, ArrayRef<Type>{result.getType()}, ArrayRef<Value>{})
+            ->getResult(0);
+    result.replaceAllUsesWith(placeholder);
+    mapping.insert(
+        {cast<mlir::TypedValue<seq ::ImmutableType>>(placeholder), operand});
+  }
+
+  svInitialOp.getBodyBlock()->getOperations().splice(
+      svInitialOp.end(), initialOp.getBodyBlock()->getOperations());
+
+  assert(initialOp->use_empty());
+  initialOp.erase();
+  yieldOp->erase();
+  return success();
+}
+
 /// Lower CompRegOp to `sv.reg` and `sv.alwaysff`. Use a posedge clock and
 /// synchronous reset.
 template <typename OpTy>
 class CompRegLower : public OpConversionPattern<OpTy> {
 public:
-  CompRegLower(TypeConverter &typeConverter, MLIRContext *context,
-               bool lowerToAlwaysFF)
+  CompRegLower(
+      TypeConverter &typeConverter, MLIRContext *context, bool lowerToAlwaysFF,
+      const MapVector<StringAttr, ModuleLoweringState> &moduleLoweringStates)
       : OpConversionPattern<OpTy>(typeConverter, context),
-        lowerToAlwaysFF(lowerToAlwaysFF) {}
+        lowerToAlwaysFF(lowerToAlwaysFF),
+        moduleLoweringStates(moduleLoweringStates) {}
 
   using OpAdaptor = typename OpConversionPattern<OpTy>::OpAdaptor;
 
@@ -75,10 +154,9 @@ public:
 
     auto regTy =
         ConversionPattern::getTypeConverter()->convertType(reg.getType());
-
     auto svReg = rewriter.create<sv::RegOp>(loc, regTy, reg.getNameAttr(),
-                                            reg.getInnerSymAttr(),
-                                            reg.getPowerOnValue());
+                                            reg.getInnerSymAttr());
+
     svReg->setDialectAttrs(reg->getDialectAttrs());
 
     circt::sv::setSVAttributes(svReg, circt::sv::getSVAttributes(reg));
@@ -92,11 +170,16 @@ public:
       rewriter.create<sv::PAssignOp>(loc, svReg, adaptor.getResetValue());
     };
 
+    // Registers written in an `always_ff` process may not have any assignments
+    // outside of that process.
+    // For some tools this also prohibits inititalization.
+    bool mayLowerToAlwaysFF = lowerToAlwaysFF && !reg.getInitialValue();
+
     if (adaptor.getReset() && adaptor.getResetValue()) {
-      if (lowerToAlwaysFF) {
+      if (mayLowerToAlwaysFF) {
         rewriter.create<sv::AlwaysFFOp>(
             loc, sv::EventControl::AtPosEdge, adaptor.getClk(),
-            ResetType::SyncReset, sv::EventControl::AtPosEdge,
+            sv::ResetType::SyncReset, sv::EventControl::AtPosEdge,
             adaptor.getReset(), assignValue, assignReset);
       } else {
         rewriter.create<sv::AlwaysOp>(
@@ -106,12 +189,34 @@ public:
             });
       }
     } else {
-      if (lowerToAlwaysFF) {
+      if (mayLowerToAlwaysFF) {
         rewriter.create<sv::AlwaysFFOp>(loc, sv::EventControl::AtPosEdge,
                                         adaptor.getClk(), assignValue);
       } else {
         rewriter.create<sv::AlwaysOp>(loc, sv::EventControl::AtPosEdge,
                                       adaptor.getClk(), assignValue);
+      }
+    }
+
+    // Lower initial values.
+    if (auto init = reg.getInitialValue()) {
+      auto module = reg->template getParentOfType<hw::HWModuleOp>();
+      const auto &initial =
+          moduleLoweringStates.find(module.getModuleNameAttr())
+              ->second.immutableValueLowering;
+
+      Value initialValue = initial.lookupImmutableValue(init);
+
+      if (auto op = initialValue.getDefiningOp();
+          op && op->hasTrait<mlir::OpTrait::ConstantLike>()) {
+        auto clonedConstant = rewriter.clone(*op);
+        rewriter.moveOpBefore(clonedConstant, svReg);
+        svReg.getInitMutable().assign(clonedConstant->getResult(0));
+      } else {
+        OpBuilder::InsertionGuard guard(rewriter);
+        auto in = initial.getSVInitial();
+        rewriter.setInsertionPointToEnd(in.getBodyBlock());
+        rewriter.create<sv::BPAssignOp>(reg->getLoc(), svReg, initialValue);
       }
     }
 
@@ -125,6 +230,7 @@ public:
 
 private:
   bool lowerToAlwaysFF;
+  const MapVector<StringAttr, ModuleLoweringState> &moduleLoweringStates;
 };
 
 /// Create the assign.
@@ -144,6 +250,49 @@ void CompRegLower<CompRegClockEnabledOp>::createAssign(
   });
 }
 
+/// Lower FromImmutable to `sv.reg` and `sv.initial`.
+class FromImmutableLowering : public OpConversionPattern<FromImmutableOp> {
+public:
+  FromImmutableLowering(
+      TypeConverter &typeConverter, MLIRContext *context,
+      const MapVector<StringAttr, ModuleLoweringState> &moduleLoweringStates)
+      : OpConversionPattern<FromImmutableOp>(typeConverter, context),
+        moduleLoweringStates(moduleLoweringStates) {}
+
+  using OpAdaptor = typename OpConversionPattern<FromImmutableOp>::OpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(FromImmutableOp fromImmutableOp, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    Location loc = fromImmutableOp.getLoc();
+
+    auto regTy = ConversionPattern::getTypeConverter()->convertType(
+        fromImmutableOp.getType());
+    auto svReg = rewriter.create<sv::RegOp>(loc, regTy);
+
+    auto regVal = rewriter.create<sv::ReadInOutOp>(loc, svReg);
+
+    // Lower initial values.
+    auto module = fromImmutableOp->template getParentOfType<hw::HWModuleOp>();
+    const auto &initial = moduleLoweringStates.find(module.getModuleNameAttr())
+                              ->second.immutableValueLowering;
+
+    Value initialValue =
+        initial.lookupImmutableValue(fromImmutableOp.getInput());
+
+    OpBuilder::InsertionGuard guard(rewriter);
+    auto in = initial.getSVInitial();
+    rewriter.setInsertionPointToEnd(in.getBodyBlock());
+    rewriter.create<sv::BPAssignOp>(fromImmutableOp->getLoc(), svReg,
+                                    initialValue);
+
+    rewriter.replaceOp(fromImmutableOp, regVal);
+    return success();
+  }
+
+private:
+  const MapVector<StringAttr, ModuleLoweringState> &moduleLoweringStates;
+};
 // Lower seq.clock_gate to a fairly standard clock gate implementation.
 //
 class ClockGateLowering : public OpConversionPattern<ClockGateOp> {
@@ -225,6 +374,7 @@ public:
 struct SeqToSVTypeConverter : public TypeConverter {
   SeqToSVTypeConverter() {
     addConversion([&](Type type) { return type; });
+    addConversion([&](seq::ImmutableType type) { return type.getInnerType(); });
     addConversion([&](seq::ClockType type) {
       return IntegerType::get(type.getContext(), 1);
     });
@@ -253,23 +403,25 @@ struct SeqToSVTypeConverter : public TypeConverter {
       return arrayTy;
     });
 
-    addTargetMaterialization(
-        [&](mlir::OpBuilder &builder, mlir::Type resultType,
-            mlir::ValueRange inputs,
-            mlir::Location loc) -> std::optional<mlir::Value> {
-          if (inputs.size() != 1)
-            return std::nullopt;
-          return inputs[0];
-        });
+    addTargetMaterialization([&](mlir::OpBuilder &builder,
+                                 mlir::Type resultType, mlir::ValueRange inputs,
+                                 mlir::Location loc) -> mlir::Value {
+      if (inputs.size() != 1)
+        return Value();
+      return builder
+          .create<mlir::UnrealizedConversionCastOp>(loc, resultType, inputs[0])
+          ->getResult(0);
+    });
 
-    addSourceMaterialization(
-        [&](mlir::OpBuilder &builder, mlir::Type resultType,
-            mlir::ValueRange inputs,
-            mlir::Location loc) -> std::optional<mlir::Value> {
-          if (inputs.size() != 1)
-            return std::nullopt;
-          return inputs[0];
-        });
+    addSourceMaterialization([&](mlir::OpBuilder &builder,
+                                 mlir::Type resultType, mlir::ValueRange inputs,
+                                 mlir::Location loc) -> mlir::Value {
+      if (inputs.size() != 1)
+        return Value();
+      return builder
+          .create<mlir::UnrealizedConversionCastOp>(loc, resultType, inputs[0])
+          ->getResult(0);
+    });
   }
 };
 
@@ -310,6 +462,28 @@ public:
   }
 };
 
+class AggregateConstantPattern
+    : public OpConversionPattern<hw::AggregateConstantOp> {
+public:
+  using OpConversionPattern<hw::AggregateConstantOp>::OpConversionPattern;
+  using OpConversionPattern<hw::AggregateConstantOp>::OpAdaptor;
+
+  LogicalResult
+  matchAndRewrite(hw::AggregateConstantOp aggregateConstant, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const final {
+    auto newType = typeConverter->convertType(aggregateConstant.getType());
+    auto newAttr = aggregateConstant.getFieldsAttr().replace(
+        [](seq::ClockConstAttr clockConst) {
+          return mlir::IntegerAttr::get(
+              mlir::IntegerType::get(clockConst.getContext(), 1),
+              APInt(1, clockConst.getValue() == ClockConst::High));
+        });
+    rewriter.replaceOpWithNewOp<hw::AggregateConstantOp>(
+        aggregateConstant, newType, cast<ArrayAttr>(newAttr));
+    return success();
+  }
+};
+
 /// Lower `seq.clock_div` to a behavioural clock divider
 ///
 class ClockDividerLowering : public OpConversionPattern<ClockDividerOp> {
@@ -327,7 +501,7 @@ public:
       one = rewriter.create<hw::ConstantOp>(loc, APInt(1, 1));
     }
 
-    Value output = clockDiv.getClockIn();
+    Value output = clockDiv.getInput();
 
     SmallVector<Value> regs;
     for (unsigned i = 0; i < clockDiv.getPow2(); ++i) {
@@ -388,6 +562,15 @@ static bool isLegalOp(Operation *op) {
         return false;
     return true;
   }
+
+  if (auto hwAggregateConstantOp = dyn_cast<hw::AggregateConstantOp>(op)) {
+    bool foundClockAttr = false;
+    hwAggregateConstantOp.getFieldsAttr().walk(
+        [&](seq::ClockConstAttr attr) { foundClockAttr = true; });
+    if (foundClockAttr)
+      return false;
+  }
+
   bool allOperandsLowered = llvm::all_of(
       op->getOperands(), [](auto op) { return isLegalType(op.getType()); });
   bool allResultsLowered = llvm::all_of(op->getResults(), [](auto result) {
@@ -407,9 +590,11 @@ void SeqToSVPass::runOnOperation() {
   // Identify memories and group them by module.
   auto uniqueMems = memLowering.collectMemories(modules);
   MapVector<HWModuleOp, SmallVector<FirMemLowering::MemoryConfig>> memsByModule;
+  SmallVector<HWModuleGeneratedOp> generatedModules;
   for (auto &[config, memOps] : uniqueMems) {
     // Create the `HWModuleGeneratedOp`s for each unique configuration.
     auto genOp = memLowering.createMemoryModule(config, memOps);
+    generatedModules.push_back(genOp);
 
     // Group memories by their parent module for parallelism.
     for (auto memOp : memOps) {
@@ -419,19 +604,85 @@ void SeqToSVPass::runOnOperation() {
   }
 
   // Lower memories and registers in modules in parallel.
-  bool needsRegRandomization = false;
-  mlir::parallelForEach(&getContext(), modules, [&](HWModuleOp module) {
-    SeqToSVTypeConverter typeConverter;
-    FirRegLowering regLowering(typeConverter, module, disableRegRandomization,
-                               emitSeparateAlwaysBlocks);
-    regLowering.lower();
-    if (regLowering.needsRegRandomization())
-      needsRegRandomization = true;
-    numSubaccessRestored += regLowering.numSubaccessRestored;
+  std::atomic<bool> needsRegRandomization = false;
+  std::atomic<bool> needsMemRandomization = false;
 
-    if (auto *it = memsByModule.find(module); it != memsByModule.end())
-      memLowering.lowerMemoriesInModule(module, it->second);
-  });
+  MapVector<StringAttr, ModuleLoweringState> moduleLoweringStates;
+  for (auto module : circuit.getOps<HWModuleOp>())
+    moduleLoweringStates.try_emplace(module.getModuleNameAttr(),
+                                     ModuleLoweringState(module));
+
+  auto result = mlir::failableParallelForEach(
+      &getContext(), moduleLoweringStates, [&](auto &moduleAndState) {
+        auto &state = moduleAndState.second;
+        auto module = state.module;
+        SeqToSVTypeConverter typeConverter;
+        FirRegLowering regLowering(typeConverter, module,
+                                   disableRegRandomization,
+                                   emitSeparateAlwaysBlocks);
+        regLowering.lower();
+        if (regLowering.needsRegRandomization()) {
+          if (!disableRegRandomization) {
+            state.fragment.needsRegFragment = true;
+          }
+          needsRegRandomization = true;
+        }
+        numSubaccessRestored += regLowering.numSubaccessRestored;
+
+        if (auto *it = memsByModule.find(module); it != memsByModule.end()) {
+          memLowering.lowerMemoriesInModule(module, it->second);
+          // Generated memories need register randomization since `HWMemSimImpl`
+          // may add registers.
+          needsMemRandomization = true;
+          needsRegRandomization = true;
+        }
+        return state.immutableValueLowering.lower();
+      });
+
+  if (failed(result))
+    return signalPassFailure();
+
+  auto randomInitFragmentName =
+      FlatSymbolRefAttr::get(context, "RANDOM_INIT_FRAGMENT");
+  auto randomInitRegFragmentName =
+      FlatSymbolRefAttr::get(context, "RANDOM_INIT_REG_FRAGMENT");
+  auto randomInitMemFragmentName =
+      FlatSymbolRefAttr::get(context, "RANDOM_INIT_MEM_FRAGMENT");
+
+  for (auto &[_, state] : moduleLoweringStates) {
+    const auto &info = state.fragment;
+    // Do not add fragments if not needed.
+    if (!info.needsRegFragment) {
+      continue;
+    }
+
+    SmallVector<Attribute> fragmentAttrs;
+    auto module = state.module;
+    if (auto others =
+            module->getAttrOfType<ArrayAttr>(emit::getFragmentsAttrName()))
+      fragmentAttrs = llvm::to_vector(others);
+
+    if (info.needsRegFragment) {
+      fragmentAttrs.push_back(randomInitRegFragmentName);
+      fragmentAttrs.push_back(randomInitFragmentName);
+    }
+
+    module->setAttr(emit::getFragmentsAttrName(),
+                    ArrayAttr::get(context, fragmentAttrs));
+  }
+
+  // Set fragments for generated modules.
+  SmallVector<Attribute> genModFragments;
+  if (!disableRegRandomization)
+    genModFragments.push_back(randomInitRegFragmentName);
+  if (!disableMemRandomization)
+    genModFragments.push_back(randomInitMemFragmentName);
+  if (!genModFragments.empty()) {
+    genModFragments.push_back(randomInitFragmentName);
+    auto fragmentAttr = ArrayAttr::get(context, genModFragments);
+    for (auto genOp : generatedModules)
+      genOp->setAttr(emit::getFragmentsAttrName(), fragmentAttr);
+  }
 
   // Mark all ops which can have clock types as illegal.
   SeqToSVTypeConverter typeConverter;
@@ -440,10 +691,12 @@ void SeqToSVPass::runOnOperation() {
   target.markUnknownOpDynamicallyLegal(isLegalOp);
 
   RewritePatternSet patterns(context);
-  patterns.add<CompRegLower<CompRegOp>>(typeConverter, context,
-                                        lowerToAlwaysFF);
-  patterns.add<CompRegLower<CompRegClockEnabledOp>>(typeConverter, context,
-                                                    lowerToAlwaysFF);
+  patterns.add<CompRegLower<CompRegOp>>(typeConverter, context, lowerToAlwaysFF,
+                                        moduleLoweringStates);
+  patterns.add<CompRegLower<CompRegClockEnabledOp>>(
+      typeConverter, context, lowerToAlwaysFF, moduleLoweringStates);
+  patterns.add<FromImmutableLowering>(typeConverter, context,
+                                      moduleLoweringStates);
   patterns.add<ClockCastLowering<seq::FromClockOp>>(typeConverter, context);
   patterns.add<ClockCastLowering<seq::ToClockOp>>(typeConverter, context);
   patterns.add<ClockGateLowering>(typeConverter, context);
@@ -452,52 +705,72 @@ void SeqToSVPass::runOnOperation() {
   patterns.add<ClockDividerLowering>(typeConverter, context);
   patterns.add<ClockConstLowering>(typeConverter, context);
   patterns.add<TypeConversionPattern>(typeConverter, context);
+  patterns.add<AggregateConstantPattern>(typeConverter, context);
 
   if (failed(applyPartialConversion(circuit, target, std::move(patterns))))
     signalPassFailure();
 
+  auto loc = UnknownLoc::get(context);
+  auto b = ImplicitLocOpBuilder::atBlockBegin(loc, circuit.getBody());
+  if (needsRegRandomization || needsMemRandomization) {
+    b.create<sv::MacroDeclOp>("ENABLE_INITIAL_REG_");
+    b.create<sv::MacroDeclOp>("ENABLE_INITIAL_MEM_");
+    if (needsRegRandomization) {
+      b.create<sv::MacroDeclOp>("FIRRTL_BEFORE_INITIAL");
+      b.create<sv::MacroDeclOp>("FIRRTL_AFTER_INITIAL");
+    }
+    if (needsMemRandomization)
+      b.create<sv::MacroDeclOp>("RANDOMIZE_MEM_INIT");
+    b.create<sv::MacroDeclOp>("RANDOMIZE_REG_INIT");
+    b.create<sv::MacroDeclOp>("RANDOMIZE");
+    b.create<sv::MacroDeclOp>("RANDOMIZE_DELAY");
+    b.create<sv::MacroDeclOp>("RANDOM");
+    b.create<sv::MacroDeclOp>("INIT_RANDOM");
+    b.create<sv::MacroDeclOp>("INIT_RANDOM_PROLOG_");
+  }
+
   bool hasRegRandomization = needsRegRandomization && !disableRegRandomization;
-  bool hasMemRandomization = !memsByModule.empty() && !disableMemRandomization;
+  bool hasMemRandomization = needsMemRandomization && !disableMemRandomization;
   if (!hasRegRandomization && !hasMemRandomization)
     return;
 
   // Build macros for FIRRTL-style register and memory initialization.
   // Insert them at the start of the module, after any other verbatims.
-  auto loc = UnknownLoc::get(context);
-  auto b = ImplicitLocOpBuilder::atBlockBegin(loc, circuit.getBody());
   for (Operation &op : *circuit.getBody()) {
-    if (!isa<sv::VerbatimOp>(&op)) {
+    if (!isa<sv::VerbatimOp, sv::IfDefOp>(&op)) {
       b.setInsertionPoint(&op);
       break;
     }
   }
 
+  // Create SYNTHESIS/VERILATOR macros if other passes have not done so already.
+  {
+    StringSet<> symbols;
+    for (auto sym : circuit.getOps<sv::MacroDeclOp>())
+      symbols.insert(sym.getName());
+    if (!symbols.count("SYNTHESIS"))
+      b.create<sv::MacroDeclOp>("SYNTHESIS");
+    if (!symbols.count("VERILATOR"))
+      b.create<sv::MacroDeclOp>("VERILATOR");
+  }
+
   // TODO: We could have an operation for macros and uses of them, and
   // even turn them into symbols so we can DCE unused macro definitions.
-  StringSet<> emittedDecls;
-  auto emitDefine = [&](StringRef name, StringRef body, ArrayAttr args = {}) {
-    if (!emittedDecls.count(name)) {
-      emittedDecls.insert(name);
-      OpBuilder::InsertionGuard guard(b);
-      b.setInsertionPointToStart(circuit.getBody());
-      b.create<sv::MacroDeclOp>(name, args, StringAttr());
-    }
-    b.create<sv::MacroDefOp>(name, body);
-  };
   auto emitGuardedDefine = [&](StringRef guard, StringRef defName,
                                StringRef defineTrue = "",
                                StringRef defineFalse = StringRef()) {
     if (!defineFalse.data()) {
       assert(defineTrue.data() && "didn't define anything");
-      b.create<sv::IfDefOp>(guard, [&]() { emitDefine(defName, defineTrue); });
+      b.create<sv::IfDefOp>(
+          guard, [&]() { b.create<sv::MacroDefOp>(defName, defineTrue); });
     } else {
       b.create<sv::IfDefOp>(
           guard,
           [&]() {
             if (defineTrue.data())
-              emitDefine(defName, defineTrue);
+              b.create<sv::MacroDefOp>(defName, defineTrue);
           },
-          [&]() { emitDefine(defName, defineFalse); });
+          [&]() { b.create<sv::MacroDefOp>(defName, defineFalse); });
     }
   };
 
@@ -507,23 +780,11 @@ void SeqToSVPass::runOnOperation() {
         guard, []() {}, body);
   };
 
-  b.create<sv::VerbatimOp>("// Standard header to adapt well known macros for "
-                           "register randomization.");
+  b.create<emit::FragmentOp>(randomInitFragmentName.getAttr(), [&] {
+    b.create<sv::VerbatimOp>(
+        "// Standard header to adapt well known macros for "
+        "register randomization.");
 
-  bool needsRandom = true;
-  if (hasMemRandomization) {
-    emitGuard("RANDOMIZE",
-              [&]() { emitGuardedDefine("RANDOMIZE_MEM_INIT", "RANDOMIZE"); });
-    needsRandom = true;
-  }
-
-  if (hasRegRandomization) {
-    emitGuard("RANDOMIZE",
-              [&]() { emitGuardedDefine("RANDOMIZE_REG_INIT", "RANDOMIZE"); });
-    needsRandom = true;
-  }
-
-  if (needsRandom) {
     b.create<sv::VerbatimOp>(
         "\n// RANDOM may be set to an expression that produces a 32-bit "
         "random unsigned value.");
@@ -552,23 +813,38 @@ void SeqToSVPass::runOnOperation() {
                               "`INIT_RANDOM",
                               "`INIT_RANDOM #`RANDOMIZE_DELAY begin end");
           },
-          [&]() { emitDefine("INIT_RANDOM_PROLOG_", ""); });
+          [&]() { b.create<sv::MacroDefOp>("INIT_RANDOM_PROLOG_", ""); });
     });
+  });
 
-    b.create<sv::VerbatimOp>("\n// Include register initializers in init "
-                             "blocks unless synthesis is set");
-    emitGuard("SYNTHESIS", [&] {
-      emitGuardedDefine("ENABLE_INITIAL_REG_", "ENABLE_INITIAL_REG_",
-                        StringRef(), "");
+  if (hasMemRandomization) {
+    b.create<emit::FragmentOp>(randomInitMemFragmentName.getAttr(), [&] {
+      b.create<sv::VerbatimOp>("\n// Include rmemory initializers in init "
+                               "blocks unless synthesis is set");
+      emitGuard("RANDOMIZE", [&]() {
+        emitGuardedDefine("RANDOMIZE_MEM_INIT", "RANDOMIZE");
+      });
+      emitGuard("SYNTHESIS", [&] {
+        emitGuardedDefine("ENABLE_INITIAL_MEM_", "ENABLE_INITIAL_MEM_",
+                          StringRef(), "");
+      });
+      b.create<sv::VerbatimOp>("");
     });
+  }
 
-    b.create<sv::VerbatimOp>("\n// Include rmemory initializers in init "
-                             "blocks unless synthesis is set");
-    emitGuard("SYNTHESIS", [&] {
-      emitGuardedDefine("ENABLE_INITIAL_MEM_", "ENABLE_INITIAL_MEM_",
-                        StringRef(), "");
+  if (hasRegRandomization) {
+    b.create<emit::FragmentOp>(randomInitRegFragmentName.getAttr(), [&] {
+      b.create<sv::VerbatimOp>("\n// Include register initializers in init "
+                               "blocks unless synthesis is set");
+      emitGuard("RANDOMIZE", [&]() {
+        emitGuardedDefine("RANDOMIZE_REG_INIT", "RANDOMIZE");
+      });
+      emitGuard("SYNTHESIS", [&] {
+        emitGuardedDefine("ENABLE_INITIAL_REG_", "ENABLE_INITIAL_REG_",
+                          StringRef(), "");
+      });
+      b.create<sv::VerbatimOp>("");
     });
-    b.create<sv::VerbatimOp>("");
   }
 }
 

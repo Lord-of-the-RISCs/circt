@@ -14,20 +14,22 @@
 #ifndef CIRCT_INITALLDIALECTS_H_
 #define CIRCT_INITALLDIALECTS_H_
 
+#include "circt/Dialect/AIG/AIGDialect.h"
 #include "circt/Dialect/Arc/ArcDialect.h"
 #include "circt/Dialect/Calyx/CalyxDialect.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/DC/DCDialect.h"
 #include "circt/Dialect/Debug/DebugDialect.h"
 #include "circt/Dialect/ESI/ESIDialect.h"
+#include "circt/Dialect/Emit/EmitDialect.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLDialect.h"
 #include "circt/Dialect/FSM/FSMOps.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HWArith/HWArithDialect.h"
 #include "circt/Dialect/Handshake/HandshakeDialect.h"
-#include "circt/Dialect/Ibis/IbisDialect.h"
 #include "circt/Dialect/Interop/InteropDialect.h"
+#include "circt/Dialect/Kanagawa/KanagawaDialect.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
 #include "circt/Dialect/LTL/LTLDialect.h"
 #include "circt/Dialect/LoopSchedule/LoopScheduleDialect.h"
@@ -35,6 +37,11 @@
 #include "circt/Dialect/Moore/MooreDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/Pipeline/PipelineDialect.h"
+#include "circt/Dialect/RTG/IR/RTGDialect.h"
+#ifdef CIRCT_INCLUDE_TESTS
+#include "circt/Dialect/RTGTest/IR/RTGTestDialect.h"
+#endif
+#include "circt/Dialect/SMT/SMTDialect.h"
 #include "circt/Dialect/SSP/SSPDialect.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
@@ -49,12 +56,14 @@ namespace circt {
 inline void registerAllDialects(mlir::DialectRegistry &registry) {
   // clang-format off
   registry.insert<
+    aig::AIGDialect,
     arc::ArcDialect,
     calyx::CalyxDialect,
     chirrtl::CHIRRTLDialect,
     comb::CombDialect,
     dc::DCDialect,
     debug::DebugDialect,
+    emit::EmitDialect,
     esi::ESIDialect,
     firrtl::FIRRTLDialect,
     fsm::FSMDialect,
@@ -62,7 +71,7 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
     hw::HWDialect,
     hwarith::HWArithDialect,
     interop::InteropDialect,
-    ibis::IbisDialect,
+    kanagawa::KanagawaDialect,
     llhd::LLHDDialect,
     loopschedule::LoopScheduleDialect,
     ltl::LTLDialect,
@@ -70,8 +79,13 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
     msft::MSFTDialect,
     om::OMDialect,
     pipeline::PipelineDialect,
+    rtg::RTGDialect,
+#ifdef CIRCT_INCLUDE_TESTS
+    rtgtest::RTGTestDialect,
+#endif
     seq::SeqDialect,
     sim::SimDialect,
+    smt::SMTDialect,
     ssp::SSPDialect,
     sv::SVDialect,
     systemc::SystemCDialect,

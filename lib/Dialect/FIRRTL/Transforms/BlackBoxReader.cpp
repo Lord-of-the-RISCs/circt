@@ -13,18 +13,21 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWAttributes.h"
-#include "circt/Dialect/HW/HWDialect.h"
-#include "circt/Dialect/SV/SVOps.h"
+#include "circt/Support/Debug.h"
 #include "circt/Support/Path.h"
 #include "mlir/IR/Attributes.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Support/FileUtilities.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/FormatAdapters.h"
 #include "llvm/Support/FormatVariadic.h"
@@ -33,11 +36,15 @@
 
 #define DEBUG_TYPE "firrtl-blackbox-reader"
 
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_BLACKBOXREADER
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
+
 using namespace circt;
 using namespace firrtl;
-
-using hw::OutputFileAttr;
-using sv::VerbatimOp;
 
 //===----------------------------------------------------------------------===//
 // Pass Implementation
@@ -45,60 +52,43 @@ using sv::VerbatimOp;
 
 namespace {
 
-/// This is used to indicate the directory priority.  Multiple external modules
-/// with the same "defname" may have different output filenames.  This is used
-/// to choose the best filename.
-enum class Priority { TargetDir = 0, Verification, Explicit, TestBench, Unset };
-
 /// Data extracted from BlackBoxInlineAnno or BlackBoxPathAnno.
 struct AnnotationInfo {
   /// The name of the file that should be created for this BlackBox.
   StringAttr name;
-  /// The output directory where this annotation should be written.
-  OutputFileAttr outputFile;
+  /// The output directory information for this extmodule.
+  hw::OutputFileAttr outputFileAttr;
   /// The body of the BlackBox.  (This should be Verilog text.)
   StringAttr inlineText;
-  /// The priority of this annotation.  In the even that multiple annotations
-  /// are provided for the same BlackBox, then use this as a tie-breaker if an
-  /// external module is instantiated multiple times and those multiple
-  /// instantiations disagree on where the module should go.
-  Priority priority = Priority::Unset;
 
 #if !defined(NDEBUG)
   /// Pretty print the AnnotationInfo in a YAML-esque format.
   void print(raw_ostream &os, unsigned indent = 0) const {
-    if (priority == Priority::Unset) {
-      os << "<null>\n";
-      return;
-    }
     os << llvm::formatv("name: {1}\n"
                         "{0}outputFile: {2}\n"
-                        "{0}priority: {3}\n",
+                        "{0}exclude: {3}\n",
                         llvm::fmt_pad("", indent, 0), name,
-                        outputFile.getFilename(), (unsigned)priority);
+                        outputFileAttr.getFilename(),
+                        outputFileAttr.getExcludeFromFilelist().getValue());
   };
 #endif
 };
 
-struct BlackBoxReaderPass : public BlackBoxReaderBase<BlackBoxReaderPass> {
+struct BlackBoxReaderPass
+    : public circt::firrtl::impl::BlackBoxReaderBase<BlackBoxReaderPass> {
   void runOnOperation() override;
   bool runOnAnnotation(Operation *op, Annotation anno, OpBuilder &builder,
                        bool isCover, AnnotationInfo &annotationInfo);
   StringAttr loadFile(Operation *op, StringRef inputPath, OpBuilder &builder);
-  std::pair<OutputFileAttr, Priority> getOutputFile(Operation *origOp,
-                                                    StringAttr fileNameAttr,
-                                                    bool isCover = false);
-  void setOutputFile(VerbatimOp op, OutputFileAttr outputFile,
-                     StringAttr fileNameAttr);
-  // Check if module or any of its parents in the InstanceGraph is a DUT.
-  bool isDut(Operation *module);
+  hw::OutputFileAttr getOutputFile(Operation *origOp, StringAttr fileNameAttr,
+                                   bool isCover = false);
 
   using BlackBoxReaderBase::inputPrefix;
 
 private:
   /// A list of all files which will be included in the file list.  This is
   /// subset of all emitted files.
-  SmallVector<StringRef> fileListFiles;
+  SmallVector<emit::FileOp> fileListFiles;
 
   /// The target directory to output black boxes into. Can be changed
   /// through `firrtl.transforms.BlackBoxTargetDirAnno` annotations.
@@ -110,18 +100,14 @@ private:
   /// The target directory for testbench files.
   StringRef testBenchDir;
 
-  /// The design-under-test (DUT) as indicated by the presence of a
-  /// "sifive.enterprise.firrtl.MarkDUTAnnotation".  This will be null if no
-  /// annotation is present.
-  FModuleOp dut;
-
   /// The file list file name (sic) for black boxes. If set, generates a file
   /// that lists all non-header source files for black boxes. Can be changed
   /// through `firrtl.transforms.BlackBoxResourceFileNameAnno` annotations.
   StringRef resourceFileName;
 
-  /// InstanceGraph to determine modules which are under the DUT.
+  /// Analyses used by this pass.
   InstanceGraph *instanceGraph;
+  InstanceInfo *instanceInfo;
 
   /// A cache of the modules which have been marked as DUT or a testbench.
   /// This is used to determine the output directory.
@@ -135,14 +121,18 @@ private:
   /// appropriate annotation is found (e.g., which will cause the file to be
   /// written to the DUT directory and not the TestHarness directory), then this
   /// will map will be updated.
-  llvm::MapVector<Attribute, AnnotationInfo> emittedFileMap;
+  llvm::MapVector<StringAttr, AnnotationInfo> emittedFileMap;
 };
 } // end anonymous namespace
 
 /// Emit the annotated source code for black boxes in a circuit.
 void BlackBoxReaderPass::runOnOperation() {
+  LLVM_DEBUG(debugPassHeader(this) << "\n");
   CircuitOp circuitOp = getOperation();
+  CircuitNamespace ns(circuitOp);
+
   instanceGraph = &getAnalysis<InstanceGraph>();
+  instanceInfo = &getAnalysis<InstanceInfo>();
   auto context = &getContext();
 
   // If this pass has changed anything.
@@ -210,16 +200,6 @@ void BlackBoxReaderPass::runOnOperation() {
   // Newly generated IR will be placed at the end of the circuit.
   auto builder = circuitOp.getBodyBuilder();
 
-  // Do a shallow walk of the circuit to collect information necessary before we
-  // do real work.
-  for (auto &op : *circuitOp.getBodyBlock()) {
-    FModuleOp module = dyn_cast<FModuleOp>(op);
-    // Find the DUT if it exists or error if there are multiple DUTs.
-    if (module)
-      if (failed(extractDUT(module, dut)))
-        return signalPassFailure();
-  }
-
   LLVM_DEBUG(llvm::dbgs() << "Visiting extmodules:\n");
   auto bboxAnno =
       builder.getDictionaryAttr({{builder.getStringAttr("class"),
@@ -241,10 +221,24 @@ void BlackBoxReaderPass::runOnOperation() {
 
       LLVM_DEBUG(annotationInfo.print(llvm::dbgs().indent(6) << "- ", 8));
 
-      auto &bestAnnotationInfo = emittedFileMap[annotationInfo.name];
-      if (annotationInfo.priority < bestAnnotationInfo.priority) {
-        bestAnnotationInfo = annotationInfo;
-
+      // If we have seen a black box trying to create a blackbox with this
+      // filename before, then compute the lowest commmon ancestor between the
+      // two blackbox paths.  This is the same logic used in `AssignOutputDirs`.
+      // However, this needs to incorporate filenames that are only available
+      // _after_ output directories are assigned.
+      auto [ptr, inserted] =
+          emittedFileMap.try_emplace(annotationInfo.name, annotationInfo);
+      if (inserted) {
+        emittedFileMap[annotationInfo.name] = annotationInfo;
+      } else {
+        auto &fileAttr = ptr->second.outputFileAttr;
+        SmallString<64> directory(fileAttr.getDirectory());
+        makeCommonPrefix(directory,
+                         annotationInfo.outputFileAttr.getDirectory());
+        fileAttr = hw::OutputFileAttr::getFromDirectoryAndFilename(
+            context, directory, annotationInfo.name.getValue(),
+            /*excludeFromFileList=*/
+            fileAttr.getExcludeFromFilelist().getValue());
         // TODO: Check that the new text is the _exact same_ as the prior best.
       }
 
@@ -260,6 +254,7 @@ void BlackBoxReaderPass::runOnOperation() {
   }
 
   LLVM_DEBUG(llvm::dbgs() << "emittedFiles:\n");
+  Location loc = builder.getUnknownLoc();
   for (auto &[verilogName, annotationInfo] : emittedFileMap) {
     LLVM_DEBUG({
       llvm::dbgs().indent(2) << "verilogName: " << verilogName << "\n";
@@ -267,9 +262,16 @@ void BlackBoxReaderPass::runOnOperation() {
       annotationInfo.print(llvm::dbgs().indent(4) << "- ", 6);
     });
 
-    auto verbatim = builder.create<VerbatimOp>(builder.getUnknownLoc(),
-                                               annotationInfo.inlineText);
-    setOutputFile(verbatim, annotationInfo.outputFile, annotationInfo.name);
+    auto fileName = ns.newName("blackbox_" + verilogName.getValue());
+
+    auto fileOp = builder.create<emit::FileOp>(
+        loc, annotationInfo.outputFileAttr.getFilename(), fileName,
+        [&, text = annotationInfo.inlineText] {
+          builder.create<emit::VerbatimOp>(loc, text);
+        });
+
+    if (!annotationInfo.outputFileAttr.getExcludeFromFilelist().getValue())
+      fileListFiles.push_back(fileOp);
   }
 
   // If we have emitted any files, generate a file list operation that
@@ -277,41 +279,31 @@ void BlackBoxReaderPass::runOnOperation() {
   // created.
   if (!fileListFiles.empty()) {
     // Output the file list in sorted order.
-    llvm::sort(fileListFiles.begin(), fileListFiles.end());
+    llvm::sort(fileListFiles.begin(), fileListFiles.end(),
+               [](emit::FileOp fileA, emit::FileOp fileB) {
+                 return fileA.getFileName() < fileB.getFileName();
+               });
 
-    // Create the file list contents by prepending the file name with the target
-    // directory, and putting each file on its own line.
-    std::string output;
-    llvm::raw_string_ostream os(output);
-    llvm::interleave(
-        fileListFiles, os,
-        [&](StringRef fileName) {
-          SmallString<32> filePath(targetDir);
-          llvm::sys::path::append(filePath, fileName);
-          llvm::sys::path::remove_dots(filePath);
-          os << filePath;
-        },
-        "\n");
+    // Create the file list contents by enumerating the symbols to the files.
+    SmallVector<Attribute> symbols;
+    for (emit::FileOp file : fileListFiles)
+      symbols.push_back(FlatSymbolRefAttr::get(file.getSymNameAttr()));
 
-    // Put the file list in to a verbatim op.  Use "unknown location" so that no
-    // file info will unnecessarily print.
-    auto op =
-        builder.create<VerbatimOp>(builder.getUnknownLoc(), std::move(output));
-
-    // Attach the output file information to the verbatim op.
-    op->setAttr("output_file", hw::OutputFileAttr::getFromFilename(
-                                   context, resourceFileName,
-                                   /*excludeFromFileList=*/true));
+    builder.create<emit::FileListOp>(
+        loc, builder.getStringAttr(resourceFileName),
+        builder.getArrayAttr(symbols),
+        builder.getStringAttr(ns.newName("blackbox_filelist")));
   }
 
   // If nothing has changed we can preserve the analysis.
   if (!anythingChanged)
     markAllAnalysesPreserved();
-  markAnalysesPreserved<InstanceGraph>();
+  markAnalysesPreserved<InstanceGraph, InstanceInfo>();
 
   // Clean up.
   emittedFileMap.clear();
   fileListFiles.clear();
+  LLVM_DEBUG(debugFooter() << "\n");
 }
 
 /// Run on an operation-annotation pair. The annotation need not be a black box
@@ -331,11 +323,9 @@ bool BlackBoxReaderPass::runOnAnnotation(Operation *op, Annotation anno,
       return true;
     }
 
-    auto outputFile = getOutputFile(op, name, isCover);
-    annotationInfo.outputFile = outputFile.first;
+    annotationInfo.outputFileAttr = getOutputFile(op, name, isCover);
     annotationInfo.name = name;
     annotationInfo.inlineText = text;
-    annotationInfo.priority = outputFile.second;
     return true;
   }
 
@@ -357,11 +347,9 @@ bool BlackBoxReaderPass::runOnAnnotation(Operation *op, Annotation anno,
       return false;
     }
     auto name = builder.getStringAttr(llvm::sys::path::filename(path));
-    auto outputFile = getOutputFile(op, name, isCover);
-    annotationInfo.outputFile = outputFile.first;
+    annotationInfo.outputFileAttr = getOutputFile(op, name, isCover);
     annotationInfo.name = name;
     annotationInfo.inlineText = text;
-    annotationInfo.priority = outputFile.second;
     return true;
   }
 
@@ -388,14 +376,13 @@ StringAttr BlackBoxReaderPass::loadFile(Operation *op, StringRef inputPath,
 }
 
 /// Determine the output file for some operation.
-std::pair<OutputFileAttr, Priority>
-BlackBoxReaderPass::getOutputFile(Operation *origOp, StringAttr fileNameAttr,
-                                  bool isCover) {
-  // If the original operation has a specified output file that is not a
-  // directory, then just use that.
-  auto outputFile = origOp->getAttrOfType<OutputFileAttr>("output_file");
-  if (outputFile && !outputFile.isDirectory())
-    return {outputFile, Priority::TargetDir};
+hw::OutputFileAttr BlackBoxReaderPass::getOutputFile(Operation *origOp,
+                                                     StringAttr fileNameAttr,
+                                                     bool isCover) {
+  auto outputFile = origOp->getAttrOfType<hw::OutputFileAttr>("output_file");
+  if (outputFile && !outputFile.isDirectory()) {
+    return {outputFile};
+  }
 
   // Exclude Verilog header files since we expect them to be included
   // explicitly by compiler directives in other source files.
@@ -403,65 +390,28 @@ BlackBoxReaderPass::getOutputFile(Operation *origOp, StringAttr fileNameAttr,
   auto fileName = fileNameAttr.getValue();
   auto ext = llvm::sys::path::extension(fileName);
   bool exclude = (ext == ".h" || ext == ".vh" || ext == ".svh");
-  auto outDir = std::make_pair(targetDir, Priority::TargetDir);
+  auto outDir = targetDir;
+
+  // If the original operation has a specified output file that is not a
+  // directory, then just use that.
+  if (outputFile)
+    outDir = outputFile.getFilename();
   // In order to output into the testbench directory, we need to have a
   // testbench dir annotation, not have a blackbox target directory annotation
   // (or one set to the current directory), have a DUT annotation, and the
-  // module needs to be in or under the DUT.
-  if (!testBenchDir.empty() && targetDir.equals(".") && dut && !isDut(origOp))
-    outDir = {testBenchDir, Priority::TestBench};
+  // module needs to be in or under the effective design.
+  else if (!testBenchDir.empty() && targetDir == "." &&
+           !instanceInfo->allInstancesInEffectiveDesign(
+               cast<igraph::ModuleOpInterface>(origOp)))
+    outDir = testBenchDir;
   else if (isCover)
-    outDir = {coverDir, Priority::Verification};
-  else if (outputFile)
-    outDir = {outputFile.getFilename(), Priority::Explicit};
+    outDir = coverDir;
 
   // If targetDir is not set explicitly and this is a testbench module, then
   // update the targetDir to be the "../testbench".
-  auto outFileAttr = OutputFileAttr::getFromDirectoryAndFilename(
-      context, outDir.first, fileName,
-      /*excludeFromFileList=*/exclude);
-  return {outFileAttr, outDir.second};
-}
-
-/// This function is called for every file generated.  It does the following
-/// things:
-///  1. Attaches the output file attribute to the VerbatimOp.
-///  2. Record that the file has been generated to avoid duplicates.
-///  3. Add each file name to the generated "file list" file.
-void BlackBoxReaderPass::setOutputFile(VerbatimOp op, OutputFileAttr outputFile,
-                                       StringAttr fileNameAttr) {
-  op->setAttr("output_file", outputFile);
-
-  // Append this file to the file list if its not excluded.
-  if (!outputFile.getExcludeFromFilelist().getValue())
-    fileListFiles.push_back(outputFile.getFilename());
-}
-
-/// Return true if module is in the DUT hierarchy.
-/// NOLINTNEXTLINE(misc-no-recursion)
-bool BlackBoxReaderPass::isDut(Operation *module) {
-  // Check if result already cached.
-  auto iter = dutModuleMap.find(module);
-  if (iter != dutModuleMap.end())
-    return iter->getSecond();
-  AnnotationSet annos(module);
-  // Any module with the dutAnno, is the DUT.
-  if (annos.hasAnnotation(dutAnnoClass)) {
-    dutModuleMap[module] = true;
-    return true;
-  }
-  auto *node = instanceGraph->lookup(cast<igraph::ModuleOpInterface>(module));
-  bool anyParentIsDut = false;
-  if (node)
-    for (auto *u : node->uses()) {
-      // Recursively check the parents.
-      auto dut = isDut(u->getInstance()->getParentOfType<FModuleOp>());
-      // Cache the result.
-      dutModuleMap[module] = dut;
-      anyParentIsDut |= dut;
-    }
-  dutModuleMap[module] = anyParentIsDut;
-  return anyParentIsDut;
+  SmallString<128> outputFilePath(outDir);
+  llvm::sys::path::append(outputFilePath, fileName);
+  return hw::OutputFileAttr::getFromFilename(context, outputFilePath, exclude);
 }
 
 //===----------------------------------------------------------------------===//

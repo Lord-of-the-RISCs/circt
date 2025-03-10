@@ -1,5 +1,6 @@
 ; RUN: circt-translate -import-firrtl -verify-diagnostics --split-input-file %s
 
+FIRRTL version 4.0.0
 circuit test :
   extmodule MyModule :
 
@@ -45,18 +46,19 @@ circuit test :
 ;// -----
 
 ; expected-error @below {{'circuit' must be first token on its line}}
-FIRRTL version 1.1.0 circuit test :
+FIRRTL version 2.0.0 circuit test :
   module test :
 
 ;// -----
 
-; expected-error @below {{FIRRTL version must be >=0.2.0}}
+; expected-error @below {{FIRRTL version must be >=2.0.0}}
 FIRRTL version 0.1.0
 circuit test :
   module test :
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit test test : ; expected-error {{expected ':' in circuit definition}}
 
 ;// -----
@@ -66,6 +68,7 @@ circuit test test : ; expected-error {{expected ':' in circuit definition}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit nameConflict :
   module nameConflict :
     input c: Clock   ; expected-note {{previous definition here}}
@@ -74,6 +77,7 @@ circuit nameConflict :
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit nameConflict :
   extmodule nameConflict :
     input c: Clock   ; expected-note {{previous definition here}}
@@ -82,99 +86,126 @@ circuit nameConflict :
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_name :
-  module invalid_name :
-    input c: UInt
-    out <= c         ; expected-error {{use of unknown declaration 'out'}}
+  public module invalid_name :
+    input c: UInt<4>
+    connect out, c   ; expected-error {{use of unknown declaration 'out'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_name :
-  module invalid_name :
-    output out: UInt
-    out <= c         ; expected-error {{use of unknown declaration 'c'}}
+  public module invalid_name :
+    output out: UInt<4>
+    connect out, c   ; expected-error {{use of unknown declaration 'c'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit subfield_of_ground_type :
-  module subfield_of_ground_type :
+  public module subfield_of_ground_type :
     input a: UInt<1>
     output b: UInt<1>
     ; expected-error @+1 {{subfield requires bundle or object operand}}
-    b <= a.a
+    connect b, a.a
 
 ;// -----
 
-FIRRTL version 1.2.0
+FIRRTL version 2.0.0
 circuit invalid_name :
   module invalid_name :
    input out_0 : { member : { 0 : { clock : Clock, reset : UInt<1>}}}
-   ; expected-error @+1 {{unknown field 'xx' in type '!firrtl.bundle<member: bundle<"0": bundle<clock: clock, reset: uint<1>>>>'}}
-   out_0.xx <- out_0.yy
+   ; expected-error @+1 {{unknown field 'xx' in type '!firrtl.bundle<member: bundle<"0": bundle<clock: clock, reset: uint<1>>>>}}
+   out_0.xx <= out_0.yy
 
 ;// -----
 
-FIRRTL version 1.2.0
+FIRRTL version 2.0.0
 circuit invalid_name :
   module invalid_name :
    input out_0 : SInt<8>[5]
    ; expected-error @+1 {{out of range index '5' in vector type '!firrtl.vector<sint<8>, 5>'}}
-   out_0[4] <- out_0[5]
+   out_0[4] <= out_0[5]
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_add :
-  module invalid_add :
+  public module invalid_add :
    input in : SInt<8>
    input c : Clock
    ; expected-error @+1 {{second operand must be an integer type, not '!firrtl.clock'}}
    node n = add(in, c)
+;// -----
+
+FIRRTL version 4.0.0
+circuit trailing_comma :
+  public module trailing_comma :
+   input in0 : SInt<8>
+   input in1 : SInt<8>
+   ; expected-error @+1 {{expected ')'}}
+   node n = add(in0, in1,)
 
 ;// -----
 
+FIRRTL version 4.0.0
+circuit no_commas :
+  public module no_commas :
+   input in0 : SInt<8>
+   input in1 : SInt<8>
+   ; expected-error @+1 {{expected ','}}
+   node n = add(in0 in1)
+
+;// -----
+
+FIRRTL version 4.0.0
 circuit invalid_add :
-  module invalid_add :
+  public module invalid_add :
    input in : SInt<8>
    input c : Clock
-   ; expected-error @+1 {{operation requires two operands}}
+   ; expected-error @+1 {{expected ')'}}
    node n = add(in, in, in)
 
 ;// -----
 
+FIRRTL version 2.0.0
 circuit invalid_int_literal :
   module invalid_int_literal :
    node n = add(UInt<8>("hAX"), UInt<10>(42))  ; expected-error {{invalid character in integer literal}}
 
 ;// -----
 ; When scopes are local to the body
-FIRRTL version 1.2.0
+FIRRTL version 2.0.0
 circuit invalid_name :
   module invalid_name :
     input reset : UInt<1>
     output out : UInt<1>
     when reset :
       node n4 = reset
-    out <- n4   ; expected-error {{use of unknown declaration 'n4'}}
+    out <= n4   ; expected-error {{use of unknown declaration 'n4'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_inst :
-  module invalid_inst :
+  public module invalid_inst :
 
     ; expected-error @+1 {{use of undefined module name 'some_module' in instance}}
     inst xyz of some_module
 
 ;// -----
 
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit class_inst :
   class some_class :
-  module class_inst :
+  public module class_inst :
     ; expected-error @below {{cannot create instance of class 'some_class', did you mean object?}}
     inst xyz of some_class
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit MyParameterizedExtModule :
   extmodule MyParameterizedExtModule :
     parameter DEFAULT = 0
@@ -182,41 +213,46 @@ circuit MyParameterizedExtModule :
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_name :
-  module invalid_name :
+  public module invalid_name :
     input bf: { flip int_1 : UInt<1>, int_out : UInt<2>}
     node n4 = add(bf, bf)  ; expected-error {{operands must be integer types, not '!firrtl.bundle<int_1 flip: uint<1>, int_out: uint<2>>' and '!firrtl.bundle<int_1 flip: uint<1>, int_out: uint<2>>'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_bits :
-  module invalid_bits:
+  public module invalid_bits:
      input a: UInt<8>
      output b: UInt<4>
      ; expected-error @+1 {{high must be equal or greater than low, but got high = 4, low = 7}}
-     b <= bits(a, 4, 7)
+     connect b, bits(a, 4, 7)
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit test :
-  module invalid_add :
-   input in1 : SInt
-   input in2 : UInt
+  public module invalid_add :
+   input in1 : SInt<5>
+   input in2 : UInt<5>
    node n = add(in1, in2)  ; expected-error {{operand signedness must match}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_node_not_passive :
-  module invalid_node_not_passive :
-    input a : { a: UInt, flip b: UInt}
-    output b : { a: UInt, flip b: UInt}
+  public module invalid_node_not_passive :
+    input a : { a: UInt<5>, flip b: UInt<5>}
+    output b : { a: UInt<5>, flip b: UInt<5>}
     ; expected-error @+1 {{Node cannot be analog and must be passive or passive under a flip}}
     node n = a
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit invalid_node_analog :
-  module invalid_node_analog :
+  public module invalid_node_analog :
     input a : Analog<1>
     output b : Analog<1>
     ; expected-error @+1 {{Node cannot be analog and must be passive or passive under a flip}}
@@ -224,64 +260,71 @@ circuit invalid_node_analog :
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit Issue418:
-  module Issue418:
+  public module Issue418:
     input a: UInt<1>
     output b: UInt<1>
 
-    ; expected-error @+1 {{operation requires one operand}}
-    b <= not(a, a)
+    ; expected-error @+1 {{expected ')'}}
+    connect b, not(a, a)
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit Issue3799:
-  module Issue3799:
+  public module Issue3799:
     output a: UInt<0>
-    a <= UInt<0>(0) ; ok
-    a <= UInt<0>(-0) ; ok
+    connect a, UInt<0>(0) ; ok
+    connect a, UInt<0>(-0) ; ok
     ; expected-error @below {{zero bit constant must be zero}}
-    a <= UInt<0>(1)
+    connect a, UInt<0>(1)
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit Issue3799:
-  module Issue3799:
+  public module Issue3799:
     output a: SInt<0>
-    a <= SInt<0>(0) ; ok
-    a <= SInt<0>(-0) ; ok
+    connect a, SInt<0>(0) ; ok
+    connect a, SInt<0>(-0) ; ok
     ; expected-error @below {{zero bit constant must be zero}}
-    a <= SInt<0>(1)
+    connect a, SInt<0>(1)
 
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit Issue426:
-  module Issue426:
+  public module Issue426:
     output a: UInt<1>
     ; expected-error @+1 {{initializer too wide for declared width}}
-    a <= UInt<1>(2)
+    connect a, UInt<1>(2)
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit Issue426:
-  module Issue426:
+  public module Issue426:
     output a: SInt<1>
-    a <= SInt<1>(0) ; ok
-    a <= SInt<1>(-1) ; ok
+    connect a, SInt<1>(0) ; ok
+    connect a, SInt<1>(-1) ; ok
     ; expected-error @+1 {{initializer too wide for declared width}}
-    a <= SInt<1>(1)
+    connect a, SInt<1>(1)
 ;// -----
 
+FIRRTL version 4.0.0
 circuit Issue426:
-  module Issue426:
+  public module Issue426:
     output a: SInt<1>
     ; expected-error @+1 {{initializer too wide for declared width}}
-    a <= SInt<1>(-2)
+    connect a, SInt<1>(-2)
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit circuit:
-  module circuit :
+  public module circuit :
     input in: UInt<80>
     inst xyz of circuit
     node n = xyz
@@ -289,30 +332,34 @@ circuit circuit:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit circuit:
-  module circuit :
+  public module circuit :
     input in: UInt<80>
     inst xyz of circuit
     node n = xyz.foo   ; expected-error {{use of invalid field name 'foo' on bundle value}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit NonAscii:
-  module NonAscii:
+  public module NonAscii:
     input clk: Clock
     input enable: UInt<1>
     printf(clk, enable, "’") ; expected-error {{string characters must be 7-bit ASCII}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit UnicodeEscape:
-  module UnicodeEscape:
+  public module UnicodeEscape:
     input clk: Clock
     input enable: UInt<1>
     printf(clk, enable, "\u0065") ; expected-error {{unicode escape not supported in string}}
 
 ;// -----
 
+FIRRTL version 2.0.0
 circuit PrintfExpr:
   module PrintfExpr:
     input clk: Clock
@@ -322,17 +369,40 @@ circuit PrintfExpr:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ProbeFlipType:
-  module ProbeFlipType:
+  public module ProbeFlipType:
     output p : Probe<{a: UInt, flip b: UInt}> ; expected-error {{probe inner type must be passive}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit NestedProbes:
-  module NestedProbes:
+  public module NestedProbes:
     output p : Probe<Probe<UInt>> ; expected-error {{invalid probe inner type, must be base-type}}
 
 ;// -----
+
+FIRRTL version 4.0.0
+circuit BadCommas:
+  public module BadCommas:
+    output p : Probe<UInt<1>,> ; expected-error {{expected layer name}}
+    wire w : UInt<1>
+    invalidate w
+    define p = probe(w)
+
+;// -----
+
+FIRRTL version 4.0.0
+circuit BadCommas2:
+  public module BadCommas2:
+    output p : Probe<UInt<1>, A,> ; expected-error {{expected '>' to end reference type}}
+    wire w : UInt<1>
+    invalidate w
+    define p = probe(w)
+
+;// -----
+
 FIRRTL version 3.1.0
 
 circuit ProbeOfProp:
@@ -341,77 +411,85 @@ circuit ProbeOfProp:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit RefSubaccess:
-  module RefSubaccess:
+  public module RefSubaccess:
     input in : UInt<1>[3]
     input sel : UInt<2>
     output out : UInt<1>
 
-    out <= read(probe(in)[sel]) ; expected-error {{expected ')' in 'read'}}
+    connect out, read(probe(in)[sel]) ; expected-error {{expected ')' in 'read'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ProbeBase:
   extmodule ProbeGen:
     output p : Probe<UInt<2>>
-    ref p is "x.y"
 
-  module ProbeBase:
+  public module ProbeBase:
     input in : UInt<1>
-    output out : UInt
+    output out : UInt<1>
 
     inst pg of ProbeGen
-    out <= probe(pg.p) ; expected-error {{expected base-type expression in 'probe', got}}
+    connect out, probe(pg.p) ; expected-error {{expected base-type expression in 'probe', got}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ProbeProbe:
-  module ProbeProbe:
+  public module ProbeProbe:
     input in : UInt<1>
-    output out : UInt
+    output out : UInt<1>
 
-    out <= probe(probe(in)) ; expected-error {{expected static reference expression in 'probe'}}
+    connect out, probe(probe(in)) ; expected-error {{expected static reference expression in 'probe'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ReadBase:
-  module ReadBase:
+  public module ReadBase:
     input in : UInt<1>
-    output out : UInt
+    output out : UInt<1>
 
-    out <= read(in) ; expected-error {{expected reference-type expression in 'read', got}}
+    connect out, read(in) ; expected-error {{expected reference-type expression in 'read', got}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit DefineBaseLHS:
-  module DefineBaseLHS:
+  public module DefineBaseLHS:
     input in : UInt<1>
-    output out : UInt
+    output out : UInt<1>
 
     define out = probe(in) ; expected-error {{expected reference-type expression in 'define' target (LHS), got}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit DefineBaseRHS:
-  module DefineBaseRHS:
+  public module DefineBaseRHS:
     input in : UInt<1>
-    output out : Probe<UInt>
+    output out : Probe<UInt<1>>
 
     define out = in ; expected-error {{expected reference-type expression in 'define' source (RHS), got}}
 
 ;// -----
+
+FIRRTL version 4.0.0
 circuit RefSubaccess:
-  module RefSubaccess:
+  public module RefSubaccess:
     input in : UInt<1>[3]
     input sel : UInt<2>
     output out : UInt<1>
 
-    out <= read(probe(in[sel])) ; expected-error {{subaccess not allowed here}}
+    connect out, read(probe(in[sel])) ; expected-error {{subaccess not allowed here}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit DefineTwice:
-  module DefineTwice:
+  public module DefineTwice:
     input in: UInt<1>
     output out : Probe<UInt<1>>
     define out = probe(in) ; expected-error {{destination reference cannot be reused by multiple operations, it can only capture a unique dataflow}}
@@ -419,8 +497,9 @@ circuit DefineTwice:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit DefineIntoSubindex:
-  module DefineIntoSubindex:
+  public module DefineIntoSubindex:
     input in : UInt<1>[3]
     output out : Probe<UInt<1>[3]>
 
@@ -428,8 +507,9 @@ circuit DefineIntoSubindex:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit DefineIntoProbe:
-  module DefineIntoProbe:
+  public module DefineIntoProbe:
     input in : UInt<1>
     output out : UInt<1>
 
@@ -437,12 +517,14 @@ circuit DefineIntoProbe:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit InProbeTop:
-  module InProbeTop:
-    input p : Probe<UInt<1>> ; expected-error {{input probe not allowed on public module}}
+  public module InProbeTop:
+    input p : Probe<UInt<1>> ; expected-error {{input probe not allowed}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit InProbeExt:
   extmodule BadExtMod:
     input p : Probe<UInt<1>> ; expected-error {{references in ports must be output on extmodule and intmodule}}
@@ -452,6 +534,7 @@ circuit InProbeExt:
 
 ;// -----
 
+FIRRTL version 3.0.0
 circuit RefDupe:
   extmodule RefDupe:
     output p : Probe<UInt<2>>
@@ -461,6 +544,7 @@ circuit RefDupe:
 ;// -----
 ; Either use ref statements or ABI, can't partially use ref statements.
 
+FIRRTL version 3.0.0
 circuit MissingRef:
   extmodule MissingRef:
     output p : Probe<UInt<2>> ; expected-error {{no ref statement found for ref port "p"}}
@@ -469,12 +553,14 @@ circuit MissingRef:
 
 ;// -----
 
+FIRRTL version 3.0.0
 circuit UnusedRef:
   extmodule UnusedRef:
     ref p is "x.y" ; expected-error {{unused ref statement}}
 
 ;// -----
 
+FIRRTL version 3.0.0
 circuit RefNotString:
   extmodule RefNotString:
     output p : Probe<UInt<2>>
@@ -482,6 +568,7 @@ circuit RefNotString:
 
 ;// -----
 
+FIRRTL version 3.0.0
 circuit RefForAggElement:
   extmodule RefForAggElement:
     output p : { x: Probe<UInt<2>> }
@@ -489,12 +576,21 @@ circuit RefForAggElement:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ConnectWrongType:
-  module ConnectWrongType:
+  public module ConnectWrongType:
     input a: UInt<1>
     output b: SInt<1>
 
-    b <= a ; expected-error {{cannot connect non-equivalent type}}
+    connect b, a ; expected-error {{cannot connect non-equivalent type}}
+
+;// -----
+FIRRTL version 4.0.0
+
+circuit RefStatementDeprecated:
+  extmodule RefStatementDeprecated:
+    output p : Probe<UInt<1>>
+    ref p is "x.y" ; expected-error {{ref statements were removed in FIRRTL 4.0.0, but the specified FIRRTL version was 4.0.0}}
 
 ;// -----
 
@@ -508,12 +604,13 @@ circuit ConnectAlternateWrongType:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ProbeConnect:
-  module ProbeConnect:
+  public module ProbeConnect:
     input in : UInt<1>
     output p : Probe<UInt<1>>
 
-    p <= probe(in) ; expected-error {{cannot connect reference or property types}}
+    connect p, probe(in) ; expected-error {{cannot connect reference or property types}}
 
 ;// -----
 
@@ -527,18 +624,9 @@ circuit ProbeConnectAlternate:
 
 ;// -----
 
-FIRRTL version 1.2.0
-circuit ProbePartialConnect:
-  module ProbePartialConnect:
-    input in : UInt<1>
-    output p : Probe<UInt<1>>
-
-    p <- probe(in) ; expected-error {{cannot connect reference or property types}}
-
-;// -----
-
+FIRRTL version 4.0.0
 circuit ProbeMem:
-  module ProbeMem:
+  public module ProbeMem:
     output out : Probe<UInt<3>> ; (wrong probe type, can't probe memories)
 
     mem memory:
@@ -550,13 +638,14 @@ circuit ProbeMem:
       write-latency => 1
       read-under-write => undefined
 
-    memory.r is invalid
-    memory.w is invalid
+    invalidate memory.r
+    invalidate memory.w
     define out = probe(memory.r) ; expected-error {{cannot probe memories or their ports}}
 
 
 ;// -----
 
+FIRRTL version 3.0.0
 circuit ProbeSMem:
   module ProbeSMem:
     input clock : Clock
@@ -566,49 +655,88 @@ circuit ProbeSMem:
 
     smem mem : UInt<8> [8]
     infer mport read = mem[io.addr], clock
-    io.dataOut <= read
+    connect io.dataOut, read
     define out = probe(read) ; expected-error {{cannot probe memories or their ports}}
+;// -----
+
+FIRRTL version 3.0.0
+circuit SmemNoRuwInfo:
+  module SmemNoRuwInfo:
+    input clock : Clock
+    input reset : Reset
+    output io : { flip addr : UInt<3>, dataOut : UInt<8>}
+
+    smem mem : UInt<8> [8] @[foo.fir 1:1]
+    infer mport read = mem[io.addr], clock
+    connect io.dataOut, read
 
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit LeadingRead:
-  module LeadingRead:
+  public module LeadingRead:
     input in : UInt<1>
     read(probe(in)) ; expected-error {{unexpected read() as start of statement}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit LeadingProbe:
-  module LeadingProbe:
+  public module LeadingProbe:
     input in : UInt<1>
     probe(in) ; expected-error {{unexpected probe() as start of statement}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ForceProbe:
-  module ForceProbe:
+  public module ForceProbe:
     input in : UInt<1>
     force_initial(probe(in), UInt<1>(1)) ; expected-error {{expected rwprobe-type expression for force_initial destination, got '!firrtl.probe<uint<1>>'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ForceWithLiteral:
-  module ForceWithLiteral:
+  public module ForceWithLiteral:
     input in : UInt<1>
     node n = in
     force_initial(rwprobe(n), 1) ; expected-error {{expected source expression in force_initial}}
 
 ;// -----
 
+FIRRTL version 4.0.0
+circuit ForceBadTypes:
+  public module ForceBadTypes:
+    input in : { a : UInt<5>, b : UInt<4> }
+    node n = in
+    ; expected-error @below {{incompatible force_initial source of type '!firrtl.uint<4>' cannot target destination '!firrtl.rwprobe<bundle<a: uint<5>, b: uint<4>>>'}}
+    force_initial(rwprobe(n), in.b)
+
+;// -----
+
+FIRRTL version 4.0.0
+circuit ForceBadTypesWithFlips:
+  public module ForceBadTypesWithFlips:
+    output out : { flip a : UInt<5> }
+    wire w : { flip a : UInt<5> }
+    connect out, w
+    ; expected-error @below {{expected passive value for force_initial source, got '!firrtl.bundle<a flip: uint<5>>'}}
+    force_initial(rwprobe(w), out)
+
+;// -----
+
+FIRRTL version 4.0.0
 circuit RWProbeConst:
   extmodule RWProbeConst:
     output p : RWProbe<{a: const UInt}> ; expected-error {{rwprobe cannot contain const}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit RWProbeConstPort:
-  module RWProbeConstPort:
+  public module RWProbeConstPort:
     input in : const UInt<1>[2]
     output p : RWProbe<UInt<1>>
     define p = rwprobe(in[1]) ; expected-error {{cannot force target of type '!firrtl.const.uint<1>'}}
@@ -621,7 +749,7 @@ circuit PartialConnect_v2p0p0:
     input a: UInt<1>
     output b: UInt<1>
 
-    b <- a ; expected-error {{partial connects were removed in FIRRTL 2.0.0, but the specified FIRRTL version was 2.0.0}}
+    b <- a ; expected-error {{unexpected character after sign}}
 
 ;// -----
 
@@ -641,31 +769,35 @@ circuit IllegalLiteral:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit NodeProbe:
   extmodule Ref:
     output x : Probe<UInt<1>>
-  module NodeProbe:
+  public module NodeProbe:
     inst r of Ref
     node n = r.x ; expected-error {{Node cannot be analog and must be passive or passive under a flip}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit ConstProbe:
-  module ConstProbe:
+  public module ConstProbe:
     output x : const Probe<UInt<1>> ; expected-error {{only hardware types can be 'const'}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit MultiConst:
-  module MultiConst:
+  public module MultiConst:
     output x : const const UInt<1> ; expected-error {{'const' can only be specified once on a type}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit DefinePromoteToRW:
   extmodule Ref:
     output ro : Probe<UInt<1>>
-  module DefinePromoteToRW:
+  public module DefinePromoteToRW:
     output rw : RWProbe<UInt<1>>
     inst r of Ref
     ; expected-error @below {{cannot define reference of type '!firrtl.rwprobe<uint<1>>' with incompatible reference of type '!firrtl.probe<uint<1>>'}}
@@ -736,24 +868,28 @@ circuit UnsupportedStringEncodedIntegerLiterals:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit UnknownTypeAlias:
-  module UnknownTypeAlias:
+  public module UnknownTypeAlias:
     output x : Foo ; expected-error {{type identifier `Foo` is not declared}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit DuplicateAlias:
   type Foo = UInt
   type Foo = UInt; expected-error {{type alias `Foo` is already defined}}
-  module DuplicateAlias:
+  public module DuplicateAlias:
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit KeywordTypeName:
   type Clock = UInt; expected-error {{cannot use keyword 'Clock' for type alias name}}
 
 ;// -----
 
+FIRRTL version 4.0.0
 circuit KeywordTypeName:
   type module = UInt; expected-error {{cannot use keyword 'module' for type alias name}}
 
@@ -768,14 +904,14 @@ circuit UnsupportedVersionDeclGroups:
 
 FIRRTL version 4.0.0
 circuit RemovedDeclGroups:
-  ; expected-error @below {{optional groups were removed in FIRRTL 4.0.0, but the specified FIRRTL version was 4.0.0}}
+  ; expected-error @below {{optional groups were removed in FIRRTL 3.3.0, but the specified FIRRTL version was 4.0.0}}
   declgroup A, bind:
 
 ;// -----
 
-FIRRTL version 3.9.0
+FIRRTL version 3.2.0
 circuit UnsupportedVersionLayer:
-  ; expected-error @below {{layers are a FIRRTL 4.0.0+ feature, but the specified FIRRTL version was 3.9.0}}
+  ; expected-error @below {{layers are a FIRRTL 3.3.0+ feature, but the specified FIRRTL version was 3.2.0}}
   layer A, bind:
 
 ;// -----
@@ -788,18 +924,18 @@ circuit UnsupportedVersionGroups:
 
 ;// -----
 
-FIRRTL version 4.1.0
+FIRRTL version 4.0.0
 circuit RemovedGroups:
-  module RemovedGroups:
-    ; expected-error @below {{optional groups were removed in FIRRTL 4.0.0, but the specified FIRRTL version was 4.1.0}}
+  public module RemovedGroups:
+    ; expected-error @below {{optional groups were removed in FIRRTL 3.3.0, but the specified FIRRTL version was 4.0.0}}
     group A:
 
 ;// -----
 
-FIRRTL version 3.9.0
+FIRRTL version 3.2.0
 circuit UnsupportedLayerBlock:
   module UnsupportedLayerBlock:
-    ; expected-error @below {{layers are a FIRRTL 4.0.0+ feature, but the specified FIRRTL version was 3.9.0}}
+    ; expected-error @below {{layers are a FIRRTL 3.3.0+ feature, but the specified FIRRTL version was 3.2.0}}
     layerblock A:
 
 ;// -----
@@ -817,36 +953,45 @@ circuit LayerAndCircuitShareName:
   layer LayerAndCircuitShareName, bind :
 
   ; expected-error @below {{redefinition of symbol named 'LayerAndCircuitShareName'}}
-  module LayerAndCircuitShareName:
+  public module LayerAndCircuitShareName:
 
 ;// -----
 
-FIRRTL version 3.3.0
+FIRRTL version 4.0.0
+circuit LayerEmptyOutputDir:
+  ; expected-error @below {{output directory must not be blank}}
+  layer MyLayer, bind, "":
+
+  public module LayerEmptyOutputDir:
+
+;// -----
+
+FIRRTL version 4.2.0
 circuit Top:
   ; expected-error @below {{class cannot be the top of a circuit}}
   class Top:
 
 ;// -----
 
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit Top:
   ; expected-error @below {{extclass cannot be the top of a circuit}}
   extclass Top:
 
 ;// -----
 
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit Top:
-  module Top:
+  public module Top:
   class Foo:
     ;; expected-error @below {{ports on classes must be properties}}
     input a: UInt<8>
 
 ;// -----
 
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit Top:
-  module Top:
+  public module Top:
   extclass Foo:
     ;; expected-error @below {{ports on extclasses must be properties}}
     input a: UInt<8>
@@ -881,29 +1026,98 @@ circuit Top:
     propassign c, integer_add(a, b)
 
 ;// -----
-FIRRTL version 3.3.0
+FIRRTL version 3.1.0
 
 circuit Top:
   module Top:
+    input a : Integer
+    input b : Integer
+    output c : Integer
+    ; expected-error @below {{Integer arithmetic expressions are a FIRRTL 4.0.0+ feature, but the specified FIRRTL version was 3.1.0}}
+    propassign c, integer_mul(a, b)
+
+;// -----
+FIRRTL version 3.1.0
+
+circuit Top:
+  module Top:
+    input a : Integer
+    input b : Integer
+    output c : Integer
+    ; expected-error @below {{Integer arithmetic expressions are a FIRRTL 4.0.0+ feature, but the specified FIRRTL version was 3.1.0}}
+    propassign c, integer_shr(a, b)
+
+;// -----
+FIRRTL version 3.1.0
+
+circuit Top:
+  module Top:
+    input a : Integer
+    input b : Integer
+    output c : Integer
+    ; expected-error @below {{Integer arithmetic expressions are a FIRRTL 4.0.0+ feature, but the specified FIRRTL version was 3.1.0}}
+    propassign c, integer_shl(a, b)
+
+;// -----
+FIRRTL version 4.0.0
+
+; CHECK-LABEL: firrtl.circuit "Top"
+circuit Top :
+  public module Top :
+    input a : Integer
+    output b : List<Integer>
+
+    ; expected-error @below {{unexpected expression of type '!firrtl.integer' in List concat expression}}
+    propassign b, list_concat(a)
+
+;// -----
+FIRRTL version 4.0.0
+
+; CHECK-LABEL: firrtl.circuit "Top"
+circuit Top :
+  public module Top :
+    input a : List<Integer>
+    input b : List<String>
+    output c : List<Integer>
+
+    ; expected-error @below {{unexpected expression of type '!firrtl.list<string>' in List concat expression of type '!firrtl.list<integer>'}}
+    propassign c, list_concat(a, b)
+
+;// -----
+FIRRTL version 4.0.0
+
+; CHECK-LABEL: firrtl.circuit "Top"
+circuit Top :
+  public module Top :
+    output c : List<Integer>
+
+    ; expected-error @below {{need at least one List to concatenate}}
+    propassign c, list_concat()
+
+;// -----
+FIRRTL version 4.2.0
+
+circuit Top:
+  public module Top:
     ; expected-error @below {{unknown class 'Missing'}}
     input in : Inst<Missing>
 
 ;// -----
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 
 circuit Top:
-  module Top:
+  public module Top:
     ; expected-error @below {{use of undefined class name 'Missing' in object}}
     object x of Missing
 
 ;// -----
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 
 circuit Top:
   class MyClass:
     skip
 
-  module Top:
+  public module Top:
     output str : String
     object x of MyClass
     ; expected-error @below {{unknown field 'missing' in type '!firrtl.class<@MyClass()>'}}
@@ -913,7 +1127,7 @@ circuit Top:
 FIRRTL version 3.0.0
 
 circuit Top:
-  ; expected-error @below {{classes are a FIRRTL 3.3.0+ feature, but the specified FIRRTL version was 3.0.0}}
+  ; expected-error @below {{classes are a FIRRTL 4.2.0+ feature, but the specified FIRRTL version was 3.0.0}}
   class MyClass:
     skip
 
@@ -925,7 +1139,7 @@ FIRRTL version 3.0.0
 
 circuit Top:
   module Top:
-    ; expected-error @below {{object statements are a FIRRTL 3.3.0+ feature, but the specified FIRRTL version was 3.0.0}}
+    ; expected-error @below {{object statements are a FIRRTL 4.2.0+ feature, but the specified FIRRTL version was 3.0.0}}
     object x of MyClass
 
 ;// -----
@@ -933,7 +1147,7 @@ FIRRTL version 3.0.0
 
 circuit Top:
   module Top:
-    ; expected-error @below {{Inst types are a FIRRTL 3.3.0+ feature, but the specified FIRRTL version was 3.0.0}}
+    ; expected-error @below {{Inst types are a FIRRTL 4.2.0+ feature, but the specified FIRRTL version was 3.0.0}}
     output o: Inst<MyClass>
 
 ;// -----
@@ -941,38 +1155,38 @@ circuit Top:
 FIRRTL version 3.1.0
 circuit ListOfInt:
    module ListOfInt:
-     ; expected-error @below {{Lists are a FIRRTL 3.3.0+ feature}}
+     ; expected-error @below {{Lists are a FIRRTL 4.0.0+ feature}}
      output a : List<Integer>
 
 ;// -----
-FIRRTL version 3.3.0
+FIRRTL version 4.0.0
 circuit ListOfUInt:
-   module ListOfUInt:
+   public module ListOfUInt:
      ; expected-error @below {{expected property type}}
      output a : List<UInt>
 
 ;// -----
 ; Wrong type of elements in List expression.
-FIRRTL version 3.3.0
+FIRRTL version 4.0.0
 circuit ListOfUInt:
-   module ListOfUInt:
+   public module ListOfUInt:
      output a : List<String>
      ; expected-error @below {{unexpected expression of type '!firrtl.integer' in List expression of type '!firrtl.string'}}
      propassign a, List<String>(Integer(5))
 
 ;// -----
 ; List should not be leading a statement.
-FIRRTL version 3.3.0
+FIRRTL version 4.0.0
 circuit LeadingList:
-  module LeadingList:
+  public module LeadingList:
     ; expected-error @below {{unexpected List<>() as start of statement}}
     List<String>()
 
 ;// -----
 ; Path should not be leading a statement.
-FIRRTL version 3.3.0
+FIRRTL version 4.0.0
 circuit LeadingPath:
-  module LeadingPath:
+  public module LeadingPath:
     ; expected-error @below {{unexpected path() as start of statement}}
     path("")
 
@@ -980,33 +1194,33 @@ circuit LeadingPath:
 FIRRTL version 3.1.0
 circuit PathVersion:
   module PathVersion:
-    ; expected-error @below {{Paths are a FIRRTL 3.3.0+ feature, but the specified FIRRTL version was 3.1.0}}
+    ; expected-error @below {{Paths are a FIRRTL 4.2.0+ feature, but the specified FIRRTL version was 3.1.0}}
     output path : Path
     propassign path, path("")
 
 ;// -----
 ; Path operation should have a single string argument.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit BadPathExpr:
-  module BadPathExp:
+  public module BadPathExp:
     output path : Path
     ; expected-error @below {{expected target string in path expression}}
     propassign path, path()
 
 ;// -----
 ; Path operation should have a single string argument.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit BadPathExpr:
-  module BadPathExp:
+  public module BadPathExp:
     output path : Path
     ; expected-error @below {{expected ')' in path expression}}
     propassign path, path("hello", "goodbye")
 
 ;// -----
 ; Path operation should have a single string argument.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit BadPathExpr:
-  module BadPathExp:
+  public module BadPathExp:
     output path : Path
     ; expected-error @below {{expected target string in path expression}}
     propassign path, path(UInt<1>(1))
@@ -1017,27 +1231,27 @@ FIRRTL version 3.0.0
 
 circuit Top:
   module Top:
-    ; expected-error @below {{Bools are a FIRRTL 3.3.0+ feature, but the specified FIRRTL version was 3.0.0}}
+    ; expected-error @below {{Bools are a FIRRTL 4.2.0+ feature, but the specified FIRRTL version was 3.0.0}}
     input in : Bool
     output out : Bool
     propassign out, in
 
 ;// -----
 ; Bool literal must be true or false.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 
 circuit Top:
-  module Top:
+  public module Top:
     output out : Bool
     ; expected-error @below {{expected true or false in Bool expression}}
     propassign out, Bool(0)
 
 ;// -----
 ; Properties can't be const.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 
 circuit Top:
-  module Top:
+  public module Top:
     ; expected-error @below {{only hardware types can be 'const'}}
     output out : const Bool
 
@@ -1046,34 +1260,34 @@ circuit Top:
 FIRRTL version 3.1.0
 circuit AnyRef:
    module AnyRef:
-     ; expected-error @below {{AnyRef types are a FIRRTL 3.3.0+ feature}}
+     ; expected-error @below {{AnyRef types are a FIRRTL 4.2.0+ feature}}
      output a : AnyRef
 
 ;// -----
 ; Only objects are valid as AnyRef
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit AnyRef:
-  module AnyRef:
+  public module AnyRef:
     output out : AnyRef
     ; expected-error @below {{cannot propassign non-equivalent type '!firrtl.integer' to '!firrtl.anyref'}}
     propassign out, Integer(5)
 
 ;// -----
 ; Only objects are valid as AnyRef in Lists
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit AnyRefList:
-  module AnyRefList:
+  public module AnyRefList:
     output list : List<AnyRef>
     ; expected-error @below {{unexpected expression of type '!firrtl.integer' in List expression of type '!firrtl.anyref'}}
     propassign list, List<AnyRef>(Integer(5))
 
 ;// -----
 ; Not Covariant.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit NotCovariant:
   class Class:
 
-  module NotCovariant:
+  public module NotCovariant:
     output list : List<AnyRef>
 
     object obj of Class
@@ -1082,11 +1296,11 @@ circuit NotCovariant:
 
 ;// -----
 ; Not Contravariant.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit NotContravariant:
   class Class:
 
-  module NotContravariant:
+  public module NotContravariant:
     output list : List<Inst<Class>>
 
     object obj of Class
@@ -1095,62 +1309,62 @@ circuit NotContravariant:
 
 ;// -----
 ; Double: must have digit before point.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit DoubleNegPeriod:
-  module DoubleNegPeriod:
+  public module DoubleNegPeriod:
     output d : Double
     ; expected-error @below {{unexpected character after sign}}
     propassign d, Double(-.5)
 
 ;// -----
 ; Double: must have digit after point.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit DoublePeriodEnd:
-  module DoublePeriodEnd:
+  public module DoublePeriodEnd:
     output d : Double
     ; expected-error @below {{expected floating point in Double expression}}
     propassign d, Double(0.)
 
 ;// -----
 ; Double: Not an integer.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit DoubleInteger:
-  module DoubleInteger:
+  public module DoubleInteger:
     output d : Double
     ; expected-error @below {{expected floating point in Double expression}}
     propassign d, Double(0)
 
 ;// -----
 ; Double: don't support NaN or inf.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit DoubleNaN:
-  module DoubleNaN:
+  public module DoubleNaN:
     output d : Double
     ; expected-error @below {{expected floating point in Double expression}}
     propassign d, Double(NaN)
 
 ;// -----
 ; Double: Don't support hex.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit DoubleHex:
-  module DoubleHex:
+  public module DoubleHex:
     output d : Double
     ; expected-error @below {{expected floating point in Double expression}}
     propassign d, Double(0x0)
 
 ;// -----
 ; Double: Don't suuport FIRRTL-y radix.
-FIRRTL version 3.3.0
+FIRRTL version 4.2.0
 circuit DoubleRadix:
-  module DoubleRadix:
+  public module DoubleRadix:
     output d : Double
     ; expected-error @below {{expected floating point in Double expression}}
     propassign d, Double(0hABC)
 
 ;// -----
-FIRRTL version 3.9.0
+FIRRTL version 3.2.0
 circuit PublicModuleUnsupported:
-  ; expected-error @below {{public modules are a FIRRTL 4.0.0+ feature}}
+  ; expected-error @below {{public modules are a FIRRTL 3.3.0+ feature}}
   public module PublicModuleUnsupported:
 
 ;// -----
@@ -1158,26 +1372,27 @@ FIRRTL version 4.0.0
 circuit PublicNonModule:
   ; expected-error @below {{only modules may be public}}
   public extmodule Foo:
-  module PublicNonModule:
+  public module PublicNonModule:
 
 ;// -----
+FIRRTL version 4.0.0
 circuit RWProbeExprOOB :
-  module RWProbeExprOOB :
+  public module RWProbeExprOOB :
     output p : RWProbe<UInt<1>>
     wire x : UInt<1>[2]
-    x is invalid
+    invalidate x
 
     ; expected-error @below {{out of range index '100' for vector type '!firrtl.vector<uint<1>, 2>'}}
     define p = rwprobe(x[100])
 
    input out_0 : SInt<8>[5]
-   out_0[4] <- out_0[5]
+   connect out_0[4], out_0[5]
 
 ;// -----
 
 FIRRTL version 3.9.0
 circuit Foo:
-  ; expected-error @below {{option groups/instance choices are a FIRRTL 4.0.0+ feature}}
+  ; expected-error @below {{option groups/instance choices are a FIRRTL 4.2.0+ feature}}
   option Platform:
     FPGA
     ASIC
@@ -1188,14 +1403,14 @@ FIRRTL version 3.9.0
 circuit Foo:
 
   module Foo:
-    ; expected-error @below {{option groups/instance choices are a FIRRTL 4.0.0+ feature}}
+    ; expected-error @below {{option groups/instance choices are a FIRRTL 4.2.0+ feature}}
     instchoice inst of DefaultTarget Platform :
       FPGA => FPGATarget
       ASIC => ASICTarget
 
 ;// -----
 
-FIRRTL version 4.0.0
+FIRRTL version 4.2.0
 circuit Foo:
   option Platform:
     FPGA
@@ -1206,14 +1421,14 @@ circuit Foo:
   module FPGATarget:
     input clock: UInt<1>
 
-  module Foo:
+  public module Foo:
     ; expected-error @below {{instance case port 'clock' type does not match the default module port}}
     instchoice inst of DefaultTarget, Platform :
       FPGA => FPGATarget
 
 ;// -----
 
-FIRRTL version 4.0.0
+FIRRTL version 4.2.0
 circuit Foo:
   option Platform:
     FPGA
@@ -1224,14 +1439,14 @@ circuit Foo:
   module FPGATarget:
     input x: UInt<1>
 
-  module Foo:
+  public module Foo:
     ; expected-error @below {{instance case module port 'x' does not match the default module port 'clock'}}
     instchoice inst of DefaultTarget, Platform :
       FPGA => FPGATarget
 
 ;// -----
 
-FIRRTL version 4.0.0
+FIRRTL version 4.2.0
 circuit Foo:
   option Platform:
     FPGA
@@ -1239,26 +1454,26 @@ circuit Foo:
   module DefaultTarget:
   module FPGATarget:
 
-  module Foo:
+  public module Foo:
     ; expected-error @below {{use of undefined option case 'ASIC'}}
     instchoice inst of DefaultTarget, Platform :
       ASIC => FPGATarget
 
 ;// -----
 
-FIRRTL version 4.0.0
+FIRRTL version 4.2.0
 circuit Foo:
   module DefaultTarget:
   module FPGATarget:
 
-  module Foo:
+  public module Foo:
     ; expected-error @below {{use of undefined option group 'Platform'}}
     instchoice inst of DefaultTarget, Platform :
       ASIC => FPGATarget
 
 ;// -----
 
-FIRRTL version 4.0.0
+FIRRTL version 4.2.0
 circuit Foo:
   ; expected-error @below {{duplicate option case definition 'FPGA'}}
   option Platform:
@@ -1270,58 +1485,185 @@ FIRRTL version 3.1.0
 circuit Foo:
 
   module Foo:
-    ; expected-error @below {{colored probes are a FIRRTL 3.2.0+ feature, but the specified FIRRTL version was 3.1.0}}
+    ; expected-error @below {{colored probes are a FIRRTL 4.0.0+ feature, but the specified FIRRTL version was 3.1.0}}
     output a: Probe<UInt<1>, A>
 
 ;// -----
 FIRRTL version 4.0.0
 circuit Foo:
-  layer A bind:
-  module Foo:
+  layer A, bind:
+  public module Foo:
     output a: Probe<
     ; expected-error @below {{expected probe data type}}
 ;// -----
 FIRRTL version 4.0.0
 circuit Foo:
-  layer A bind:
-  module Foo:
+  layer A, bind:
+  public module Foo:
     ; expected-error @below {{expected '<' in reference type}}
     output a: Probe X
 
 ;// -----
 FIRRTL version 4.0.0
 circuit Foo:
-  layer A bind:
-  module Foo:
+  layer A, bind:
+  public module Foo:
     output a: Probe
     ; expected-error @below {{expected '<' in reference type}}
 ;// -----
 FIRRTL version 4.0.0
 circuit Foo:
-  layer A bind:
-  module Foo:
+  layer A, bind:
+  public module Foo:
     ; expected-error @below {{expected probe data type}}
     output a: Probe<>
 
 ;// -----
 FIRRTL version 4.0.0
 circuit Foo:
-  layer A bind:
-  module Foo:
+  layer A, bind:
+  public module Foo:
     ; expected-error @below {{expected '>' to end reference type}}
     output a: Probe<UInt<1>
 ;// -----
 FIRRTL version 4.0.0
 circuit Foo:
-  layer A bind:
-  module Foo:
+  layer A, bind:
+  public module Foo:
     ; expected-error @below {{expected '>' to end reference type}}
-    output a: Probe<UInt<1> A
+    output a: Probe<UInt<1>, A
 
 ;// -----
 FIRRTL version 4.0.0
 circuit Foo:
-  layer A bind:
-  module Foo:
+  layer A, bind:
+  public module Foo:
     ; expected-error @below {{expected layer name}}
-    output a: Probe<UInt<1> A.>
+    output a: Probe<UInt<1>, A.>
+
+;// -----
+FIRRTL version 4.0.0
+circuit UnknownWidthPublic:
+  public module UnknownWidthPublic:
+    ; expected-error @below {{public module port must have known width}}
+    output a: UInt
+
+;// -----
+FIRRTL version 4.0.0
+circuit UnknownWidthExt:
+  extmodule UnknownWidthExt:
+    ; expected-error @below {{extmodule port must have known width}}
+    output a: { x: UInt }
+
+;// -----
+FIRRTL version 4.0.0
+circuit AbstractResetPublic:
+  public module AbstractResetPublic:
+    ; expected-error @below {{public module port must have concrete reset type}}
+    input r: Reset
+
+;// -----
+FIRRTL version 4.0.0
+circuit PrivateMainModule:
+  ; expected-error @below {{private main modules were removed in FIRRTL 4.0.0}}
+  module PrivateMainModule:
+
+;// -----
+FIRRTL version 3.0.0
+circuit IntModuleNoIntrinsic:
+  intmodule test:
+  ; expected-error @below {{expected 'intrinsic'}}
+  module IntModule:
+
+;// -----
+FIRRTL version 3.0.0
+circuit IntModuleBadIntrinsic:
+  intmodule test:
+    ; expected-error @below {{expected intrinsic name}}
+    intrinsic = 0
+  module IntModule:
+
+;// -----
+FIRRTL version 4.0.0
+circuit GenericIntExprNoRet:
+  public module GenericIntExprNoRet:
+    ; expected-error @below {{expected ':' in intrinsic expression}}
+    node n = intrinsic(dummy)
+
+;// -----
+FIRRTL version 4.0.0
+circuit GenericIntNotPassive:
+  public module GenericIntNotPassive:
+    ; expected-error @below {{must be a passive base type}}
+    intrinsic(dummy : { flip x : UInt<1> })
+
+;// -----
+FIRRTL version 4.0.0
+circuit GenericIntBadId:
+  public module GenericIntBadId:
+    ; expected-error @below {{expected intrinsic identifier}}
+    intrinsic(5)
+
+;// -----
+FIRRTL version 4.0.0
+circuit GenericIntUntermStr:
+  public module GenericIntUntermStr:
+    ; expected-error @below {{unterminated string}}
+    intrinsic<key = "val
+      " ; end for syntax highlighting
+;// -----
+FIRRTL version 4.0.0
+circuit GenericIntParamRedef:
+  public module GenericIntParamRedef:
+    ; expected-error @below {{redefinition of parameter 'x'}}
+    intrinsic(dummy<x = 5, x = 3>)
+
+;// -----
+FIRRTL version 4.0.0
+circuit IntrinsicModule:
+  ; expected-error @below {{intrinsic modules were removed in FIRRTL 4.0.0}}
+  intmodule MyIntModule :
+    intrinsic = testIntrinsic1
+
+;// -----
+FIRRTL version 3.0.0
+circuit RegWith:
+  module RegWith:
+    input clock: Clock
+
+    ; expected-error @below {{'reg with' registers were removed in FIRRTL 3.0.0}}
+    reg r_0 : UInt<5>, clock with :
+      reset => (UInt<1>(0h0), r_0)
+
+;// -----
+FIRRTL version 3.0.0
+circuit IsInvalid:
+  module IsInvalid:
+    output a: UInt<1>
+
+    ; expected-error @below {{'is invalid' statements were removed in FIRRTL 3.0.0}}
+    a is invalid
+
+;// -----
+FIRRTL version 3.0.0
+circuit IsInvalid:
+  module IsInvalid:
+    input a: UInt<1>
+    output b: UInt<1>
+
+    ; expected-error @below {{'<=' connections were removed in FIRRTL 3.0.0}}
+    b <= a
+
+;// -----
+FIRRTL version 4.0.0
+circuit Foo:
+  ; expected-error @below {{inline layers are a FIRRTL 4.1.0+ feature}}
+  layer A, inline:
+  public module Foo:
+
+;// -----
+FIRRTL version 4.1.0
+circuit Top:
+  public module Top:
+    ; expected-error @below {{contracts are a FIRRTL 4.2.0+ feature}}
+    contract:

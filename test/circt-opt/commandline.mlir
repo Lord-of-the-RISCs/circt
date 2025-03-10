@@ -5,6 +5,7 @@
 
 // DIALECT: Available Dialects:
 // DIALECT-SAME: affine
+// DIALECT-SAME: aig
 // DIALECT-SAME: arc
 // DIALECT-SAME: arith
 // DIALECT-SAME: builtin
@@ -20,8 +21,8 @@
 // DIALECT-SAME: handshake
 // DIALECT-SAME: hw
 // DIALECT-SAME: hwarith
-// DIALECT-SAME: ibis
 // DIALECT-SAME: interop
+// DIALECT-SAME: kanagawa
 // DIALECT-SAME: llhd
 // DIALECT-SAME: llvm
 // DIALECT-SAME: memref
@@ -31,6 +32,7 @@
 // DIALECT-SAME: pipeline
 // DIALECT-SAME: scf
 // DIALECT-SAME: seq
+// DIALECT-SAME: smt
 // DIALECT-SAME: ssp
 // DIALECT-SAME: sv
 // DIALECT-SAME: systemc

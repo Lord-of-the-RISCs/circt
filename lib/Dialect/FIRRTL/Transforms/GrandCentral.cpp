@@ -10,11 +10,12 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/NLATable.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
@@ -24,7 +25,7 @@
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/Debug.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DepthFirstIterator.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
@@ -32,6 +33,13 @@
 #include <variant>
 
 #define DEBUG_TYPE "gct"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_GRANDCENTRAL
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -45,16 +53,16 @@ namespace {
 // These are used to provide hard-errors if a user tries to use the YAML
 // infrastructure improperly.  We only implement conversion to YAML and not
 // conversion from YAML.  The LLVM YAML infrastructure doesn't provide the
-// ability to differentitate this and we don't need it for the purposes of
+// ability to differentiate this and we don't need it for the purposes of
 // Grand Central.
-static std::string noDefault(StringRef clazz) {
+[[maybe_unused]] static std::string noDefault(StringRef clazz) {
   return ("default '" + clazz +
           "' construction is an intentionally *NOT* implemented "
           "YAML feature (you should never be using this)")
       .str();
 }
 
-static std::string deNorm(StringRef clazz) {
+[[maybe_unused]] static std::string deNorm(StringRef clazz) {
   return ("conversion from YAML to a '" + clazz +
           "' is intentionally *NOT* implemented (you should not be "
           "converting from YAML to an interface)")
@@ -67,8 +75,8 @@ namespace yaml {
 
 /// Context information necessary for YAML generation.
 struct Context {
-  /// A symbol table consisting of _only_ the interfaces construted by the Grand
-  /// Central pass.  This is not a symbol table because we do not have an
+  /// A symbol table consisting of _only_ the interfaces constructed by the
+  /// Grand Central pass.  This is not a symbol table because we do not have an
   /// up-to-date symbol table that includes interfaces at the time the Grand
   /// Central pass finishes.  This structure is easier to build up and is only
   /// the information we need.
@@ -153,7 +161,7 @@ std::string static stripComment(StringRef str) {
 
 /// Conversion from a `DescribedSignal` to YAML.  This is
 /// implemented using YAML normalization to first convert this to an internal
-/// `Field` structure which has a one-to-one mapping to the YAML represntation.
+/// `Field` structure which has a one-to-one mapping to the YAML representation.
 template <>
 struct MappingContextTraits<DescribedSignal, Context> {
   /// A one-to-one representation with a YAML representation of a signal/field.
@@ -191,7 +199,7 @@ struct MappingContextTraits<DescribedSignal, Context> {
       //     dimensions: [ 3, 2, 1 ]
       //     width: 8
       //
-      // Note that the above is equivalenet to the following Verilog
+      // Note that the above is equivalent to the following Verilog
       // specification.
       //
       //     wire [7:0] foo [2:0][1:0][0:0]
@@ -200,7 +208,7 @@ struct MappingContextTraits<DescribedSignal, Context> {
       // the underlying type.  The dimensions need to be reversed as this
       // unwrapping happens in reverse order of the final representation.
       auto tpe = op.signal.getType();
-      while (auto vector = tpe.dyn_cast<hw::UnpackedArrayType>()) {
+      while (auto vector = dyn_cast<hw::UnpackedArrayType>(tpe)) {
         dimensions.push_back(vector.getNumElements());
         tpe = vector.getElementType();
       }
@@ -216,7 +224,7 @@ struct MappingContextTraits<DescribedSignal, Context> {
     /// A no-argument constructor is necessary to work with LLVM's YAML library.
     Field(IO &io) { llvm_unreachable(noDefault("Field").c_str()); }
 
-    /// This cannot be denomralized back to an interface op.
+    /// This cannot be denormalized back to an interface op.
     DescribedSignal denormalize(IO &) {
       llvm_unreachable(deNorm("DescribedSignal").c_str());
     }
@@ -245,7 +253,7 @@ struct MappingContextTraits<DescribedInstance, Context> {
     /// An optional textual description of the interface.
     std::optional<std::string> description = std::nullopt;
 
-    /// An array describing the dimnensionality of the interface.
+    /// An array describing the dimensionality of the interface.
     SmallVector<int64_t, 2> dimensions;
 
     /// The underlying interface.
@@ -338,7 +346,7 @@ struct MappingContextTraits<sv::InterfaceOp, Context> {
               auto tpe = op->getAttrOfType<StringAttr>(
                   "firrtl.grandcentral.yaml.type");
 
-              // This is a descripton.  Update the mutable description and
+              // This is a description.  Update the mutable description and
               // continue;
               if (tpe.getValue() == "description") {
                 description = op.getFormatStringAttr();
@@ -374,7 +382,7 @@ struct MappingContextTraits<sv::InterfaceOp, Context> {
     /// A no-argument constructor is necessary to work with LLVM's YAML library.
     Interface(IO &io) { llvm_unreachable(noDefault("Interface").c_str()); }
 
-    /// This cannot be denomralized back to an interface op.
+    /// This cannot be denormalized back to an interface op.
     sv::InterfaceOp denormalize(IO &) {
       llvm_unreachable(deNorm("sv::InterfaceOp").c_str());
     }
@@ -481,14 +489,13 @@ private:
 
 /// A wrapper around a string that is used to encode a type which cannot be
 /// represented by an mlir::Type for some reason.  This is currently used to
-/// represent either an interface, a n-dimensional vector of interfaces, or a
-/// tombstone for an actually unsupported type (e.g., an AugmentedBooleanType).
+/// represent either an interface or an n-dimensional vector of interfaces.
 struct VerbatimType {
   /// The textual representation of the type.
   std::string str;
 
-  /// True if this is a type which must be "instatiated" and requires a trailing
-  /// "()".
+  /// True if this is a type which must be "instantiated" and requires a
+  /// trailing "()".
   bool instantiation;
 
   /// A vector storing the width of each dimension of the type.
@@ -513,7 +520,7 @@ struct VerbatimType {
 
 /// A sum type representing either a type encoded as a string (VerbatimType)
 /// or an actual mlir::Type.
-typedef std::variant<VerbatimType, Type> TypeSum;
+using TypeSum = std::variant<VerbatimType, Type>;
 
 /// Stores the information content of an ExtractGrandCentralAnnotation.
 struct ExtractionInfo {
@@ -582,16 +589,14 @@ struct InterfaceElemsBuilder {
 /// 3. The circuit-level Grand Central annotation is walked to both generate and
 ///    instantiate interfaces and to generate the "mappings" file that produces
 ///    cross-module references (XMRs) to drive the interface.
-struct GrandCentralPass : public GrandCentralBase<GrandCentralPass> {
+struct GrandCentralPass
+    : public circt::firrtl::impl::GrandCentralBase<GrandCentralPass> {
   using GrandCentralBase::companionMode;
 
   void runOnOperation() override;
 
 private:
-  /// Optionally build an AugmentedType from an attribute.  Return none if the
-  /// attribute is not a dictionary or if it does not match any of the known
-  /// templates for AugmentedTypes.
-  std::optional<Attribute> fromAttr(Attribute attr);
+  //===- Annotation handling data -----------------------------------------===//
 
   /// Mapping of ID to leaf ground type and an optional non-local annotation
   /// associated with that ID.
@@ -600,32 +605,18 @@ private:
   /// Mapping of ID to companion module.
   DenseMap<Attribute, CompanionInfo> companionIDMap;
 
-  /// An optional prefix applied to all interfaces in the design.  This is set
-  /// based on a PrefixInterfacesAnnotation.
-  StringRef interfacePrefix;
-
   NLATable *nlaTable;
-
-  /// The design-under-test (DUT) as determined by the presence of a
-  /// "sifive.enterprise.firrtl.MarkDUTAnnotation".  This will be null if no DUT
-  /// was found.
-  FModuleOp dut;
 
   /// An optional directory for testbench-related files.  This is null if no
   /// "TestBenchDirAnnotation" is found.
   StringAttr testbenchDir;
 
-  /// Return a string containing the name of an interface.  Apply correct
-  /// prefixing from the interfacePrefix and module-level prefix parameter.
-  std::string getInterfaceName(StringAttr prefix,
-                               AugmentedBundleTypeAttr bundleType) {
+  //===- Annotation handling functions ------------------------------------===//
 
-    if (prefix)
-      return (prefix.getValue() + interfacePrefix +
-              bundleType.getDefName().getValue())
-          .str();
-    return (interfacePrefix + bundleType.getDefName().getValue()).str();
-  }
+  /// Optionally build an AugmentedType from an attribute.  Return none if the
+  /// attribute is not a dictionary or if it does not match any of the known
+  /// templates for AugmentedTypes.
+  std::optional<Attribute> fromAttr(Attribute attr);
 
   /// Recursively examine an AugmentedType to populate the "mappings" file
   /// (generate XMRs) for this interface.  This does not build new interfaces.
@@ -635,10 +626,10 @@ private:
 
   /// Recursively examine an AugmentedType to both build new interfaces and
   /// populate a "mappings" file (generate XMRs) using `traverseField`.  Return
-  /// the type of the field exmained.
+  /// the type of the field examined.
   std::optional<TypeSum>
-  computeField(Attribute field, IntegerAttr id, StringAttr prefix,
-               VerbatimBuilder &path, SmallVector<VerbatimXMRbuilder> &xmrElems,
+  computeField(Attribute field, IntegerAttr id, VerbatimBuilder &path,
+               SmallVector<VerbatimXMRbuilder> &xmrElems,
                SmallVector<InterfaceElemsBuilder> &interfaceBuilder);
 
   /// Recursively examine an AugmentedBundleType to both build new interfaces
@@ -646,7 +637,7 @@ private:
   /// interface is invalid.
   std::optional<StringAttr>
   traverseBundle(AugmentedBundleTypeAttr bundle, IntegerAttr id,
-                 StringAttr prefix, VerbatimBuilder &path,
+                 VerbatimBuilder &path,
                  SmallVector<VerbatimXMRbuilder> &xmrElems,
                  SmallVector<InterfaceElemsBuilder> &interfaceBuilder);
 
@@ -654,7 +645,54 @@ private:
   igraph::ModuleOpInterface getEnclosingModule(Value value,
                                                FlatSymbolRefAttr sym = {});
 
-  /// Inforamtion about how the circuit should be extracted.  This will be
+  // Utility that acts like emitOpError, but does _not_ include a note.  The
+  // note in emitOpError includes the entire op which means the **ENTIRE**
+  // FIRRTL circuit.  This doesn't communicate anything useful to the user
+  // other than flooding their terminal.
+  InFlightDiagnostic emitCircuitError(StringRef message = {}) {
+    return emitError(getOperation().getLoc(), "'firrtl.circuit' op " + message);
+  }
+
+  //===- Intrinsic Handling Functions -------------------------------------===//
+
+  /// Optionally build an AugmentedType from an attribute.  Return none if the
+  /// attribute is not a dictionary or if it does not match any of the known
+  /// templates for AugmentedTypes.
+  std::optional<Attribute> fromViewAttr(ViewIntrinsicOp view, Attribute attr);
+
+  /// Recursively examine an AugmentedType to populate the "mappings" file
+  /// (generate XMRs) for this interface.  This does not build new interfaces.
+  bool traverseViewField(Attribute field, VerbatimBuilder &path,
+                         SmallVector<VerbatimXMRbuilder> &xmrElems,
+                         SmallVector<InterfaceElemsBuilder> &interfaceBuilder,
+                         ViewIntrinsicOp view, size_t &idx);
+
+  /// Recursively examine an AugmentedType to both build new interfaces and
+  /// populate a "mappings" file (generate XMRs) using `traverseField`.  Return
+  /// the type of the field examined.
+  std::optional<TypeSum>
+  computeViewField(Attribute field, VerbatimBuilder &path,
+                   SmallVector<VerbatimXMRbuilder> &xmrElems,
+                   SmallVector<InterfaceElemsBuilder> &interfaceBuilder,
+                   ViewIntrinsicOp view, size_t &idx);
+
+  /// Recursively examine an AugmentedBundleType to both build new interfaces
+  /// and populate a "mappings" file (generate XMRs).  Return none if the
+  /// interface is invalid.
+  std::optional<StringAttr>
+  traverseViewBundle(AugmentedBundleTypeAttr bundle, VerbatimBuilder &path,
+                     SmallVector<VerbatimXMRbuilder> &xmrElems,
+                     SmallVector<InterfaceElemsBuilder> &interfaceBuilder,
+                     ViewIntrinsicOp view, size_t &idx);
+
+  //===- Common helpers and state -----------------------------------------===//
+
+  /// Return a string containing the name of an interface.
+  std::string getInterfaceName(AugmentedBundleTypeAttr bundleType) {
+    return (bundleType.getDefName().getValue()).str();
+  }
+
+  /// Information about how the circuit should be extracted.  This will be
   /// non-empty if an extraction annotation is found.
   std::optional<ExtractionInfo> maybeExtractInfo = std::nullopt;
 
@@ -674,10 +712,15 @@ private:
   ///
   /// TODO: Investigate a way to not use a pointer here like how `getNamespace`
   /// works below.
+  /// Only used for annotation handling / companions.
   InstancePathCache *instancePaths = nullptr;
 
+  /// An instance info analysis that is used to query if modules are in the
+  /// design or not.
+  InstanceInfo *instanceInfo = nullptr;
+
   /// The namespace associated with the circuit.  This is lazily constructed
-  /// using `getNamesapce`.
+  /// using `getNamespace`.
   std::optional<CircuitNamespace> circuitNamespace;
 
   /// The module namespaces. These are lazily constructed by
@@ -709,14 +752,6 @@ private:
     return **symbolTable;
   }
 
-  // Utility that acts like emitOpError, but does _not_ include a note.  The
-  // note in emitOpError includes the entire op which means the **ENTIRE**
-  // FIRRTL circuit.  This doesn't communicate anything useful to the user
-  // other than flooding their terminal.
-  InFlightDiagnostic emitCircuitError(StringRef message = {}) {
-    return emitError(getOperation().getLoc(), "'firrtl.circuit' op " + message);
-  }
-
   // Insert comment delimiters ("// ") after newlines in the description string.
   // This is necessary to prevent introducing invalid verbatim Verilog.
   //
@@ -738,7 +773,8 @@ private:
   DenseMap<Attribute, sv::InterfaceOp> interfaceMap;
 
   /// Emit the hierarchy yaml file.
-  void emitHierarchyYamlFile(SmallVectorImpl<sv::InterfaceOp> &intfs);
+  void emitHierarchyYamlFile(StringRef yamlPath,
+                             SmallVectorImpl<sv::InterfaceOp> &intfs);
 };
 
 } // namespace
@@ -754,8 +790,8 @@ private:
 ///   2) Scattered annotations for how components bind to interfaces
 static std::optional<DictionaryAttr>
 parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
-                   DictionaryAttr root, StringRef companion, StringAttr name,
-                   StringAttr defName, std::optional<IntegerAttr> id,
+                   DictionaryAttr root, StringAttr name, StringAttr defName,
+                   std::optional<IntegerAttr> id,
                    std::optional<StringAttr> description, Twine clazz,
                    StringAttr companionAttr, Twine path = {}) {
 
@@ -765,7 +801,7 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
   /// Optionally unpack a ReferenceTarget encoded as a DictionaryAttr.  Return
   /// either a pair containing the Target string (up to the reference) and an
   /// array of components or none if the input is malformed.  The input
-  /// DicionaryAttr encoding is a JSON object of a serialized ReferenceTarget
+  /// DictionaryAttr encoding is a JSON object of a serialized ReferenceTarget
   /// Scala class.  By example, this is converting:
   ///   ~Foo|Foo>a.b[0]
   /// To:
@@ -867,6 +903,8 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
 
     auto refAttr =
         tryGetAs<StringAttr>(refTarget, refTarget, "ref", loc, clazz, path);
+    if (!refAttr)
+      return {};
 
     return (Twine("~" + circuitAttr.getValue() + "|" + moduleAttr.getValue() +
                   strpath + ">" + refAttr.getValue()) +
@@ -901,7 +939,7 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
     // Each element is an AugmentedField with members:
     //   "name": String
     //   "description": Option[String]
-    //   "tpe": AugmenetedType
+    //   "tpe": AugmentedType
     SmallVector<Attribute> elements;
     auto elementsAttr =
         tryGetAs<ArrayAttr>(augmentedType, root, "elements", loc, clazz, path);
@@ -923,13 +961,15 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
       auto name = tryGetAs<StringAttr>(field, root, "name", loc, clazz, ePath);
       auto tpe =
           tryGetAs<DictionaryAttr>(field, root, "tpe", loc, clazz, ePath);
+      if (!name || !tpe)
+        return std::nullopt;
       std::optional<StringAttr> description;
       if (auto maybeDescription = field.get("description"))
         description = cast<StringAttr>(maybeDescription);
       auto eltAttr = parseAugmentedType(
-          state, tpe, root, companion, name, defName, std::nullopt, description,
-          clazz, companionAttr, path + "_" + name.getValue());
-      if (!name || !tpe || !eltAttr)
+          state, tpe, root, name, defName, std::nullopt, description, clazz,
+          companionAttr, path + "_" + name.getValue());
+      if (!eltAttr)
         return std::nullopt;
 
       // Collect information necessary to build a module with this view later.
@@ -938,7 +978,12 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
       if (auto maybeDescription = field.get("description"))
         attrs.append("description", cast<StringAttr>(maybeDescription));
       attrs.append("name", name);
-      attrs.append("tpe", tpe.getAs<StringAttr>("class"));
+      auto tpeClass = tpe.getAs<StringAttr>("class");
+      if (!tpeClass) {
+        mlir::emitError(loc, "missing 'class' key in") << tpe;
+        return std::nullopt;
+      }
+      attrs.append("tpe", tpeClass);
       elements.push_back(*eltAttr);
     }
     // Add an annotation that stores information necessary to construct the
@@ -963,7 +1008,12 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
   // either be an actual FIRRTL ground type or a GrandCentral uninferred type.
   // This can be ignored for us.
   if (classBase == "GroundType") {
-    auto maybeTarget = refToTarget(augmentedType.getAs<DictionaryAttr>("ref"));
+    auto augRef = augmentedType.getAs<DictionaryAttr>("ref");
+    if (!augRef) {
+      mlir::emitError(loc, "missing 'ref' key in ") << augmentedType;
+      return std::nullopt;
+    }
+    auto maybeTarget = refToTarget(augRef);
     if (!maybeTarget) {
       mlir::emitError(loc, "Failed to parse ReferenceTarget").attachNote()
           << "See the full Annotation here: " << root;
@@ -1069,7 +1119,13 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
                                     state.symTbl, state.targetCaches)
                             ->ref.getOp());
     builder.setInsertionPointToEnd(companionMod.getBodyBlock());
-    auto sink = builder.create<WireOp>(source->getType(), name);
+    // Sink type must be passive.  It's required to be converted to a NodeOp by
+    // the wiring problem solving, and later checked to be a Node.
+    // This also ensures passive sink so works equally well w/ or w/o probes.
+    auto sinkType = source->getType();
+    if (auto baseSinkType = type_dyn_cast<FIRRTLBaseType>(sinkType))
+      sinkType = baseSinkType.getPassiveType();
+    auto sink = builder.create<WireOp>(sinkType, name);
     state.targetCaches.insertOp(sink);
     AnnotationSet annotations(context);
     annotations.addAnnotations(
@@ -1094,10 +1150,10 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
       return std::nullopt;
     SmallVector<Attribute> elements;
     for (auto [i, elt] : llvm::enumerate(elementsAttr)) {
-      auto eltAttr = parseAugmentedType(
-          state, cast<DictionaryAttr>(elt), root, companion, name,
-          StringAttr::get(context, ""), id, std::nullopt, clazz, companionAttr,
-          path + "_" + Twine(i));
+      auto eltAttr =
+          parseAugmentedType(state, cast<DictionaryAttr>(elt), root, name,
+                             StringAttr::get(context, ""), id, std::nullopt,
+                             clazz, companionAttr, path + "_" + Twine(i));
       if (!eltAttr)
         return std::nullopt;
       elements.push_back(*eltAttr);
@@ -1108,28 +1164,6 @@ parseAugmentedType(ApplyState &state, DictionaryAttr augmentedType,
       attrs.append("description", *description);
     attrs.append("elements", ArrayAttr::get(context, elements));
     attrs.append("name", name);
-    return DictionaryAttr::getWithSorted(context, attrs);
-  }
-
-  // Any of the following are known and expected, but are legacy AugmentedTypes
-  // do not have a target:
-  //   - AugmentedStringType
-  //   - AugmentedBooleanType
-  //   - AugmentedIntegerType
-  //   - AugmentedDoubleType
-  bool isIgnorable =
-      llvm::StringSwitch<bool>(classBase)
-          .Cases("StringType", "BooleanType", "IntegerType", "DoubleType", true)
-          .Default(false);
-  if (isIgnorable) {
-    NamedAttrList attrs;
-    attrs.append("class", classAttr);
-    attrs.append("name", name);
-    auto value =
-        tryGetAs<Attribute>(augmentedType, root, "value", loc, clazz, path);
-    if (!value)
-      return std::nullopt;
-    attrs.append("value", value);
     return DictionaryAttr::getWithSorted(context, attrs);
   }
 
@@ -1168,8 +1202,8 @@ LogicalResult circt::firrtl::applyGCTView(const AnnoPathValue &target,
   state.addToWorklistFn(DictionaryAttr::get(context, companionAttrs));
 
   auto prunedAttr =
-      parseAugmentedType(state, viewAttr, anno, companionAttr.getValue(), name,
-                         {}, id, {}, viewAnnoClass, companionAttr, Twine(name));
+      parseAugmentedType(state, viewAttr, anno, name, {}, id, {}, viewAnnoClass,
+                         companionAttr, Twine(name));
   if (!prunedAttr)
     return failure();
 
@@ -1227,26 +1261,60 @@ std::optional<Attribute> GrandCentralPass::fromAttr(Attribute attr) {
                          << "' that does not have a scattered leaf to connect "
                             "to in the circuit "
                             "(was the leaf deleted or constant prop'd away?)";
-  } else if (classBase == "StringType") {
-    if (auto name = dict.getAs<StringAttr>("name"))
-      return AugmentedStringTypeAttr::get(&getContext(), dict);
-  } else if (classBase == "BooleanType") {
-    if (auto name = dict.getAs<StringAttr>("name"))
-      return AugmentedBooleanTypeAttr::get(&getContext(), dict);
-  } else if (classBase == "IntegerType") {
-    if (auto name = dict.getAs<StringAttr>("name"))
-      return AugmentedIntegerTypeAttr::get(&getContext(), dict);
-  } else if (classBase == "DoubleType") {
-    if (auto name = dict.getAs<StringAttr>("name"))
-      return AugmentedDoubleTypeAttr::get(&getContext(), dict);
-  } else if (classBase == "LiteralType") {
-    if (auto name = dict.getAs<StringAttr>("name"))
-      return AugmentedLiteralTypeAttr::get(&getContext(), dict);
-  } else if (classBase == "DeletedType") {
-    if (auto name = dict.getAs<StringAttr>("name"))
-      return AugmentedDeletedTypeAttr::get(&getContext(), dict);
   } else {
     emitCircuitError() << "has an invalid AugmentedType";
+  }
+  return std::nullopt;
+}
+
+std::optional<Attribute> GrandCentralPass::fromViewAttr(ViewIntrinsicOp view,
+                                                        Attribute attr) {
+  auto dict = dyn_cast<DictionaryAttr>(attr);
+  if (!dict) {
+    view.emitError() << "attribute is not a dictionary: " << attr;
+    return std::nullopt;
+  }
+
+  auto clazz = dict.getAs<StringAttr>("class");
+  if (!clazz) {
+    view.emitError() << "missing 'class' key in " << dict;
+    return std::nullopt;
+  }
+
+  auto classBase = clazz.getValue();
+  if (!classBase.consume_front("sifive.enterprise.grandcentral.Augmented"))
+    view.emitOpError() << "has an invalid AugmentedType class '" << classBase
+                       << "'";
+  else if (classBase == "BundleType") {
+    if (dict.getAs<StringAttr>("defName") && dict.getAs<ArrayAttr>("elements"))
+      return AugmentedBundleTypeAttr::get(&getContext(), dict);
+    view.emitError() << "has an invalid AugmentedBundleType that does not "
+                        "contain 'defName' and 'elements' fields: "
+                     << dict;
+  } else if (classBase == "VectorType") {
+    if (dict.getAs<StringAttr>("name") && dict.getAs<ArrayAttr>("elements"))
+      return AugmentedVectorTypeAttr::get(&getContext(), dict);
+    view.emitError() << "has an invalid AugmentedVectorType that does not "
+                        "contain 'name' and 'elements' fields: "
+                     << dict;
+  } else if (classBase == "GroundType") {
+    auto id = dict.getAs<IntegerAttr>("id");
+    if (id) {
+      (
+          view.emitOpError()
+          << "has 'id' field which is only for old annotation encoding")
+              .attachNote()
+          << "id within GroundType attribute: " << dict;
+      return std::nullopt;
+    }
+    auto name = dict.getAs<StringAttr>("name");
+    if (name)
+      return AugmentedGroundTypeAttr::get(&getContext(), dict);
+    view.emitError() << "has an invalid AugmentedGroundType that does not "
+                        "contain 'name' field:  "
+                     << dict;
+  } else {
+    view.emitOpError() << "has an invalid AugmentedType '" << classBase << "'";
   }
   return std::nullopt;
 }
@@ -1343,7 +1411,7 @@ bool GrandCentralPass::traverseField(
           return StringAttr::get(&getContext(), "assign " + replStr + ";");
         };
 
-        // This is the new style of XMRs using RefTypes.  The value subsitution
+        // This is the new style of XMRs using RefTypes.  The value substitution
         // index is set to -1, as it will be incremented when generating the
         // string.
         // Generate the path from the LCA to the module that contains the leaf.
@@ -1384,24 +1452,116 @@ bool GrandCentralPass::traverseField(
 
         return anyFailed;
       })
-      .Case<AugmentedStringTypeAttr>([&](auto a) { return false; })
-      .Case<AugmentedBooleanTypeAttr>([&](auto a) { return false; })
-      .Case<AugmentedIntegerTypeAttr>([&](auto a) { return false; })
-      .Case<AugmentedDoubleTypeAttr>([&](auto a) { return false; })
-      .Case<AugmentedLiteralTypeAttr>([&](auto a) { return false; })
-      .Case<AugmentedDeletedTypeAttr>([&](auto a) { return false; })
+      .Default([](auto a) { return true; });
+}
+
+bool GrandCentralPass::traverseViewField(
+    Attribute field, VerbatimBuilder &path,
+    SmallVector<VerbatimXMRbuilder> &xmrElems,
+    SmallVector<InterfaceElemsBuilder> &interfaceBuilder, ViewIntrinsicOp view,
+    size_t &idx) {
+  return TypeSwitch<Attribute, bool>(field)
+      .Case<AugmentedGroundTypeAttr>([&](AugmentedGroundTypeAttr ground) {
+        // Grab next signal, increment index counter.
+        auto index = idx++;
+        if (index >= view.getNumOperands()) {
+          view.emitOpError("more ground types needed (")
+              << idx << " so far) than view has operands ("
+              << view.getNumOperands() << ")";
+          return false;
+        }
+
+        auto val = view.getOperand(index);
+        auto tpe = type_cast<FIRRTLBaseType>(val.getType());
+
+        // If the type is zero-width then do not emit an XMR.
+        if (!tpe.getBitWidthOrSentinel())
+          return true;
+
+        /// Increment all the indices inside `{{`, `}}` by one. This is to
+        /// indicate that a value is added to the `substitutions` of the
+        /// verbatim op, other than the symbols.
+        auto getStrAndIncrementIds = [&](StringRef base) -> StringAttr {
+          SmallString<128> replStr;
+          StringRef begin = "{{";
+          StringRef end = "}}";
+          // The replacement string.
+          size_t from = 0;
+          while (from < base.size()) {
+            // Search for the first `{{` and `}}`.
+            size_t beginAt = base.find(begin, from);
+            size_t endAt = base.find(end, from);
+            // If not found, then done.
+            if (beginAt == StringRef::npos || endAt == StringRef::npos ||
+                (beginAt > endAt)) {
+              replStr.append(base.substr(from));
+              break;
+            }
+            // Copy the string as is, until the `{{`.
+            replStr.append(base.substr(from, beginAt - from));
+            // Advance `from` to the character after the `}}`.
+            from = endAt + 2;
+            auto idChar = base.substr(beginAt + 2, endAt - beginAt - 2);
+            int idNum;
+            bool failed = idChar.getAsInteger(10, idNum);
+            (void)failed;
+            assert(!failed && "failed to parse integer from verbatim string");
+            // Now increment the id and append.
+            replStr.append("{{");
+            Twine(idNum + 1).toVector(replStr);
+            replStr.append("}}");
+          }
+          return StringAttr::get(&getContext(), "assign " + replStr + ";");
+        };
+
+        // This is the new style of XMRs using RefTypes.  The value substitution
+        // index is set to -1, as it will be incremented when generating the
+        // string.
+        path += " = {{-1}}";
+
+        // Assemble the verbatim op.
+        auto mod = view->getParentOfType<FModuleOp>();
+        xmrElems.emplace_back(val, getStrAndIncrementIds(path.getString()),
+                              ArrayAttr::get(&getContext(), path.getSymbols()),
+                              mod);
+        return true;
+      })
+      .Case<AugmentedVectorTypeAttr>([&](auto vector) {
+        bool notFailed = true;
+        auto elements = vector.getElements();
+        for (size_t i = 0, e = elements.size(); i != e; ++i) {
+          auto field = fromViewAttr(view, elements[i]);
+          if (!field)
+            return false;
+          notFailed &= traverseViewField(
+              *field, path.snapshot().append("[" + Twine(i) + "]"), xmrElems,
+              interfaceBuilder, view, idx);
+        }
+        return notFailed;
+      })
+      .Case<AugmentedBundleTypeAttr>([&](AugmentedBundleTypeAttr bundle) {
+        bool anyFailed = true;
+        for (auto element : bundle.getElements()) {
+          auto field = fromViewAttr(view, element);
+          if (!field)
+            return false;
+          auto name = cast<DictionaryAttr>(element).getAs<StringAttr>("name");
+          if (!name)
+            name = cast<DictionaryAttr>(element).getAs<StringAttr>("defName");
+          anyFailed &= traverseViewField(
+              *field, path.snapshot().append("." + name.getValue()), xmrElems,
+              interfaceBuilder, view, idx);
+        }
+
+        return anyFailed;
+      })
       .Default([](auto a) { return true; });
 }
 
 std::optional<TypeSum> GrandCentralPass::computeField(
-    Attribute field, IntegerAttr id, StringAttr prefix, VerbatimBuilder &path,
+    Attribute field, IntegerAttr id, VerbatimBuilder &path,
     SmallVector<VerbatimXMRbuilder> &xmrElems,
     SmallVector<InterfaceElemsBuilder> &interfaceBuilder) {
-
-  auto unsupported = [&](StringRef name, StringRef kind) {
-    return VerbatimType({("// <unsupported " + kind + " type>").str(), false});
-  };
-
   return TypeSwitch<Attribute, std::optional<TypeSum>>(field)
       .Case<AugmentedGroundTypeAttr>(
           [&](AugmentedGroundTypeAttr ground) -> std::optional<TypeSum> {
@@ -1427,11 +1587,15 @@ std::optional<TypeSum> GrandCentralPass::computeField(
       .Case<AugmentedVectorTypeAttr>(
           [&](AugmentedVectorTypeAttr vector) -> std::optional<TypeSum> {
             auto elements = vector.getElements();
+            if (elements.empty())
+              llvm::report_fatal_error(
+                  "unexpected empty augmented vector in GrandCentral View");
             auto firstElement = fromAttr(elements[0]);
-            auto elementType =
-                computeField(*firstElement, id, prefix,
-                             path.snapshot().append("[" + Twine(0) + "]"),
-                             xmrElems, interfaceBuilder);
+            if (!firstElement)
+              return std::nullopt;
+            auto elementType = computeField(
+                *firstElement, id, path.snapshot().append("[" + Twine(0) + "]"),
+                xmrElems, interfaceBuilder);
             if (!elementType)
               return std::nullopt;
 
@@ -1453,29 +1617,78 @@ std::optional<TypeSum> GrandCentralPass::computeField(
           })
       .Case<AugmentedBundleTypeAttr>(
           [&](AugmentedBundleTypeAttr bundle) -> TypeSum {
-            auto ifaceName = traverseBundle(bundle, id, prefix, path, xmrElems,
-                                            interfaceBuilder);
+            auto ifaceName =
+                traverseBundle(bundle, id, path, xmrElems, interfaceBuilder);
             assert(ifaceName && *ifaceName);
             return VerbatimType({ifaceName->str(), true});
+          });
+}
+
+std::optional<TypeSum> GrandCentralPass::computeViewField(
+    Attribute field, VerbatimBuilder &path,
+    SmallVector<VerbatimXMRbuilder> &xmrElems,
+    SmallVector<InterfaceElemsBuilder> &interfaceBuilder, ViewIntrinsicOp view,
+    size_t &idx) {
+  return TypeSwitch<Attribute, std::optional<TypeSum>>(field)
+      .Case<AugmentedGroundTypeAttr>(
+          [&](AugmentedGroundTypeAttr ground) -> std::optional<TypeSum> {
+            // Traverse to generate mappings.
+            auto index = idx;
+            if (!traverseViewField(field, path, xmrElems, interfaceBuilder,
+                                   view, idx))
+              return std::nullopt;
+
+            auto val = view.getOperand(index);
+            auto tpe = dyn_cast<FIRRTLBaseType>(val.getType());
+            if (!tpe || !tpe.isGround()) {
+              mlir::emitError(val.getLoc(), "cannot be added to interface, "
+                                            "because it is not a ground type")
+                  .attachNote(view.getLoc())
+                  .append("interface part of view");
+              return std::nullopt;
+            }
+
+            return TypeSum(
+                IntegerType::get(&getContext(), tpe.getBitWidthOrSentinel()));
           })
-      .Case<AugmentedStringTypeAttr>([&](auto field) -> TypeSum {
-        return unsupported(field.getName().getValue(), "string");
-      })
-      .Case<AugmentedBooleanTypeAttr>([&](auto field) -> TypeSum {
-        return unsupported(field.getName().getValue(), "boolean");
-      })
-      .Case<AugmentedIntegerTypeAttr>([&](auto field) -> TypeSum {
-        return unsupported(field.getName().getValue(), "integer");
-      })
-      .Case<AugmentedDoubleTypeAttr>([&](auto field) -> TypeSum {
-        return unsupported(field.getName().getValue(), "double");
-      })
-      .Case<AugmentedLiteralTypeAttr>([&](auto field) -> TypeSum {
-        return unsupported(field.getName().getValue(), "literal");
-      })
-      .Case<AugmentedDeletedTypeAttr>([&](auto field) -> TypeSum {
-        return unsupported(field.getName().getValue(), "deleted");
-      });
+      .Case<AugmentedVectorTypeAttr>(
+          [&](AugmentedVectorTypeAttr vector) -> std::optional<TypeSum> {
+            auto elements = vector.getElements();
+            if (elements.empty())
+              llvm::report_fatal_error(
+                  "unexpected empty augmented vector in GrandCentral View");
+            auto firstElement = fromViewAttr(view, elements[0]);
+            if (!firstElement)
+              return std::nullopt;
+            auto elementType = computeViewField(
+                *firstElement, path.snapshot().append("[" + Twine(0) + "]"),
+                xmrElems, interfaceBuilder, view, idx);
+            if (!elementType)
+              return std::nullopt;
+
+            for (size_t i = 1, e = elements.size(); i != e; ++i) {
+              auto subField = fromViewAttr(view, elements[i]);
+              if (!subField)
+                return std::nullopt;
+              (void)traverseViewField(
+                  *subField, path.snapshot().append("[" + Twine(i) + "]"),
+                  xmrElems, interfaceBuilder, view, idx);
+            }
+
+            if (auto *tpe = std::get_if<Type>(&*elementType))
+              return TypeSum(
+                  hw::UnpackedArrayType::get(*tpe, elements.getValue().size()));
+            auto str = std::get<VerbatimType>(*elementType);
+            str.dimensions.push_back(elements.getValue().size());
+            return TypeSum(str);
+          })
+      .Case<AugmentedBundleTypeAttr>(
+          [&](AugmentedBundleTypeAttr bundle) -> TypeSum {
+            auto ifaceName = traverseViewBundle(bundle, path, xmrElems,
+                                                interfaceBuilder, view, idx);
+            assert(ifaceName && *ifaceName);
+            return VerbatimType({ifaceName->str(), true});
+          });
 }
 
 /// Traverse an Annotation that is an AugmentedBundleType.  During traversal,
@@ -1485,13 +1698,13 @@ std::optional<TypeSum> GrandCentralPass::computeField(
 /// stringy-typed SystemVerilog hierarchical references to drive the
 /// interface. Returns false on any failure and true on success.
 std::optional<StringAttr> GrandCentralPass::traverseBundle(
-    AugmentedBundleTypeAttr bundle, IntegerAttr id, StringAttr prefix,
-    VerbatimBuilder &path, SmallVector<VerbatimXMRbuilder> &xmrElems,
+    AugmentedBundleTypeAttr bundle, IntegerAttr id, VerbatimBuilder &path,
+    SmallVector<VerbatimXMRbuilder> &xmrElems,
     SmallVector<InterfaceElemsBuilder> &interfaceBuilder) {
 
   unsigned lastIndex = interfaceBuilder.size();
   auto iFaceName = StringAttr::get(
-      &getContext(), getNamespace().newName(getInterfaceName(prefix, bundle)));
+      &getContext(), getNamespace().newName(getInterfaceName(bundle)));
   interfaceBuilder.emplace_back(iFaceName, id);
 
   for (auto element : bundle.getElements()) {
@@ -1510,8 +1723,67 @@ std::optional<StringAttr> GrandCentralPass::traverseBundle(
     // if the interface field requires renaming in the output (e.g. due to
     // naming conflicts).
     auto elementType = computeField(
-        *field, id, prefix, path.snapshot().append(".").append(name.getValue()),
+        *field, id, path.snapshot().append(".").append(name.getValue()),
         xmrElems, interfaceBuilder);
+    if (!elementType)
+      return std::nullopt;
+    StringAttr description =
+        cast<DictionaryAttr>(element).getAs<StringAttr>("description");
+    interfaceBuilder[lastIndex].elementsList.emplace_back(description, name,
+                                                          *elementType);
+  }
+  return iFaceName;
+}
+
+/// Traverse an attribute that is an AugmentedBundleType.  During traversal,
+/// construct any discovered SystemVerilog interfaces.  If this is the root
+/// interface, instantiate that interface in the companion. Recurse into fields
+/// of the AugmentedBundleType to construct nested interfaces and generate
+/// stringy-typed SystemVerilog hierarchical references to drive the
+/// interface. Returns false on any failure and true on success.
+std::optional<StringAttr> GrandCentralPass::traverseViewBundle(
+    AugmentedBundleTypeAttr bundle, VerbatimBuilder &path,
+    SmallVector<VerbatimXMRbuilder> &xmrElems,
+    SmallVector<InterfaceElemsBuilder> &interfaceBuilder, ViewIntrinsicOp view,
+    size_t &idx) {
+
+  // TODO: Require as part of attribute, structurally.
+  if (!bundle.getDefName()) {
+    view.emitOpError("missing 'defName' at top-level");
+    return std::nullopt;
+  }
+  if (!bundle.getElements()) {
+    view.emitOpError("missing 'elements' at top-level");
+    return std::nullopt;
+  }
+
+  unsigned lastIndex = interfaceBuilder.size();
+  auto iFaceName = StringAttr::get(
+      &getContext(), getNamespace().newName(getInterfaceName(bundle)));
+  interfaceBuilder.emplace_back(iFaceName, IntegerAttr() /* XXX */);
+
+  for (auto element : bundle.getElements()) {
+    auto field = fromViewAttr(view, element);
+    if (!field)
+      return std::nullopt;
+
+    auto name = cast<DictionaryAttr>(element).getAs<StringAttr>("name");
+    if (!name) {
+      view.emitError("missing 'name' field in element of bundle: ") << element;
+      return std::nullopt;
+    }
+    // auto signalSym = hw::InnerRefAttr::get(iface.sym_nameAttr(), name);
+    // TODO: The `append(name.getValue())` in the following should actually be
+    // `append(signalSym)`, but this requires that `computeField` and the
+    // functions it calls always return a type for which we can construct an
+    // `InterfaceSignalOp`. Since nested interface instances are currently
+    // busted (due to the interface being a symbol table), this doesn't work at
+    // the moment. Passing a `name` works most of the time, but can be brittle
+    // if the interface field requires renaming in the output (e.g. due to
+    // naming conflicts).
+    auto elementType = computeViewField(
+        *field, path.snapshot().append(".").append(name.getValue()), xmrElems,
+        interfaceBuilder, view, idx);
     if (!elementType)
       return std::nullopt;
     StringAttr description =
@@ -1543,7 +1815,7 @@ void GrandCentralPass::runOnOperation() {
 
   CircuitOp circuitOp = getOperation();
 
-  // Look at the circuit annotaitons to do two things:
+  // Look at the circuit annotations to do two things:
   //
   // 1. Determine extraction information (directory and filename).
   // 2. Populate a worklist of all annotations that encode interfaces.
@@ -1612,41 +1884,12 @@ void GrandCentralPass::runOnOperation() {
       ++numAnnosRemoved;
       return true;
     }
-    if (anno.isClass(prefixInterfacesAnnoClass)) {
-      if (!interfacePrefix.empty()) {
-        emitCircuitError("more than one 'PrefixInterfacesAnnotation' was "
-                         "found, but zero or one may be provided");
-        removalError = true;
-        return false;
-      }
-
-      auto prefix = anno.getMember<StringAttr>("prefix");
-      if (!prefix) {
-        emitCircuitError()
-            << "contained an invalid 'PrefixInterfacesAnnotation' that does "
-               "not contain a 'prefix' field: "
-            << anno.getDict();
-        removalError = true;
-        return false;
-      }
-
-      interfacePrefix = prefix.getValue();
-      ++numAnnosRemoved;
-      return true;
-    }
     if (anno.isClass(testBenchDirAnnoClass)) {
       testbenchDir = anno.getMember<StringAttr>("dirname");
       return false;
     }
     return false;
   });
-
-  // Find the DUT if it exists.  This needs to be known before the circuit is
-  // walked.
-  for (auto mod : circuitOp.getOps<FModuleOp>()) {
-    if (failed(extractDUT(mod, dut)))
-      removalError = true;
-  }
 
   if (removalError)
     return signalPassFailure();
@@ -1659,13 +1902,11 @@ void GrandCentralPass::runOnOperation() {
     else
       llvm::dbgs() << "  <none>\n";
     llvm::dbgs() << "DUT: ";
-    if (dut)
+    if (auto dut = instanceInfo->getDut())
       llvm::dbgs() << dut.getModuleName() << "\n";
     else
       llvm::dbgs() << "<none>\n";
     llvm::dbgs()
-        << "Prefix Info (from PrefixInterfacesAnnotation):\n"
-        << "  prefix: " << interfacePrefix << "\n"
         << "Hierarchy File Info (from GrandCentralHierarchyFileAnnotation):\n"
         << "  filename: ";
     if (maybeHierarchyFileYAML)
@@ -1675,12 +1916,22 @@ void GrandCentralPass::runOnOperation() {
     llvm::dbgs() << "\n";
   });
 
+  // per-YAML output list of interfaces.
+  llvm::SmallMapVector<StringAttr, SmallVector<sv::InterfaceOp, 0>, 1>
+      interfaceYAMLMap;
+  if (maybeHierarchyFileYAML.has_value())
+    interfaceYAMLMap[maybeHierarchyFileYAML.value()] = {};
+
+  // Scan entire design for View operations.
+  SmallVector<ViewIntrinsicOp> views;
+  circuitOp.walk([&views](ViewIntrinsicOp view) { views.push_back(view); });
+
   // Exit immediately if no annotations indicative of interfaces that need to be
   // built exist.  However, still generate the YAML file if the annotation for
   // this was passed in because some flows expect this.
-  if (worklist.empty()) {
-    SmallVector<sv::InterfaceOp, 0> interfaceVec;
-    emitHierarchyYamlFile(interfaceVec);
+  if (worklist.empty() && views.empty()) {
+    for (auto &[yamlPath, intfs] : interfaceYAMLMap)
+      emitHierarchyYamlFile(yamlPath.getValue(), intfs);
     return markAllAnalysesPreserved();
   }
 
@@ -1706,33 +1957,10 @@ void GrandCentralPass::runOnOperation() {
     return id;
   };
 
-  /// TODO: Handle this differently to allow construction of an optionsl
+  /// TODO: Handle this differently to allow construction of an options
   auto instancePathCache = InstancePathCache(getAnalysis<InstanceGraph>());
   instancePaths = &instancePathCache;
-
-  /// Contains the set of modules which are instantiated by the DUT, but not a
-  /// companion or instantiated by a companion.  If no DUT exists, treat the top
-  /// module as if it were the DUT.  This works by doing a depth-first walk of
-  /// the instance graph, starting from the "effective" DUT and stopping the
-  /// search at any modules which are known companions.
-  DenseSet<igraph::ModuleOpInterface> dutModules;
-  FModuleOp effectiveDUT = dut;
-  if (!effectiveDUT)
-    effectiveDUT = cast<FModuleOp>(
-        *instancePaths->instanceGraph.getTopLevelNode()->getModule());
-  auto dfRange =
-      llvm::depth_first(instancePaths->instanceGraph.lookup(effectiveDUT));
-  for (auto i = dfRange.begin(), e = dfRange.end(); i != e;) {
-    auto module = cast<FModuleLike>(*i->getModule());
-    if (AnnotationSet(module).hasAnnotation(companionAnnoClass)) {
-      i.skipChildren();
-      continue;
-    }
-    dutModules.insert(i->getModule<igraph::ModuleOpInterface>());
-    // Manually increment the iterator to avoid walking off the end from
-    // skipChildren.
-    ++i;
-  }
+  instanceInfo = &getAnalysis<InstanceInfo>();
 
   // Maybe return the lone instance of a module.  Generate errors on the op if
   // the module is not instantiated or is multiply instantiated.
@@ -1765,7 +1993,6 @@ void GrandCentralPass::runOnOperation() {
   /// (2) the leafMap.  Annotations are removed as they are discovered and if
   /// they are not malformed.
   DenseSet<Operation *> modulesToDelete;
-  removalError = false;
   circuitOp.walk([&](Operation *op) {
     TypeSwitch<Operation *>(op)
         .Case<RegOp, RegResetOp, WireOp, NodeOp>([&](auto op) {
@@ -1863,8 +2090,8 @@ void GrandCentralPass::runOnOperation() {
             // If this is a companion, then:
             //   1. Insert it into the companion map
             //   2. Create a new mapping module.
-            //   3. Instatiate the mapping module in the companion.
-            //   4. Check that the companion is instantated exactly once.
+            //   3. Instantiate the mapping module in the companion.
+            //   4. Check that the companion is instantiated exactly once.
             //   5. Set attributes on that lone instance so it will become a
             //      bind if extraction information was provided.  If a DUT is
             //      known, then anything in the test harness will not be
@@ -1885,7 +2112,7 @@ void GrandCentralPass::runOnOperation() {
                   continue;
                 // Do not allow any outputs in the drop mode.
                 auto ty = result.getType();
-                if (ty.isa<RefType>() && companionMode != CompanionMode::Drop)
+                if (isa<RefType>(ty) && companionMode != CompanionMode::Drop)
                   continue;
                 op.emitOpError()
                     << "companion instance cannot have output ports";
@@ -1901,7 +2128,7 @@ void GrandCentralPass::runOnOperation() {
 
               // If the companion is instantiated above the DUT, then don't
               // extract it.
-              if (dut && !instancePaths->instanceGraph.isAncestor(op, dut)) {
+              if (!instanceInfo->allInstancesUnderEffectiveDut(op)) {
                 ++numAnnosRemoved;
                 return true;
               }
@@ -1950,12 +2177,12 @@ void GrandCentralPass::runOnOperation() {
                 // Check to see if we should change the output directory of a
                 // module.  Only update in the following conditions:
                 //   1) The module is the companion.
-                //   2) The module is NOT instantiated by the effective DUT.
+                //   2) The module is NOT instantiated by the effective DUT or
+                //      is under a bind.
                 auto *modNode = instancePaths->instanceGraph.lookup(mod);
-                SmallVector<InstanceRecord *> instances(modNode->uses());
                 if (modNode != companionNode &&
-                    dutModules.count(
-                        modNode->getModule<igraph::ModuleOpInterface>()))
+                    instanceInfo->anyInstanceInEffectiveDesign(
+                        modNode->getModule()))
                   continue;
 
                 LLVM_DEBUG({
@@ -2034,8 +2261,8 @@ void GrandCentralPass::runOnOperation() {
       mod->erase();
     }
 
-    SmallVector<sv::InterfaceOp, 0> interfaceVec;
-    emitHierarchyYamlFile(interfaceVec);
+    for (auto &[yamlPath, intfs] : interfaceYAMLMap)
+      emitHierarchyYamlFile(yamlPath.getValue(), intfs);
     return;
   }
 
@@ -2076,9 +2303,7 @@ void GrandCentralPass::runOnOperation() {
         llvm::dbgs() << "\n";
       } else {
         llvm::dbgs() << "  - " << id.getValue() << ": "
-                     << value.getDefiningOp()
-                            ->getAttr("name")
-                            .cast<StringAttr>()
+                     << cast<StringAttr>(value.getDefiningOp()->getAttr("name"))
                             .getValue();
         if (fieldID)
           llvm::dbgs() << ", fieldID=" << fieldID;
@@ -2093,7 +2318,6 @@ void GrandCentralPass::runOnOperation() {
   // will use XMRs to drive the interface.  If extraction info is available,
   // then the top-level instantiate interface will be marked for extraction via
   // a SystemVerilog bind.
-  SmallVector<sv::InterfaceOp, 2> interfaceVec;
   SmallDenseMap<FModuleLike, SmallVector<InterfaceElemsBuilder>>
       companionToInterfaceMap;
   auto compareInterfaceSignal = [&](InterfaceElemsBuilder &lhs,
@@ -2137,7 +2361,7 @@ void GrandCentralPass::runOnOperation() {
     auto companionModule = companionIter.companion;
     auto symbolName = getNamespace().newName(
         "__" + companionIDMap.lookup(bundle.getID()).name + "_" +
-        getInterfaceName(bundle.getPrefix(), bundle) + "__");
+        getInterfaceName(bundle) + "__");
 
     // Recursively walk the AugmentedBundleType to generate interfaces and XMRs.
     // Error out if this returns None (indicating that the annotation is
@@ -2154,8 +2378,8 @@ void GrandCentralPass::runOnOperation() {
     SmallVector<VerbatimXMRbuilder> xmrElems;
     SmallVector<InterfaceElemsBuilder> interfaceBuilder;
 
-    auto ifaceName = traverseBundle(bundle, bundle.getID(), bundle.getPrefix(),
-                                    verbatim, xmrElems, interfaceBuilder);
+    auto ifaceName = traverseBundle(bundle, bundle.getID(), verbatim, xmrElems,
+                                    interfaceBuilder);
     if (!ifaceName) {
       removalError = true;
       continue;
@@ -2198,9 +2422,8 @@ void GrandCentralPass::runOnOperation() {
       if (!topIface)
         topIface = iface;
       ++numInterfaces;
-      if (dut &&
-          !instancePaths->instanceGraph.isAncestor(
-              companionIDMap[ifaceBuilder.id].companion, dut) &&
+      if (!instanceInfo->allInstancesUnderEffectiveDut(
+              companionIDMap[ifaceBuilder.id].companion) &&
           testbenchDir)
         iface->setAttr("output_file",
                        hw::OutputFileAttr::getAsDirectory(
@@ -2238,7 +2461,7 @@ void GrandCentralPass::runOnOperation() {
               uloc, str->toStr(elem.elemName.getValue()));
 
           // If we need to generate a YAML representation of the interface, then
-          // add attirbutes that describe what this `sv::VerbatimOp` is.
+          // add attributes that describe what this `sv::VerbatimOp` is.
           if (maybeHierarchyFileYAML) {
             if (str->instantiation)
               instanceOp->setAttr("firrtl.grandcentral.yaml.type",
@@ -2264,7 +2487,8 @@ void GrandCentralPass::runOnOperation() {
 
     ++numViews;
 
-    interfaceVec.push_back(topIface);
+    if (maybeHierarchyFileYAML.has_value())
+      interfaceYAMLMap[maybeHierarchyFileYAML.value()].push_back(topIface);
 
     // Instantiate the interface inside the companion.
     builder.setInsertionPointToStart(companionModule.getBodyBlock());
@@ -2280,12 +2504,159 @@ void GrandCentralPass::runOnOperation() {
 
     // If the interface is associated with a companion that is instantiated
     // above the DUT (e.g.., in the test harness), then don't extract it.
-    if (dut && !instancePaths->instanceGraph.isAncestor(
-                   companionIDMap[bundle.getID()].companion, dut))
+    if (!instanceInfo->allInstancesUnderEffectiveDut(
+            companionIDMap[bundle.getID()].companion))
       continue;
   }
 
-  emitHierarchyYamlFile(interfaceVec);
+  for (auto view : views) {
+    auto bundle = view.getAugmentedType();
+
+    assert(!bundle.isRoot() && "'id' found in firrtl.view");
+
+    if (!bundle.getDefName()) {
+      view.emitOpError("missing 'defName' at top-level");
+      removalError = true;
+      continue;
+    }
+    if (!bundle.getElements()) {
+      view.emitOpError("missing 'elements' at top-level");
+      removalError = true;
+      continue;
+    }
+
+    auto viewParentMod = view->getParentOfType<FModuleLike>();
+    auto symbolName = getModuleNamespace(viewParentMod)
+                          .newName("__" + getInterfaceName(bundle) + "__");
+
+    // Recursively walk the AugmentedBundleType to generate interfaces and XMRs.
+    // Error out if this returns None (indicating that the view is
+    // malformed in some way).  A good error message is generated inside
+    // `traverseViewBundle` or the functions it calls.
+    auto instanceSymbol =
+        hw::InnerRefAttr::get(SymbolTable::getSymbolName(viewParentMod),
+                              StringAttr::get(&getContext(), symbolName));
+    VerbatimBuilder::Base verbatimData;
+    VerbatimBuilder verbatim(verbatimData);
+    verbatim += instanceSymbol;
+    // List of interface elements.
+
+    SmallVector<VerbatimXMRbuilder> xmrElems;
+    SmallVector<InterfaceElemsBuilder> interfaceBuilder;
+
+    size_t index = 0;
+    auto ifaceName = traverseViewBundle(bundle, verbatim, xmrElems,
+                                        interfaceBuilder, view, index);
+    if (!ifaceName) {
+      removalError = true;
+      continue;
+    }
+    if (index != view.getNumOperands()) {
+      assert(index < view.getNumOperands() &&
+             "this should error while consuming");
+      removalError = true;
+      view.emitOpError() << "has too many operands: " << view.getNumOperands()
+                         << " operands but only " << index << " were needed";
+      continue;
+    }
+
+    if (interfaceBuilder.empty())
+      continue;
+    ImplicitLocOpBuilder viewBuilder(view.getLoc(), view);
+    viewBuilder.setInsertionPointAfter(view);
+
+    // Generate gathered XMR's.
+    for (auto xmrElem : xmrElems)
+      viewBuilder.create<sv::VerbatimOp>(xmrElem.str, xmrElem.val,
+                                         xmrElem.syms);
+    numXMRs += xmrElems.size();
+
+    sv::InterfaceOp topIface;
+    auto containingOutputFileAttr =
+        viewParentMod->getAttrOfType<hw::OutputFileAttr>("output_file");
+    auto yamlPath = view.getYamlFileAttr();
+    for (const auto &ifaceBuilder : interfaceBuilder) {
+      auto builder = OpBuilder::atBlockEnd(getOperation().getBodyBlock());
+      auto loc = getOperation().getLoc();
+      sv::InterfaceOp iface =
+          builder.create<sv::InterfaceOp>(loc, ifaceBuilder.iFaceName);
+      if (!topIface)
+        topIface = iface;
+      ++numInterfaces;
+
+      // Propagate output_file information from parent to the interface.
+      // Require/expect "AssignOutputDirs" ran before this.
+      if (containingOutputFileAttr)
+        iface->setAttr("output_file", containingOutputFileAttr);
+
+      iface.setCommentAttr(builder.getStringAttr("VCS coverage exclude_file"));
+      builder.setInsertionPointToEnd(
+          cast<sv::InterfaceOp>(iface).getBodyBlock());
+      interfaceMap[FlatSymbolRefAttr::get(builder.getContext(),
+                                          ifaceBuilder.iFaceName)] = iface;
+      for (auto elem : ifaceBuilder.elementsList) {
+
+        auto uloc = builder.getUnknownLoc();
+
+        auto description = elem.description;
+
+        if (description) {
+          auto descriptionOp = builder.create<sv::VerbatimOp>(
+              uloc, ("// " + cleanupDescription(description.getValue())));
+
+          // If we need to generate a YAML representation of this interface,
+          // then add an attribute indicating that this `sv::VerbatimOp` is
+          // actually a description.
+          if (yamlPath)
+            descriptionOp->setAttr("firrtl.grandcentral.yaml.type",
+                                   builder.getStringAttr("description"));
+        }
+        if (auto *str = std::get_if<VerbatimType>(&elem.elemType)) {
+          auto instanceOp = builder.create<sv::VerbatimOp>(
+              uloc, str->toStr(elem.elemName.getValue()));
+
+          // If we need to generate a YAML representation of the interface, then
+          // add attributes that describe what this `sv::VerbatimOp` is.
+          if (yamlPath) {
+            if (str->instantiation)
+              instanceOp->setAttr("firrtl.grandcentral.yaml.type",
+                                  builder.getStringAttr("instance"));
+            else
+              instanceOp->setAttr("firrtl.grandcentral.yaml.type",
+                                  builder.getStringAttr("unsupported"));
+            instanceOp->setAttr("firrtl.grandcentral.yaml.name", elem.elemName);
+            instanceOp->setAttr("firrtl.grandcentral.yaml.dimensions",
+                                builder.getI32ArrayAttr(str->dimensions));
+            instanceOp->setAttr(
+                "firrtl.grandcentral.yaml.symbol",
+                FlatSymbolRefAttr::get(builder.getContext(), str->str));
+          }
+          continue;
+        }
+
+        auto tpe = std::get<Type>(elem.elemType);
+        builder.create<sv::InterfaceSignalOp>(uloc, elem.elemName.getValue(),
+                                              tpe);
+      }
+    }
+
+    ++numViews;
+
+    if (yamlPath)
+      interfaceYAMLMap[yamlPath].push_back(topIface);
+
+    // Instantiate the interface before the view and the XMR's we inserted
+    // above.
+    viewBuilder.setInsertionPoint(view);
+    viewBuilder.create<sv::InterfaceInstanceOp>(
+        topIface.getInterfaceType(), view.getName(),
+        hw::InnerSymAttr::get(builder.getStringAttr(symbolName)));
+
+    view.erase();
+  }
+
+  for (auto &[yamlPath, intfs] : interfaceYAMLMap)
+    emitHierarchyYamlFile(yamlPath.getValue(), intfs);
 
   // Signal pass failure if any errors were found while examining circuit
   // annotations.
@@ -2295,13 +2666,7 @@ void GrandCentralPass::runOnOperation() {
 }
 
 void GrandCentralPass::emitHierarchyYamlFile(
-    SmallVectorImpl<sv::InterfaceOp> &intfs) {
-  // If a `GrandCentralHierarchyFileAnnotation` was passed in, generate a YAML
-  // representation of the interfaces that we produced with the filename that
-  // that annotation provided.
-  if (!maybeHierarchyFileYAML)
-    return;
-
+    StringRef yamlPath, SmallVectorImpl<sv::InterfaceOp> &intfs) {
   CircuitOp circuitOp = getOperation();
 
   std::string yamlString;
@@ -2312,10 +2677,9 @@ void GrandCentralPass::emitHierarchyYamlFile(
 
   auto builder = OpBuilder::atBlockBegin(circuitOp.getBodyBlock());
   builder.create<sv::VerbatimOp>(builder.getUnknownLoc(), yamlString)
-      ->setAttr("output_file",
-                hw::OutputFileAttr::getFromFilename(
-                    &getContext(), maybeHierarchyFileYAML->getValue(),
-                    /*excludeFromFileList=*/true));
+      ->setAttr("output_file", hw::OutputFileAttr::getFromFilename(
+                                   &getContext(), yamlPath,
+                                   /*excludeFromFileList=*/true));
   LLVM_DEBUG({ llvm::dbgs() << "Generated YAML:" << yamlString << "\n"; });
 }
 

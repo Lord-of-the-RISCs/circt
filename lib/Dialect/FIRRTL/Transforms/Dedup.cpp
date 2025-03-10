@@ -10,7 +10,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAttributes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
@@ -23,21 +22,49 @@
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/IR/IRMapping.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Threading.h"
-#include "mlir/Support/LogicalResult.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
-#include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/SmallPtrSet.h"
-#include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Format.h"
 #include "llvm/Support/SHA256.h"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_DEDUP
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
 using hw::InnerRefAttr;
+
+//===----------------------------------------------------------------------===//
+// Utility function for classifying a Symbol's dedup-ability.
+//===----------------------------------------------------------------------===//
+
+/// Returns true if the module can be removed.
+static bool canRemoveModule(mlir::SymbolOpInterface symbol) {
+  // If the symbol is not private, it cannot be removed.
+  if (!symbol.isPrivate())
+    return false;
+  // Classes may be referenced in object types, so can not normally be removed
+  // if we can't find any symbol uses. Since we know that dedup will update the
+  // types of instances appropriately, we can ignore that and return true here.
+  if (isa<ClassLike>(*symbol))
+    return true;
+  // If module can not be removed even if no uses can be found, we can not
+  // delete it. The implication is that there are hidden symbol uses that dedup
+  // will not properly update.
+  if (!symbol.canDiscardOnUseEmpty())
+    return false;
+  // The module can be deleted.
+  return true;
+}
 
 //===----------------------------------------------------------------------===//
 // Hashing
@@ -68,13 +95,13 @@ struct ModuleInfo {
   // SHA256 hash.
   std::array<uint8_t, 32> structuralHash;
   // Module names referred by instance op in the module.
-  mlir::ArrayAttr referredModuleNames;
+  std::vector<StringAttr> referredModuleNames;
 };
 
-struct SymbolTarget {
-  uint64_t index;
-  uint64_t fieldID;
-};
+static bool operator==(const ModuleInfo &lhs, const ModuleInfo &rhs) {
+  return lhs.structuralHash == rhs.structuralHash &&
+         lhs.referredModuleNames == rhs.referredModuleNames;
+}
 
 /// This struct contains constant string attributes shared across different
 /// threads.
@@ -83,14 +110,16 @@ struct StructuralHasherSharedConstants {
     portTypesAttr = StringAttr::get(context, "portTypes");
     moduleNameAttr = StringAttr::get(context, "moduleName");
     innerSymAttr = StringAttr::get(context, "inner_sym");
-    portSymsAttr = StringAttr::get(context, "portSyms");
+    portSymbolsAttr = StringAttr::get(context, "portSymbols");
     portNamesAttr = StringAttr::get(context, "portNames");
     nonessentialAttributes.insert(StringAttr::get(context, "annotations"));
+    nonessentialAttributes.insert(StringAttr::get(context, "convention"));
     nonessentialAttributes.insert(StringAttr::get(context, "name"));
     nonessentialAttributes.insert(StringAttr::get(context, "portAnnotations"));
     nonessentialAttributes.insert(StringAttr::get(context, "portNames"));
     nonessentialAttributes.insert(StringAttr::get(context, "portLocations"));
     nonessentialAttributes.insert(StringAttr::get(context, "sym_name"));
+    nonessentialAttributes.insert(StringAttr::get(context, "sym_visibility"));
   };
 
   // This is a cached "portTypes" string attr.
@@ -102,8 +131,8 @@ struct StructuralHasherSharedConstants {
   // This is a cached "inner_sym" string attr.
   StringAttr innerSymAttr;
 
-  // This is a cached "portSyms" string attr.
-  StringAttr portSymsAttr;
+  // This is a cached "portSymbols" string attr.
+  StringAttr portSymbolsAttr;
 
   // This is a cached "portNames" string attr.
   StringAttr portNamesAttr;
@@ -114,18 +143,56 @@ struct StructuralHasherSharedConstants {
 
 struct StructuralHasher {
   explicit StructuralHasher(const StructuralHasherSharedConstants &constants)
-      : constants(constants){};
+      : constants(constants) {}
 
-  std::pair<std::array<uint8_t, 32>, SmallVector<StringAttr>>
-  getHashAndModuleNames(FModuleLike module, StringAttr group) {
+  ModuleInfo getModuleInfo(FModuleLike module) {
     update(&(*module));
-    if (group)
-      sha.update(group.str());
-    auto hash = sha.final();
-    return {hash, referredModuleNames};
+    return {sha.final(), std::move(referredModuleNames)};
   }
 
 private:
+  // Get the identifier for an object. The identifier is assigned on first use.
+  unsigned getID(void *object) {
+    auto [it, inserted] = idTable.try_emplace(object, nextID);
+    if (inserted)
+      ++nextID;
+    return it->second;
+  }
+
+  // Get the identifier for an IR object. Free the ID, too.
+  unsigned finalizeID(void *object) {
+    auto it = idTable.find(object);
+    if (it == idTable.end())
+      return nextID++;
+    auto id = it->second;
+    idTable.erase(it);
+    return id;
+  }
+
+  unsigned getInnerSymID(StringAttr name) {
+    auto [it, inserted] = innerSymIDTable.try_emplace(name, nextInnerSymID);
+    if (inserted)
+      ++nextInnerSymID;
+    return it->second;
+  }
+
+  void update(OpOperand &operand) {
+    auto value = operand.get();
+    if (auto result = dyn_cast<OpResult>(value)) {
+      auto *op = result.getOwner();
+      update(getID(op));
+      update(result.getResultNumber());
+      return;
+    }
+    if (auto argument = dyn_cast<BlockArgument>(value)) {
+      auto *block = argument.getOwner();
+      update(getID(block));
+      update(argument.getArgNumber());
+      return;
+    }
+    llvm_unreachable("Unknown value type");
+  }
+
   void update(const void *pointer) {
     auto *addr = reinterpret_cast<const uint8_t *>(&pointer);
     sha.update(ArrayRef<uint8_t>(addr, sizeof pointer));
@@ -154,16 +221,7 @@ private:
     update(type.getAsOpaquePointer());
   }
 
-  void record(void *address) {
-    auto size = indices.size();
-    indices[address] = size;
-  }
-
-  void update(BlockArgument arg) { record(arg.getAsOpaquePointer()); }
-
   void update(OpResult result) {
-    record(result.getAsOpaquePointer());
-
     // Like instance ops, don't use object ops' result types since they might be
     // replaced by dedup. Record the class names and lazily combine their hashes
     // using the same mechanism as instances and modules.
@@ -173,39 +231,6 @@ private:
     }
 
     update(result.getType());
-  }
-
-  void update(OpOperand &operand) {
-    // We hash the value's index as it apears in the block.
-    auto it = indices.find(operand.get().getAsOpaquePointer());
-    assert(it != indices.end() && "op should have been previously hashed");
-    update(it->second);
-  }
-
-  void update(Operation *op, hw::InnerSymAttr attr) {
-    for (auto props : attr)
-      innerSymTargets[props.getName()] =
-          SymbolTarget{indices[op], props.getFieldID()};
-  }
-
-  void update(Value value, hw::InnerSymAttr attr) {
-    for (auto props : attr)
-      innerSymTargets[props.getName()] =
-          SymbolTarget{indices[value.getAsOpaquePointer()], props.getFieldID()};
-  }
-
-  void update(const SymbolTarget &target) {
-    update(target.index);
-    update(target.fieldID);
-  }
-
-  void update(InnerRefAttr attr) {
-    // We hash the value's index as it apears in the block.
-    auto it = innerSymTargets.find(attr.getName());
-    assert(it != innerSymTargets.end() &&
-           "inner symbol should have been previously hashed");
-    update(attr.getTypeID());
-    update(it->second);
   }
 
   /// Hash the top level attribute dictionary of the operation.  This function
@@ -221,6 +246,9 @@ private:
       if (constants.nonessentialAttributes.contains(name) && !isClassPortNames)
         continue;
 
+      // Hash the attribute name (an interned pointer).
+      update(name.getAsOpaquePointer());
+
       // Hash the port types.
       if (name == constants.portTypesAttr) {
         auto portTypes = cast<ArrayAttr>(value).getAsValueRange<TypeAttr>();
@@ -230,23 +258,27 @@ private:
       }
 
       // Special case the InnerSymbols to ignore the symbol names.
-      if (name == constants.portSymsAttr) {
+      if (name == constants.portSymbolsAttr) {
         if (op->getNumRegions() != 1)
           continue;
         auto &region = op->getRegion(0);
         if (region.getBlocks().empty())
           continue;
-        auto *block = &region.front();
-        auto syms = cast<ArrayAttr>(value).getAsRange<hw::InnerSymAttr>();
-        if (syms.empty())
-          continue;
-        for (auto [arg, sym] : llvm::zip_equal(block->getArguments(), syms))
-          update(arg, sym);
+        for (auto sym : cast<ArrayAttr>(value).getAsRange<hw::InnerSymAttr>()) {
+          for (auto property : sym) {
+            update(property.getFieldID());
+            update(getInnerSymID(property.getName()));
+          }
+        }
         continue;
       }
+
       if (name == constants.innerSymAttr) {
         auto innerSym = cast<hw::InnerSymAttr>(value);
-        update(op, innerSym);
+        for (auto property : innerSym) {
+          update(property.getFieldID());
+          update(getInnerSymID(property.getName()));
+        }
         continue;
       }
 
@@ -260,9 +292,6 @@ private:
         continue;
       }
 
-      // Hash the interned pointer.
-      update(name.getAsOpaquePointer());
-
       // TODO: properly handle DistinctAttr, including its use in paths.
       // See https://github.com/llvm/circt/issues/6583.
       if (isa<DistinctAttr>(value))
@@ -270,19 +299,10 @@ private:
 
       // If this is an symbol reference, we need to perform name erasure.
       if (auto innerRef = dyn_cast<hw::InnerRefAttr>(value))
-        update(innerRef);
+        update(getInnerSymID(innerRef.getName()));
       else
         update(value.getAsOpaquePointer());
     }
-  }
-
-  void update(Block &block) {
-    // Hash the block arguments.
-    for (auto arg : block.getArguments())
-      update(arg);
-    // Hash the operations in the block.
-    for (auto &op : block)
-      update(&op);
   }
 
   void update(mlir::OperationName name) {
@@ -291,33 +311,62 @@ private:
   }
 
   // NOLINTNEXTLINE(misc-no-recursion)
+  void update(Block *block) {
+    for (auto &op : llvm::reverse(*block))
+      update(&op);
+    for (auto type : block->getArgumentTypes())
+      update(type);
+    update(finalizeID(block));
+    update(position);
+    ++position;
+  }
+
+  // NOLINTNEXTLINE(misc-no-recursion)
+  void update(Region *region) {
+    for (auto &block : llvm::reverse(region->getBlocks()))
+      update(&block);
+    update(position);
+    ++position;
+  }
+
+  // NOLINTNEXTLINE(misc-no-recursion)
   void update(Operation *op) {
-    record(op);
-    update(op->getName());
-    update(op, op->getAttrDictionary());
-    // Hash the operands.
-    for (auto &operand : op->getOpOperands())
-      update(operand);
     // Hash the regions. We need to make sure an empty region doesn't hash the
     // same as no region, so we include the number of regions.
     update(op->getNumRegions());
-    for (auto &region : op->getRegions())
-      for (auto &block : region.getBlocks())
-        update(block);
-    // Record any op results.
+    for (auto &region : reverse(op->getRegions()))
+      update(&region);
+
+    update(op->getName());
+
+    // Record the uses for later hashing.
+    for (auto &operand : op->getOpOperands())
+      update(operand);
+
+    // This happens after the numbering above, as it uses blockarg numbering
+    // for inner symbols.
+    update(op, op->getAttrDictionary());
+
+    // Record any op results (types).
     for (auto result : op->getResults())
       update(result);
+
+    // Incorporate the hash of uses we have already built.
+    update(finalizeID(op));
+    update(position);
+    ++position;
   }
 
-  // Every operation and value is assigned a unique id based on their order of
-  // appearance
-  DenseMap<void *, unsigned> indices;
+  // A map from an operation/block, to its identifier.
+  DenseMap<void *, unsigned> idTable;
+  unsigned nextID = 0;
 
-  // Every value is assigned a unique id based on their order of appearance.
-  DenseMap<StringAttr, SymbolTarget> innerSymTargets;
+  // A map from an inner symbol, to its identifier.
+  DenseMap<StringAttr, unsigned> innerSymIDTable;
+  unsigned nextInnerSymID = 0;
 
   // This keeps track of module names in the order of the appearance.
-  SmallVector<mlir::StringAttr> referredModuleNames;
+  std::vector<StringAttr> referredModuleNames;
 
   // String constants.
   const StructuralHasherSharedConstants &constants;
@@ -325,6 +374,9 @@ private:
   // This is the actual running hash calculation. This is a stateful element
   // that should be reinitialized after each hash is produced.
   llvm::SHA256 sha;
+
+  // The index of the current op. Increment after handling each op.
+  size_t position = 0;
 };
 
 //===----------------------------------------------------------------------===//
@@ -337,14 +389,14 @@ struct Equivalence {
   Equivalence(MLIRContext *context, InstanceGraph &instanceGraph)
       : instanceGraph(instanceGraph) {
     noDedupClass = StringAttr::get(context, noDedupAnnoClass);
-    dedupGroupClass = StringAttr::get(context, dedupGroupAnnoClass);
+    dedupGroupAttrName = StringAttr::get(context, "firrtl.dedup_group");
     portDirectionsAttr = StringAttr::get(context, "portDirections");
     nonessentialAttributes.insert(StringAttr::get(context, "annotations"));
     nonessentialAttributes.insert(StringAttr::get(context, "name"));
     nonessentialAttributes.insert(StringAttr::get(context, "portAnnotations"));
     nonessentialAttributes.insert(StringAttr::get(context, "portNames"));
     nonessentialAttributes.insert(StringAttr::get(context, "portTypes"));
-    nonessentialAttributes.insert(StringAttr::get(context, "portSyms"));
+    nonessentialAttributes.insert(StringAttr::get(context, "portSymbols"));
     nonessentialAttributes.insert(StringAttr::get(context, "portLocations"));
     nonessentialAttributes.insert(StringAttr::get(context, "sym_name"));
     nonessentialAttributes.insert(StringAttr::get(context, "inner_sym"));
@@ -527,16 +579,15 @@ struct Equivalence {
     return success();
   }
 
-  LogicalResult check(InFlightDiagnostic &diag, Operation *a, IntegerAttr aAttr,
-                      Operation *b, IntegerAttr bAttr) {
+  LogicalResult check(InFlightDiagnostic &diag, Operation *a,
+                      mlir::DenseBoolArrayAttr aAttr, Operation *b,
+                      mlir::DenseBoolArrayAttr bAttr) {
     if (aAttr == bAttr)
       return success();
-    auto aDirections = direction::unpackAttribute(aAttr);
-    auto bDirections = direction::unpackAttribute(bAttr);
     auto portNames = a->getAttrOfType<ArrayAttr>("portNames");
-    for (unsigned i = 0, e = aDirections.size(); i < e; ++i) {
-      auto aDirection = aDirections[i];
-      auto bDirection = bDirections[i];
+    for (unsigned i = 0, e = aAttr.size(); i < e; ++i) {
+      auto aDirection = aAttr[i];
+      auto bDirection = bAttr[i];
       if (aDirection != bDirection) {
         auto &note = diag.attachNote(a->getLoc()) << "module port ";
         if (portNames)
@@ -606,8 +657,8 @@ struct Equivalence {
       } else if (attrName == portDirectionsAttr) {
         // Special handling for the port directions attribute for better
         // error messages.
-        if (failed(check(diag, a, cast<IntegerAttr>(aAttr), b,
-                         cast<IntegerAttr>(bAttr))))
+        if (failed(check(diag, a, cast<mlir::DenseBoolArrayAttr>(aAttr), b,
+                         cast<mlir::DenseBoolArrayAttr>(bAttr))))
           return failure();
       } else if (isa<DistinctAttr>(aAttr) && isa<DistinctAttr>(bAttr)) {
         // TODO: properly handle DistinctAttr, including its use in paths.
@@ -753,24 +804,32 @@ struct Equivalence {
     hw::InnerSymbolTable aTable(a);
     hw::InnerSymbolTable bTable(b);
     ModuleData data(aTable, bTable);
-    AnnotationSet aAnnos(a);
-    AnnotationSet bAnnos(b);
-    if (aAnnos.hasAnnotation(noDedupClass)) {
+    if (AnnotationSet::hasAnnotation(a, noDedupClass)) {
       diag.attachNote(a->getLoc()) << "module marked NoDedup";
       return;
     }
-    if (bAnnos.hasAnnotation(noDedupClass)) {
+    if (AnnotationSet::hasAnnotation(b, noDedupClass)) {
       diag.attachNote(b->getLoc()) << "module marked NoDedup";
       return;
     }
-    auto aGroup = aAnnos.hasAnnotation(dedupGroupClass)
-                      ? aAnnos.getAnnotation(dedupGroupClass)
-                            .getMember<StringAttr>("group")
-                      : StringAttr();
-    auto bGroup = bAnnos.hasAnnotation(dedupGroupClass)
-                      ? bAnnos.getAnnotation(dedupGroupClass)
-                            .getMember<StringAttr>("group")
-                      : StringAttr();
+    auto aSymbol = cast<mlir::SymbolOpInterface>(a);
+    auto bSymbol = cast<mlir::SymbolOpInterface>(b);
+    if (!canRemoveModule(aSymbol)) {
+      diag.attachNote(a->getLoc())
+          << "module is "
+          << (aSymbol.isPrivate() ? "private but not discardable" : "public");
+      return;
+    }
+    if (!canRemoveModule(bSymbol)) {
+      diag.attachNote(b->getLoc())
+          << "module is "
+          << (bSymbol.isPrivate() ? "private but not discardable" : "public");
+      return;
+    }
+    auto aGroup =
+        dyn_cast_or_null<StringAttr>(a->getDiscardableAttr(dedupGroupAttrName));
+    auto bGroup = dyn_cast_or_null<StringAttr>(
+        b->getAttrOfType<StringAttr>(dedupGroupAttrName));
     if (aGroup != bGroup) {
       if (bGroup) {
         diag.attachNote(b->getLoc())
@@ -796,8 +855,9 @@ struct Equivalence {
   StringAttr portDirectionsAttr;
   // This is a cached "NoDedup" annotation class string attr.
   StringAttr noDedupClass;
-  // This is a cached "DedupGroup" annotation class string attr.
-  StringAttr dedupGroupClass;
+  // This is a cached string attr for the dedup group attribute.
+  StringAttr dedupGroupAttrName;
+
   // This is a set of every attribute we should ignore.
   DenseSet<Attribute> nonessentialAttributes;
   InstanceGraph &instanceGraph;
@@ -1274,14 +1334,14 @@ private:
     }
 
     // If there are no port symbols on the "from" operation, we are done here.
-    auto fromPortSyms = from->getAttrOfType<ArrayAttr>("portSyms");
+    auto fromPortSyms = from->getAttrOfType<ArrayAttr>("portSymbols");
     if (!fromPortSyms || fromPortSyms.empty())
       return;
     // We have to map each "fromPort" to each "toPort".
     auto &moduleNamespace = getNamespace(toModule);
     auto portCount = fromPortSyms.size();
     auto portNames = to->getAttrOfType<ArrayAttr>("portNames");
-    auto toPortSyms = to->getAttrOfType<ArrayAttr>("portSyms");
+    auto toPortSyms = to->getAttrOfType<ArrayAttr>("portSymbols");
 
     // Create an array of new port symbols for the "to" operation, copy in the
     // old symbols if it has any, create an empty symbol array if it doesn't.
@@ -1295,7 +1355,7 @@ private:
       // If this fromPort doesn't have a symbol, move on to the next one.
       if (!fromPortSyms[portNo])
         continue;
-      auto fromSym = fromPortSyms[portNo].cast<hw::InnerSymAttr>();
+      auto fromSym = cast<hw::InnerSymAttr>(fromPortSyms[portNo]);
 
       // If this toPort doesn't have a symbol, assign one.
       hw::InnerSymAttr toSym;
@@ -1309,13 +1369,14 @@ private:
             StringAttr::get(context, moduleNamespace.newName(symName)));
         newPortSyms[portNo] = toSym;
       } else
-        toSym = newPortSyms[portNo].cast<hw::InnerSymAttr>();
+        toSym = cast<hw::InnerSymAttr>(newPortSyms[portNo]);
 
       // Record the renaming.
       renameMap[fromSym.getSymName()] = toSym.getSymName();
     }
 
     // Commit the new symbol attribute.
+    FModuleLike::fixupPortSymsArray(newPortSyms, toModule.getContext());
     cast<FModuleLike>(to).setPortSymbols(newPortSyms);
   }
 
@@ -1391,6 +1452,72 @@ private:
 // Fixup
 //===----------------------------------------------------------------------===//
 
+/// This fixes up ClassLikes with ClassType ports, when the classes have
+/// deduped. For each ClassType port, if the object reference being assigned is
+/// a different type, update the port type. Returns true if the ClassOp was
+/// updated and the associated ObjectOps should be updated.
+bool fixupClassOp(ClassOp classOp) {
+  // New port type attributes, if necessary.
+  SmallVector<Attribute> newPortTypes;
+  bool anyDifferences = false;
+
+  // Check each port.
+  for (size_t i = 0, e = classOp.getNumPorts(); i < e; ++i) {
+    // Check if this port is a ClassType. If not, save the original type
+    // attribute in case we need to update port types.
+    auto portClassType = dyn_cast<ClassType>(classOp.getPortType(i));
+    if (!portClassType) {
+      newPortTypes.push_back(classOp.getPortTypeAttr(i));
+      continue;
+    }
+
+    // Check if this port is assigned a reference of a different ClassType.
+    Type newPortClassType;
+    BlockArgument portArg = classOp.getArgument(i);
+    for (auto &use : portArg.getUses()) {
+      if (auto propassign = dyn_cast<PropAssignOp>(use.getOwner())) {
+        Type sourceType = propassign.getSrc().getType();
+        if (propassign.getDest() == use.get() && sourceType != portClassType) {
+          // Double check that all references are the same new type.
+          if (newPortClassType) {
+            assert(newPortClassType == sourceType &&
+                   "expected all references to be of the same type");
+            continue;
+          }
+
+          newPortClassType = sourceType;
+        }
+      }
+    }
+
+    // If there was no difference, save the original type attribute in case we
+    // need to update port types and move along.
+    if (!newPortClassType) {
+      newPortTypes.push_back(classOp.getPortTypeAttr(i));
+      continue;
+    }
+
+    // The port type changed, so update the block argument, save the new port
+    // type attribute, and indicate there was a difference.
+    classOp.getArgument(i).setType(newPortClassType);
+    newPortTypes.push_back(TypeAttr::get(newPortClassType));
+    anyDifferences = true;
+  }
+
+  // If necessary, update port types.
+  if (anyDifferences)
+    classOp.setPortTypes(newPortTypes);
+
+  return anyDifferences;
+}
+
+/// This fixes up ObjectOps when the signature of their ClassOp changes. This
+/// amounts to updating the ObjectOp result type to match the newly updated
+/// ClassOp type.
+void fixupObjectOp(ObjectOp objectOp, ClassType newClassType) {
+  objectOp.getResult().setType(newClassType);
+}
+
 /// This fixes up connects when the field names of a bundle type changes.  It
 /// finds all fields which were previously bulk connected and legalizes it
 /// into a connect for each field.
@@ -1423,9 +1550,25 @@ void fixupConnect(ImplicitLocOpBuilder &builder, Value dst, Value src) {
 void fixupAllModules(InstanceGraph &instanceGraph) {
   for (auto *node : instanceGraph) {
     auto module = cast<FModuleLike>(*node->getModule());
+
+    // Handle class declarations here.
+    bool shouldFixupObjects = false;
+    auto classOp = dyn_cast<ClassOp>(module.getOperation());
+    if (classOp)
+      shouldFixupObjects = fixupClassOp(classOp);
+
     for (auto *instRec : node->uses()) {
+      // Handle object instantiations here.
+      if (classOp) {
+        if (shouldFixupObjects) {
+          fixupObjectOp(instRec->getInstance<ObjectOp>(),
+                        classOp.getInstanceType());
+        }
+        continue;
+      }
+
       auto inst = instRec->getInstance<InstanceOp>();
-      // Only handle module instantiations for now.
+      // Only handle module instantiations here.
       if (!inst)
         continue;
       ImplicitLocOpBuilder builder(inst.getLoc(), inst->getContext());
@@ -1462,13 +1605,13 @@ struct DenseMapInfo<ModuleInfo> {
   static inline ModuleInfo getEmptyKey() {
     std::array<uint8_t, 32> key;
     std::fill(key.begin(), key.end(), ~0);
-    return {key, DenseMapInfo<mlir::ArrayAttr>::getEmptyKey()};
+    return {key, {}};
   }
 
   static inline ModuleInfo getTombstoneKey() {
     std::array<uint8_t, 32> key;
     std::fill(key.begin(), key.end(), ~0 - 1);
-    return {key, DenseMapInfo<mlir::ArrayAttr>::getTombstoneKey()};
+    return {key, {}};
   }
 
   static unsigned getHashValue(const ModuleInfo &val) {
@@ -1478,12 +1621,13 @@ struct DenseMapInfo<ModuleInfo> {
     std::memcpy(&hash, val.structuralHash.data(), sizeof(unsigned));
 
     // Combine module names.
-    return llvm::hash_combine(hash, val.referredModuleNames);
+    return llvm::hash_combine(
+        hash, llvm::hash_combine_range(val.referredModuleNames.begin(),
+                                       val.referredModuleNames.end()));
   }
 
   static bool isEqual(const ModuleInfo &lhs, const ModuleInfo &rhs) {
-    return lhs.structuralHash == rhs.structuralHash &&
-           lhs.referredModuleNames == rhs.referredModuleNames;
+    return lhs == rhs;
   }
 };
 } // namespace llvm
@@ -1493,7 +1637,7 @@ struct DenseMapInfo<ModuleInfo> {
 //===----------------------------------------------------------------------===//
 
 namespace {
-class DedupPass : public DedupBase<DedupPass> {
+class DedupPass : public circt::firrtl::impl::DedupBase<DedupPass> {
   void runOnOperation() override {
     auto *context = &getContext();
     auto circuit = getOperation();
@@ -1526,24 +1670,41 @@ class DedupPass : public DedupBase<DedupPass> {
           return cast<FModuleLike>(*node->getModule());
         }));
 
-    SmallVector<std::optional<
-        std::pair<std::array<uint8_t, 32>, SmallVector<StringAttr>>>>
-        hashesAndModuleNames(modules.size());
+    SmallVector<std::optional<ModuleInfo>> moduleInfos(modules.size());
     StructuralHasherSharedConstants hasherConstants(&getContext());
+
+    // Attribute name used to store dedup_group for this pass.
+    auto dedupGroupAttrName = StringAttr::get(context, "firrtl.dedup_group");
+
+    // Move dedup group annotations to attributes on the module.
+    // This results in the desired behavior (included in hash),
+    // and avoids unnecessary processing of these as annotations
+    // that need to be tracked, made non-local, so on.
+    for (auto module : modules) {
+      llvm::SmallSetVector<StringAttr, 1> groups;
+      AnnotationSet::removeAnnotations(
+          module, [&groups, dedupGroupClass](Annotation annotation) {
+            if (annotation.getClassAttr() != dedupGroupClass)
+              return false;
+            groups.insert(annotation.getMember<StringAttr>("group"));
+            return true;
+          });
+      if (groups.size() > 1) {
+        module.emitError("module belongs to multiple dedup groups: ") << groups;
+        return signalPassFailure();
+      }
+      assert(!module->hasAttr(dedupGroupAttrName) &&
+             "unexpected existing use of temporary dedup group attribute");
+      if (!groups.empty())
+        module->setDiscardableAttr(dedupGroupAttrName, groups.front());
+    }
 
     // Calculate module information parallelly.
     auto result = mlir::failableParallelForEach(
         context, llvm::seq(modules.size()), [&](unsigned idx) {
           auto module = modules[idx];
-          AnnotationSet annotations(module);
           // If the module is marked with NoDedup, just skip it.
-          if (annotations.hasAnnotation(noDedupClass))
-            return success();
-
-          // If the module has input RefType ports, also skip it.
-          if (llvm::any_of(module.getPorts(), [&](PortInfo port) {
-                return type_isa<RefType>(port.type) && port.isInput();
-              }))
+          if (AnnotationSet::hasAnnotation(module, noDedupClass))
             return success();
 
           // Only dedup extmodule's with defname.
@@ -1551,30 +1712,9 @@ class DedupPass : public DedupBase<DedupPass> {
               ext && !ext.getDefname().has_value())
             return success();
 
-          // If module has symbol (name) that must be preserved even if unused,
-          // skip it. All symbol uses must be supported, which is not true if
-          // non-private.
-          if (!module.isPrivate() ||
-              (!module.canDiscardOnUseEmpty() && !isa<ClassLike>(*module))) {
-            return success();
-          }
-
-          llvm::SmallSetVector<StringAttr, 1> groups;
-          for (auto annotation : annotations) {
-            if (annotation.getClass() == dedupGroupClass)
-              groups.insert(annotation.getMember<StringAttr>("group"));
-          }
-          if (groups.size() > 1) {
-            module.emitError("module belongs to multiple dedup groups: ")
-                << groups;
-            return failure();
-          }
-          auto dedupGroup = groups.empty() ? StringAttr() : groups.front();
-
           StructuralHasher hasher(hasherConstants);
           // Calculate the hash of the module and referred module names.
-          hashesAndModuleNames[idx] =
-              hasher.getHashAndModuleNames(module, dedupGroup);
+          moduleInfos[idx] = hasher.getModuleInfo(module);
           return success();
         });
 
@@ -1583,9 +1723,9 @@ class DedupPass : public DedupBase<DedupPass> {
 
     for (auto [i, module] : llvm::enumerate(modules)) {
       auto moduleName = module.getModuleNameAttr();
-      auto &hashAndModuleNamesOpt = hashesAndModuleNames[i];
+      auto &maybeModuleInfo = moduleInfos[i];
       // If the hash was not calculated, we need to skip it.
-      if (!hashAndModuleNamesOpt) {
+      if (!maybeModuleInfo) {
         // We record it in the dedup map to help detect errors when the user
         // marks the module as both NoDedup and MustDedup. We do not record this
         // module in the hasher to make sure no other module dedups "into" this
@@ -1594,23 +1734,38 @@ class DedupPass : public DedupBase<DedupPass> {
         continue;
       }
 
-      // Replace module names referred in the module with new names.
-      SmallVector<mlir::Attribute> names;
-      for (auto oldModuleName : hashAndModuleNamesOpt->second) {
-        auto newModuleName = dedupMap[oldModuleName];
-        names.push_back(newModuleName);
-      }
+      auto &moduleInfo = maybeModuleInfo.value();
 
-      // Create a module info to use it as a key.
-      ModuleInfo moduleInfo{hashAndModuleNamesOpt->first,
-                            mlir::ArrayAttr::get(module.getContext(), names)};
+      // Replace module names referred in the module with new names.
+      for (auto &referredModule : moduleInfo.referredModuleNames)
+        referredModule = dedupMap[referredModule];
 
       // Check if there a module with the same hash.
       auto it = moduleInfoToModule.find(moduleInfo);
       if (it != moduleInfoToModule.end()) {
         auto original = cast<FModuleLike>(it->second);
+        auto originalName = original.getModuleNameAttr();
+
+        // If the current module is public, and the original is private, we
+        // want to dedup the private module into the public one.
+        if (!canRemoveModule(module)) {
+          // If both modules are public, then we can't dedup anything.
+          if (!canRemoveModule(original))
+            continue;
+          // Swap the canonical module in the dedup map.
+          for (auto &[originalName, dedupedName] : dedupMap)
+            if (dedupedName == originalName)
+              dedupedName = moduleName;
+          // Update the module hash table to point to the new original, so all
+          // future modules dedup with the new canonical module.
+          it->second = module;
+          // Swap the locals.
+          std::swap(originalName, moduleName);
+          std::swap(original, module);
+        }
+
         // Record the group ID of the other module.
-        dedupMap[moduleName] = original.getModuleNameAttr();
+        dedupMap[moduleName] = originalName;
         deduper.dedup(original, module);
         ++erasedModules;
         anythingChanged = true;
@@ -1621,7 +1776,7 @@ class DedupPass : public DedupBase<DedupPass> {
       // Add the module to a new dedup group.
       dedupMap[moduleName] = moduleName;
       // Record the module info.
-      moduleInfoToModule[moduleInfo] = module;
+      moduleInfoToModule[std::move(moduleInfo)] = module;
     }
 
     // This part verifies that all modules marked by "MustDedup" have been
@@ -1647,15 +1802,12 @@ class DedupPass : public DedupBase<DedupPass> {
                               "MustDeduplicateAnnotation references module ")
                     << module << " which does not exist";
         failed = true;
-        return 0;
+        return nullptr;
       }
       return it->second;
     };
 
     AnnotationSet::removeAnnotations(circuit, [&](Annotation annotation) {
-      // If we have already failed, don't process any more annotations.
-      if (failed)
-        return false;
       if (!annotation.isClass(mustDedupAnnoClass))
         return false;
       auto modules = annotation.getMember<ArrayAttr>("modules");
@@ -1666,18 +1818,18 @@ class DedupPass : public DedupBase<DedupPass> {
         return false;
       }
       // Empty module list has nothing to process.
-      if (modules.size() == 0)
+      if (modules.empty())
         return true;
       // Get the first element.
       auto firstModule = parseModule(modules[0]);
       auto firstLead = getLead(firstModule);
-      if (failed)
+      if (!firstLead)
         return false;
       // Verify that the remaining elements are all the same as the first.
       for (auto attr : modules.getValue().drop_front()) {
         auto nextModule = parseModule(attr);
         auto nextLead = getLead(nextModule);
-        if (failed)
+        if (!nextLead)
           return false;
         if (firstLead != nextLead) {
           auto diag = emitError(circuit.getLoc(), "module ")
@@ -1694,8 +1846,9 @@ class DedupPass : public DedupBase<DedupPass> {
     if (failed)
       return signalPassFailure();
 
-    for (auto module : circuit.getOps<FModuleOp>())
-      AnnotationSet::removeAnnotations(module, dedupGroupClass);
+    // Remove all dedup group attributes, they only exist during this pass.
+    for (auto module : circuit.getOps<FModuleLike>())
+      module->removeDiscardableAttr(dedupGroupAttrName);
 
     // Walk all the modules and fixup the instance operation to return the
     // correct type. We delay this fixup until the end because doing it early

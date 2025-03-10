@@ -4,6 +4,8 @@
 
 from . import ir
 
+from ._mlir_libs._circt._support import _walk_with_filter
+from .ir import Operation
 from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from typing import List
@@ -86,7 +88,7 @@ def type_to_pytype(t) -> ir.Type:
   if t.__class__ != ir.Type:
     return t
 
-  from .dialects import esi, hw, seq
+  from .dialects import esi, hw, seq, rtg, rtgtest
   try:
     return ir.IntegerType(t)
   except ValueError:
@@ -120,7 +122,59 @@ def type_to_pytype(t) -> ir.Type:
   except ValueError:
     pass
   try:
+    return esi.AnyType(t)
+  except ValueError:
+    pass
+  try:
     return esi.BundleType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.LabelType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.SetType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.BagType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.SequenceType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.RandomizedSequenceType(t)
+  except ValueError:
+    pass
+  try:
+    return rtg.DictType(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.IntegerRegisterType(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm5Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm12Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm13Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm21Type(t)
+  except ValueError:
+    pass
+  try:
+    return rtgtest.Imm32Type(t)
   except ValueError:
     pass
 
@@ -195,7 +249,7 @@ def attribute_to_var(attr):
   except ValueError:
     pass
   try:
-    return attribute_to_var(om.OMIntegerAttr(attr).integer)
+    return int(str(om.OMIntegerAttr(attr)))
   except ValueError:
     pass
   try:
@@ -233,6 +287,7 @@ class BackedgeBuilder(AbstractContextManager):
       self.instance_of = instance_of
       self.op_view = op_view
       self.port_name = backedge_name
+      self.loc = loc
       self.erased = False
 
     @property
@@ -246,7 +301,8 @@ class BackedgeBuilder(AbstractContextManager):
         self.creator.edges.remove(self)
         self.dummy_op.operation.erase()
 
-  def __init__(self):
+  def __init__(self, circuit_name: str = ""):
+    self.circuit_name = circuit_name
     self.edges = set()
 
   @staticmethod
@@ -287,10 +343,13 @@ class BackedgeBuilder(AbstractContextManager):
       if edge.op_view is not None:
         op = edge.op_view.operation
         msg += "Instance:   " + str(op)
+      if edge.loc is not None:
+        msg += "Location:   " + str(edge.loc)
       errors.append(msg)
 
     if errors:
-      errors.insert(0, "Uninitialized backedges remain in circuit!")
+      errors.insert(
+          0, f"Uninitialized backedges remain in module '{self.circuit_name}'")
       raise RuntimeError("\n".join(errors))
 
 
@@ -407,3 +466,13 @@ class NamedValueOpView:
   def operation(self):
     """Get the operation associated with this builder."""
     return self.opview.operation
+
+
+# Helper function to walk operation with a filter on operation names.
+# `op_views` is a list of operation views to visit. This is a wrapper
+# around the C++ implementation of walk_with_filter.
+def walk_with_filter(operation: Operation, op_views: List[ir.OpView], callback,
+                     walk_order):
+  op_names_identifiers = [name.OPERATION_NAME for name in op_views]
+  return _walk_with_filter(operation, op_names_identifiers, callback,
+                           walk_order)

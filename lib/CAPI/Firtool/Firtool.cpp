@@ -6,8 +6,6 @@
 
 #include "circt-c/Firtool/Firtool.h"
 #include "circt/Firtool/Firtool.h"
-
-#include "circt/Firtool/Firtool.h"
 #include "mlir/CAPI/IR.h"
 #include "mlir/CAPI/Pass.h"
 #include "mlir/CAPI/Support.h"
@@ -51,6 +49,11 @@ void circtFirtoolOptionsSetDisableAnnotationsClassless(
 void circtFirtoolOptionsSetLowerAnnotationsNoRefTypePorts(
     CirctFirtoolFirtoolOptions options, bool value) {
   unwrap(options)->setLowerAnnotationsNoRefTypePorts(value);
+}
+
+void circtFirtoolOptionsSetAllowAddingPortsOnPublic(
+    CirctFirtoolFirtoolOptions options, bool value) {
+  unwrap(options)->setAllowAddingPortsOnPublic(value);
 }
 
 void circtFirtoolOptionsSetPreserveAggregate(
@@ -122,6 +125,11 @@ void circtFirtoolOptionsSetBuildMode(CirctFirtoolFirtoolOptions options,
   unwrap(options)->setBuildMode(converted);
 }
 
+void circtFirtoolOptionsSetDisableLayerSink(CirctFirtoolFirtoolOptions options,
+                                            bool value) {
+  unwrap(options)->setDisableLayerSink(value);
+}
+
 void circtFirtoolOptionsSetDisableOptimization(
     CirctFirtoolFirtoolOptions options, bool value) {
   unwrap(options)->setDisableOptimization(value);
@@ -169,21 +177,6 @@ void circtFirtoolOptionsSetCompanionMode(CirctFirtoolFirtoolOptions options,
 void circtFirtoolOptionsSetDisableAggressiveMergeConnections(
     CirctFirtoolFirtoolOptions options, bool value) {
   unwrap(options)->setDisableAggressiveMergeConnections(value);
-}
-
-void circtFirtoolOptionsSetDisableHoistingHWPassthrough(
-    CirctFirtoolFirtoolOptions options, bool value) {
-  unwrap(options)->setDisableHoistingHWPassthrough(value);
-}
-
-void circtFirtoolOptionsSetEmitOmir(CirctFirtoolFirtoolOptions options,
-                                    bool value) {
-  unwrap(options)->setEmitOMIR(value);
-}
-
-void circtFirtoolOptionsSetOmirOutFile(CirctFirtoolFirtoolOptions options,
-                                       MlirStringRef value) {
-  unwrap(options)->setOmirOutFile(unwrap(value));
 }
 
 void circtFirtoolOptionsSetLowerMemories(CirctFirtoolFirtoolOptions options,
@@ -253,9 +246,9 @@ void circtFirtoolOptionsSetAddMuxPragmas(CirctFirtoolFirtoolOptions options,
   unwrap(options)->setAddMuxPragmas(value);
 }
 
-void circtFirtoolOptionsSetEmitChiselAssertsAsSVA(
-    CirctFirtoolFirtoolOptions options, bool value) {
-  unwrap(options)->setEmitChiselAssertsAsSVA(value);
+void circtFirtoolOptionsSetVerificationFlavor(
+    CirctFirtoolFirtoolOptions options, firrtl::VerificationFlavor value) {
+  unwrap(options)->setVerificationFlavor(value);
 }
 
 void circtFirtoolOptionsSetEmitSeparateAlwaysBlocks(
@@ -323,6 +316,17 @@ void circtFirtoolOptionsSetStripDebugInfo(CirctFirtoolFirtoolOptions options,
   unwrap(options)->setStripDebugInfo(value);
 }
 
+void circtFirtoolOptionsSetDisableCSEinClasses(
+    CirctFirtoolFirtoolOptions options, bool value) {
+
+  unwrap(options)->setDisableCSEinClasses(value);
+}
+
+void circtFirtoolOptionsSetSelectDefaultInstanceChoice(
+    CirctFirtoolFirtoolOptions options, bool value) {
+  unwrap(options)->setSelectDefaultInstanceChoice(value);
+}
+
 //===----------------------------------------------------------------------===//
 // Populate API.
 //===----------------------------------------------------------------------===//
@@ -376,4 +380,14 @@ MlirLogicalResult
 circtFirtoolPopulateFinalizeIR(MlirPassManager pm,
                                CirctFirtoolFirtoolOptions options) {
   return wrap(firtool::populateFinalizeIR(*unwrap(pm), *unwrap(options)));
+}
+
+MlirLogicalResult
+circtFirtoolpopulateHWToBTOR2(MlirPassManager pm,
+                              CirctFirtoolFirtoolOptions options,
+                              MlirStringCallback callback, void *userData) {
+  auto stream =
+      std::make_unique<mlir::detail::CallbackOstream>(callback, userData);
+  return wrap(firtool::populateHWToBTOR2(*unwrap(pm), *unwrap(options),
+                                         *std::move(stream)));
 }

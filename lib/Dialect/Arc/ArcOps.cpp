@@ -7,12 +7,16 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Dialect/Arc/ArcOps.h"
+#include "circt/Dialect/HW/HWOpInterfaces.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OpImplementation.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Interfaces/FunctionImplementation.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/TypeSwitch.h"
 
 using namespace circt;
 using namespace arc;
@@ -68,6 +72,52 @@ static LogicalResult verifyArcSymbolUse(Operation *op, TypeRange inputs,
     return failure();
 
   return success();
+}
+
+static bool isSupportedModuleOp(Operation *moduleOp) {
+  return llvm::isa<arc::ModelOp, hw::HWModuleLike>(moduleOp);
+}
+
+/// Fetches the operation pointed to by `pointing` with name `symbol`, checking
+/// that it is a supported model operation for simulation.
+static Operation *getSupportedModuleOp(SymbolTableCollection &symbolTable,
+                                       Operation *pointing, StringAttr symbol) {
+  Operation *moduleOp = symbolTable.lookupNearestSymbolFrom(pointing, symbol);
+  if (!moduleOp) {
+    pointing->emitOpError("model not found");
+    return nullptr;
+  }
+
+  if (!isSupportedModuleOp(moduleOp)) {
+    pointing->emitOpError("model symbol does not point to a supported model "
+                          "operation, points to ")
+        << moduleOp->getName() << " instead";
+    return nullptr;
+  }
+
+  return moduleOp;
+}
+
+static std::optional<hw::ModulePort> getModulePort(Operation *moduleOp,
+                                                   StringRef portName) {
+  auto findRightPort = [&](auto ports) -> std::optional<hw::ModulePort> {
+    const hw::ModulePort *port = llvm::find_if(
+        ports, [&](hw::ModulePort port) { return port.name == portName; });
+    if (port == ports.end())
+      return std::nullopt;
+    return *port;
+  };
+
+  return TypeSwitch<Operation *, std::optional<hw::ModulePort>>(moduleOp)
+      .Case<arc::ModelOp>(
+          [&](arc::ModelOp modelOp) -> std::optional<hw::ModulePort> {
+            return findRightPort(modelOp.getIo().getPorts());
+          })
+      .Case<hw::HWModuleLike>(
+          [&](hw::HWModuleLike moduleLike) -> std::optional<hw::ModulePort> {
+            return findRightPort(moduleLike.getPortList());
+          })
+      .Default([](Operation *) { return std::nullopt; });
 }
 
 //===----------------------------------------------------------------------===//
@@ -252,6 +302,29 @@ LogicalResult ModelOp::verify() {
   if (auto type = getBodyBlock().getArgument(0).getType();
       !isa<StorageType>(type))
     return emitOpError("argument must be of storage type");
+  for (const hw::ModulePort &port : getIo().getPorts())
+    if (port.dir == hw::ModulePort::Direction::InOut)
+      return emitOpError("inout ports are not supported");
+  return success();
+}
+
+LogicalResult ModelOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  auto fnAttrs = std::array{getInitialFnAttr(), getFinalFnAttr()};
+  auto nouns = std::array{"initializer", "finalizer"};
+  for (auto [fnAttr, noun] : llvm::zip(fnAttrs, nouns)) {
+    if (!fnAttr)
+      continue;
+    auto fn = symbolTable.lookupNearestSymbolFrom<func::FuncOp>(*this, fnAttr);
+    if (!fn)
+      return emitOpError() << noun << " '" << fnAttr.getValue()
+                           << "' does not reference a valid function";
+    if (!llvm::equal(fn.getArgumentTypes(), getBody().getArgumentTypes())) {
+      auto diag = emitError() << noun << " '" << fnAttr.getValue()
+                              << "' arguments must match arguments of model";
+      diag.attachNote(fn.getLoc()) << noun << " declared here:";
+      return diag;
+    }
+  }
   return success();
 }
 
@@ -303,10 +376,6 @@ LogicalResult VectorizeOp::verify() {
       return emitOpError("input vector must have at least one element");
   }
 
-  if (getInputs().front().size() > 1 &&
-      !isa<IntegerType>(getInputs().front().front().getType()))
-    return emitOpError("input vector element type must be a signless integer");
-
   if (getResults().empty())
     return emitOpError("must have at least one result");
 
@@ -315,11 +384,6 @@ LogicalResult VectorizeOp::verify() {
 
   if (getResults().size() != getInputs().front().size())
     return emitOpError("number results must match input vector size");
-
-  if (getResults().size() > 1 &&
-      !isa<IntegerType>(getResults().front().getType()))
-    return emitError(
-        "may only return a vector type if boundary is already vectorized");
 
   return success();
 }
@@ -423,6 +487,147 @@ bool VectorizeOp::isBodyVectorized() {
     return *width > 1;
 
   return false;
+}
+
+//===----------------------------------------------------------------------===//
+// SimInstantiateOp
+//===----------------------------------------------------------------------===//
+
+void SimInstantiateOp::print(OpAsmPrinter &p) {
+  BlockArgument modelArg = getBody().getArgument(0);
+  auto modelType = cast<SimModelInstanceType>(modelArg.getType());
+
+  p << " " << modelType.getModel() << " as ";
+  p.printRegionArgument(modelArg, {}, true);
+
+  p.printOptionalAttrDictWithKeyword(getOperation()->getAttrs());
+
+  p << " ";
+
+  p.printRegion(getBody(), false);
+}
+
+ParseResult SimInstantiateOp::parse(OpAsmParser &parser,
+                                    OperationState &result) {
+  StringAttr modelName;
+  if (failed(parser.parseSymbolName(modelName)))
+    return failure();
+
+  if (failed(parser.parseKeyword("as")))
+    return failure();
+
+  OpAsmParser::Argument modelArg;
+  if (failed(parser.parseArgument(modelArg, false, false)))
+    return failure();
+
+  if (failed(parser.parseOptionalAttrDictWithKeyword(result.attributes)))
+    return failure();
+
+  MLIRContext *ctxt = result.getContext();
+  modelArg.type =
+      SimModelInstanceType::get(ctxt, FlatSymbolRefAttr::get(ctxt, modelName));
+
+  std::unique_ptr<Region> body = std::make_unique<Region>();
+  if (failed(parser.parseRegion(*body, {modelArg})))
+    return failure();
+
+  result.addRegion(std::move(body));
+  return success();
+}
+
+LogicalResult SimInstantiateOp::verifyRegions() {
+  Region &body = getBody();
+  if (body.getNumArguments() != 1)
+    return emitError("entry block of body region must have the model instance "
+                     "as a single argument");
+  if (!llvm::isa<SimModelInstanceType>(body.getArgument(0).getType()))
+    return emitError("entry block argument type is not a model instance");
+  return success();
+}
+
+LogicalResult
+SimInstantiateOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  Operation *moduleOp = getSupportedModuleOp(
+      symbolTable, getOperation(),
+      llvm::cast<SimModelInstanceType>(getBody().getArgument(0).getType())
+          .getModel()
+          .getAttr());
+  if (!moduleOp)
+    return failure();
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SimSetInputOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+SimSetInputOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  Operation *moduleOp = getSupportedModuleOp(
+      symbolTable, getOperation(),
+      llvm::cast<SimModelInstanceType>(getInstance().getType())
+          .getModel()
+          .getAttr());
+  if (!moduleOp)
+    return failure();
+
+  std::optional<hw::ModulePort> port = getModulePort(moduleOp, getInput());
+  if (!port)
+    return emitOpError("port not found on model");
+
+  if (port->dir != hw::ModulePort::Direction::Input &&
+      port->dir != hw::ModulePort::Direction::InOut)
+    return emitOpError("port is not an input port");
+
+  if (port->type != getValue().getType())
+    return emitOpError(
+               "mismatched types between value and model port, port expects ")
+           << port->type;
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SimGetPortOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult
+SimGetPortOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  Operation *moduleOp = getSupportedModuleOp(
+      symbolTable, getOperation(),
+      llvm::cast<SimModelInstanceType>(getInstance().getType())
+          .getModel()
+          .getAttr());
+  if (!moduleOp)
+    return failure();
+
+  std::optional<hw::ModulePort> port = getModulePort(moduleOp, getPort());
+  if (!port)
+    return emitOpError("port not found on model");
+
+  if (port->type != getValue().getType())
+    return emitOpError(
+               "mismatched types between value and model port, port expects ")
+           << port->type;
+
+  return success();
+}
+
+//===----------------------------------------------------------------------===//
+// SimStepOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult SimStepOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
+  Operation *moduleOp = getSupportedModuleOp(
+      symbolTable, getOperation(),
+      llvm::cast<SimModelInstanceType>(getInstance().getType())
+          .getModel()
+          .getAttr());
+  if (!moduleOp)
+    return failure();
+
+  return success();
 }
 
 #include "circt/Dialect/Arc/ArcInterfaces.cpp.inc"

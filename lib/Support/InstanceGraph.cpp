@@ -80,7 +80,7 @@ InstanceGraph::InstanceGraph(Operation *parent) : parent(parent) {
     for (auto instanceOp : instances) {
       // Add an edge to indicate that this module instantiates the target.
       for (auto targetNameAttr : instanceOp.getReferencedModuleNamesAttr()) {
-        auto *targetNode = getOrAddNode(targetNameAttr.cast<StringAttr>());
+        auto *targetNode = getOrAddNode(cast<StringAttr>(targetNameAttr));
         currentNode->addInstance(instanceOp, targetNode);
       }
     }
@@ -106,14 +106,11 @@ void InstanceGraph::erase(InstanceGraphNode *node) {
   nodes.erase(node);
 }
 
-InstanceGraphNode *InstanceGraph::lookup(StringAttr name) {
+InstanceGraphNode *InstanceGraph::lookupOrNull(StringAttr name) {
   auto it = nodeMap.find(name);
-  assert(it != nodeMap.end() && "Module not in InstanceGraph!");
+  if (it == nodeMap.end())
+    return nullptr;
   return it->second;
-}
-
-InstanceGraphNode *InstanceGraph::lookup(ModuleOpInterface op) {
-  return lookup(cast<ModuleOpInterface>(op).getModuleNameAttr());
 }
 
 void InstanceGraph::replaceInstance(InstanceOpInterface inst,
@@ -125,7 +122,7 @@ void InstanceGraph::replaceInstance(InstanceOpInterface inst,
   // Replace all edges between the module of the instance and all targets.
   for (Attribute targetNameAttr : inst.getReferencedModuleNamesAttr()) {
     // Find the instance record of this instance.
-    auto *node = lookup(targetNameAttr.cast<StringAttr>());
+    auto *node = lookup(cast<StringAttr>(targetNameAttr));
     for (InstanceRecord *record : node->uses()) {
       if (record->getInstance() == inst) {
         // We can just replace the instance op in the InstanceRecord without
@@ -136,8 +133,9 @@ void InstanceGraph::replaceInstance(InstanceOpInterface inst,
   }
 }
 
-bool InstanceGraph::isAncestor(ModuleOpInterface child,
-                               ModuleOpInterface parent) {
+bool InstanceGraph::isAncestor(
+    ModuleOpInterface child, ModuleOpInterface parent,
+    llvm::function_ref<bool(InstanceRecord *)> skipInstance) {
   DenseSet<InstanceGraphNode *> seen;
   SmallVector<InstanceGraphNode *> worklist;
   auto *cn = lookup(child);
@@ -149,6 +147,8 @@ bool InstanceGraph::isAncestor(ModuleOpInterface child,
     if (node->getModule() == parent)
       return true;
     for (auto *use : node->uses()) {
+      if (skipInstance(use))
+        continue;
       auto *mod = use->getParent();
       if (!seen.count(mod)) {
         seen.insert(mod);
@@ -224,12 +224,18 @@ InstanceGraph::getInferredTopLevelNodes() {
 
 static InstancePath empty{};
 
-// NOLINTBEGIN(misc-no-recursion)
 ArrayRef<InstancePath>
 InstancePathCache::getAbsolutePaths(ModuleOpInterface op) {
+  return getAbsolutePaths(op, instanceGraph.getTopLevelNode());
+}
+
+// NOLINTBEGIN(misc-no-recursion)
+ArrayRef<InstancePath>
+InstancePathCache::getAbsolutePaths(ModuleOpInterface op,
+                                    InstanceGraphNode *top) {
   InstanceGraphNode *node = instanceGraph[op];
 
-  if (node == instanceGraph.getTopLevelNode()) {
+  if (node == top) {
     return empty;
   }
 
@@ -275,7 +281,7 @@ void InstancePath::print(llvm::raw_ostream &into) const {
     auto names = inst.getReferencedModuleNamesAttr();
     if (names.size() == 1) {
       // If there is a unique target, print it.
-      into << names[0].cast<StringAttr>().getValue();
+      into << cast<StringAttr>(names[0]).getValue();
     } else {
       if (i + 1 < n) {
         // If this is not a leaf node, the target module should be the
@@ -287,7 +293,7 @@ void InstancePath::print(llvm::raw_ostream &into) const {
         // Otherwise, print the whole set of targets.
         into << "{";
         llvm::interleaveComma(names, into, [&](Attribute name) {
-          into << name.cast<StringAttr>().getValue();
+          into << cast<StringAttr>(name).getValue();
         });
         into << "}";
       }

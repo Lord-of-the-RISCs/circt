@@ -29,8 +29,14 @@ MLIR_DEFINE_CAPI_DIALECT_REGISTRATION(OM, om, OMDialect)
 // Type API.
 //===----------------------------------------------------------------------===//
 
+/// Is the Type an AnyType.
+bool omTypeIsAAnyType(MlirType type) { return isa<AnyType>(unwrap(type)); }
+
+/// Get the TypeID for an AnyType.
+MlirTypeID omAnyTypeGetTypeID(void) { return wrap(AnyType::getTypeID()); }
+
 /// Is the Type a ClassType.
-bool omTypeIsAClassType(MlirType type) { return unwrap(type).isa<ClassType>(); }
+bool omTypeIsAClassType(MlirType type) { return isa<ClassType>(unwrap(type)); }
 
 /// Get the TypeID for a ClassType.
 MlirTypeID omClassTypeGetTypeID() { return wrap(ClassType::getTypeID()); }
@@ -60,9 +66,20 @@ MlirTypeID omFrozenPathTypeGetTypeID(void) {
   return wrap(FrozenPathType::getTypeID());
 }
 
+/// Is the Type a ListType.
+bool omTypeIsAListType(MlirType type) { return isa<ListType>(unwrap(type)); }
+
+/// Get the TypeID for a ListType.
+MlirTypeID omListTypeGetTypeID(void) { return wrap(ListType::getTypeID()); }
+
+// Return a element type of a ListType.
+MlirType omListTypeGetElementType(MlirType type) {
+  return wrap(cast<ListType>(unwrap(type)).getElementType());
+}
+
 /// Is the Type a StringType.
 bool omTypeIsAStringType(MlirType type) {
-  return unwrap(type).isa<StringType>();
+  return isa<StringType>(unwrap(type));
 }
 
 /// Get a StringType.
@@ -72,7 +89,7 @@ MlirType omStringTypeGet(MlirContext ctx) {
 
 /// Return a key type of a map.
 MlirType omMapTypeGetKeyType(MlirType type) {
-  return wrap(unwrap(type).cast<MapType>().getKeyType());
+  return wrap(cast<MapType>(unwrap(type)).getKeyType());
 }
 
 //===----------------------------------------------------------------------===//
@@ -117,7 +134,7 @@ OMEvaluatorValue omEvaluatorInstantiate(OMEvaluator evaluator,
   Evaluator *cppEvaluator = unwrap(evaluator);
 
   // Unwrap the className, which the client must supply as a StringAttr.
-  StringAttr cppClassName = unwrap(className).cast<StringAttr>();
+  StringAttr cppClassName = cast<StringAttr>(unwrap(className));
 
   // Unwrap the actual parameters.
   SmallVector<std::shared_ptr<evaluator::EvaluatorValue>> cppActualParams;
@@ -189,7 +206,7 @@ OMEvaluatorValue omEvaluatorObjectGetField(OMEvaluatorValue object,
   // supply as a StringAttr.
   FailureOr<EvaluatorValuePtr> result =
       llvm::cast<Object>(unwrap(object).get())
-          ->getField(unwrap(name).cast<StringAttr>());
+          ->getField(cast<StringAttr>(unwrap(name)));
 
   // If getField failed, return a null EvaluatorValue. A Diagnostic will be
   // emitted in this case.
@@ -325,17 +342,42 @@ MlirAttribute omEvaluatorPathGetAsString(OMEvaluatorValue evaluatorValue) {
   return wrap((Attribute)path->getAsString());
 }
 
+/// Query if the EvaluatorValue is a Reference.
+bool omEvaluatorValueIsAReference(OMEvaluatorValue evaluatorValue) {
+  return isa<evaluator::ReferenceValue>(unwrap(evaluatorValue).get());
+}
+
+/// Dereference a Reference EvaluatorValue. Emits an error and returns null if
+/// the Reference cannot be dereferenced.
+OMEvaluatorValue
+omEvaluatorValueGetReferenceValue(OMEvaluatorValue evaluatorValue) {
+  // Assert the EvaluatorValue is a Reference.
+  assert(omEvaluatorValueIsAReference(evaluatorValue));
+
+  // Attempt to get the final EvaluatorValue from the Reference.
+  auto result =
+      llvm::cast<evaluator::ReferenceValue>(unwrap(evaluatorValue).get())
+          ->getStrippedValue();
+
+  // If this failed, an error diagnostic has been emitted, and we return null.
+  if (failed(result))
+    return {};
+
+  // If this succeeded, wrap the EvaluatorValue and return it.
+  return wrap(result.value());
+}
+
 //===----------------------------------------------------------------------===//
 // ReferenceAttr API.
 //===----------------------------------------------------------------------===//
 
 bool omAttrIsAReferenceAttr(MlirAttribute attr) {
-  return unwrap(attr).isa<ReferenceAttr>();
+  return isa<ReferenceAttr>(unwrap(attr));
 }
 
 MlirAttribute omReferenceAttrGetInnerRef(MlirAttribute referenceAttr) {
   return wrap(
-      (Attribute)unwrap(referenceAttr).cast<ReferenceAttr>().getInnerRef());
+      (Attribute)cast<ReferenceAttr>(unwrap(referenceAttr)).getInnerRef());
 }
 
 //===----------------------------------------------------------------------===//
@@ -343,7 +385,7 @@ MlirAttribute omReferenceAttrGetInnerRef(MlirAttribute referenceAttr) {
 //===----------------------------------------------------------------------===//
 
 bool omAttrIsAIntegerAttr(MlirAttribute attr) {
-  return unwrap(attr).isa<circt::om::IntegerAttr>();
+  return isa<circt::om::IntegerAttr>(unwrap(attr));
 }
 
 MlirAttribute omIntegerAttrGetInt(MlirAttribute attr) {
@@ -356,12 +398,22 @@ MlirAttribute omIntegerAttrGet(MlirAttribute attr) {
       circt::om::IntegerAttr::get(integerAttr.getContext(), integerAttr));
 }
 
+/// Get a string representation of an om::IntegerAttr.
+MlirStringRef omIntegerAttrToString(MlirAttribute attr) {
+  mlir::IntegerAttr integerAttr =
+      cast<circt::om::IntegerAttr>(unwrap(attr)).getValue();
+  SmallVector<char> str;
+  integerAttr.getValue().toString(
+      str, /*Radix=*/10, /*Signed=*/integerAttr.getType().isSignedInteger());
+  return wrap(StringAttr::get(integerAttr.getContext(), str).getValue());
+}
+
 //===----------------------------------------------------------------------===//
 // ListAttr API.
 //===----------------------------------------------------------------------===//
 
 bool omAttrIsAListAttr(MlirAttribute attr) {
-  return unwrap(attr).isa<ListAttr>();
+  return isa<ListAttr>(unwrap(attr));
 }
 
 intptr_t omListAttrGetNumElements(MlirAttribute attr) {
@@ -378,9 +430,7 @@ MlirAttribute omListAttrGetElement(MlirAttribute attr, intptr_t pos) {
 // MapAttr API.
 //===----------------------------------------------------------------------===//
 
-bool omAttrIsAMapAttr(MlirAttribute attr) {
-  return unwrap(attr).isa<MapAttr>();
-}
+bool omAttrIsAMapAttr(MlirAttribute attr) { return isa<MapAttr>(unwrap(attr)); }
 
 intptr_t omMapAttrGetNumElements(MlirAttribute attr) {
   auto mapAttr = llvm::cast<MapAttr>(unwrap(attr));

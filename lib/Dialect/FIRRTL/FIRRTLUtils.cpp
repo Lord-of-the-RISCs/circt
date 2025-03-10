@@ -17,6 +17,7 @@
 #include "circt/Support/Naming.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/Path.h"
 
 using namespace circt;
 using namespace firrtl;
@@ -43,8 +44,14 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
       if (dstFType != srcFType)
         src = builder.create<RefCastOp>(dstFType, src);
       builder.create<RefDefineOp>(dst, src);
-    } else // Other types, give up and leave a connect
+    } else if (type_isa<PropertyType>(dstFType) &&
+               type_isa<PropertyType>(srcFType)) {
+      // Properties use propassign.
+      builder.create<PropAssignOp>(dst, src);
+    } else {
+      // Other types, give up and leave a connect
       builder.create<ConnectOp>(dst, src);
+    }
     return;
   }
 
@@ -57,7 +64,7 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
   // If the types are the exact same we can just connect them.
   if (dstType == srcType && dstType.isPassive() &&
       !dstType.hasUninferredWidth()) {
-    builder.create<StrictConnectOp>(dst, src);
+    builder.create<MatchingConnectOp>(dst, src);
     return;
   }
 
@@ -153,7 +160,7 @@ void circt::firrtl::emitConnect(ImplicitLocOpBuilder &builder, Value dst,
   // connecting uint<1> to abstract reset types.
   if (dstType == src.getType() && dstType.isPassive() &&
       !dstType.hasUninferredWidth()) {
-    builder.create<StrictConnectOp>(dst, src);
+    builder.create<MatchingConnectOp>(dst, src);
   } else
     builder.create<ConnectOp>(dst, src);
 }
@@ -181,7 +188,8 @@ IntegerAttr circt::firrtl::getIntZerosAttr(Type type) {
 /// type. This handles both the known width and unknown width case.
 IntegerAttr circt::firrtl::getIntOnesAttr(Type type) {
   int32_t width = abs(type_cast<IntType>(type).getWidthOrSentinel());
-  return getIntAttr(type, APInt(width, -1));
+  return getIntAttr(
+      type, APInt(width, -1, /*isSigned=*/false, /*implicitTrunc=*/true));
 }
 
 /// Return the single assignment to a Property value. It is assumed that the
@@ -451,7 +459,13 @@ bool circt::firrtl::walkDrivers(FIRRTLBaseValue value, bool lookThroughWires,
         auto subRef = fieldRef.getSubField(subID);
         auto subOriginal = original.getSubField(subID);
         auto value = subfield.getResult();
-        workStack.emplace_back(subOriginal, subRef, value, fieldID - subID);
+        // If fieldID is zero, this points to entire subfields.
+        if (fieldID == 0)
+          workStack.emplace_back(subOriginal, subRef, value, 0);
+        else {
+          assert(fieldID >= subID);
+          workStack.emplace_back(subOriginal, subRef, value, fieldID - subID);
+        }
       } else if (auto subindex = dyn_cast<SubindexOp>(user)) {
         FVectorType vectorType = subindex.getInput().getType();
         auto index = subindex.getIndex();
@@ -462,7 +476,13 @@ bool circt::firrtl::walkDrivers(FIRRTLBaseValue value, bool lookThroughWires,
         auto subRef = fieldRef.getSubField(subID);
         auto subOriginal = original.getSubField(subID);
         auto value = subindex.getResult();
-        workStack.emplace_back(subOriginal, subRef, value, fieldID - subID);
+        // If fieldID is zero, this points to entire subfields.
+        if (fieldID == 0)
+          workStack.emplace_back(subOriginal, subRef, value, 0);
+        else {
+          assert(fieldID >= subID);
+          workStack.emplace_back(subOriginal, subRef, value, fieldID - subID);
+        }
       } else if (auto connect = dyn_cast<FConnectLike>(user)) {
         // Make sure that this connect is driving the value.
         if (connect.getDest() != current)
@@ -752,6 +772,24 @@ hw::InnerSymTarget circt::firrtl::getTargetFor(FieldRef ref) {
   return hw::InnerSymTarget(root.getDefiningOp(), ref.getFieldID());
 }
 
+/// Get FieldRef pointing to the specified inner symbol target, which must be
+/// valid. Returns null FieldRef if target points to something with no value,
+/// such as a port of an external module.
+FieldRef circt::firrtl::getFieldRefForTarget(const hw::InnerSymTarget &ist) {
+  if (ist.isPort()) {
+    return TypeSwitch<Operation *, FieldRef>(ist.getOp())
+        .Case<FModuleOp>([&](auto fmod) {
+          return FieldRef(fmod.getArgument(ist.getPort()), ist.getField());
+        })
+        .Default({});
+  }
+
+  auto symOp = dyn_cast<hw::InnerSymbolOpInterface>(ist.getOp());
+  assert(symOp && symOp.getTargetResultIndex() &&
+         (symOp.supportsPerFieldSymbols() || ist.getField() == 0));
+  return FieldRef(symOp.getTargetResult(), ist.getField());
+}
+
 // Return InnerSymAttr with sym on specified fieldID.
 std::pair<hw::InnerSymAttr, StringAttr> circt::firrtl::getOrAddInnerSym(
     MLIRContext *context, hw::InnerSymAttr attr, uint64_t fieldID,
@@ -785,7 +823,7 @@ StringAttr circt::firrtl::getOrAddInnerSym(
       auto [attr, sym] =
           getOrAddInnerSym(mod.getContext(), mod.getPortSymbolAttr(portIdx),
                            target.getField(), getNamespace);
-      mod.setPortSymbolsAttr(portIdx, attr);
+      mod.setPortSymbolAttr(portIdx, attr);
       return sym;
     }
   } else {
@@ -1022,4 +1060,43 @@ Type circt::firrtl::lowerType(
     return IntegerType::get(type.getContext(), width);
 
   return {};
+}
+
+void circt::firrtl::makeCommonPrefix(SmallString<64> &a, StringRef b) {
+  // truncate 'a' to the common prefix of 'a' and 'b'.
+  size_t i = 0;
+  size_t e = std::min(a.size(), b.size());
+  for (; i < e; ++i)
+    if (a[i] != b[i])
+      break;
+  a.resize(i);
+
+  // truncate 'a' so it ends on a directory seperator.
+  auto sep = llvm::sys::path::get_separator();
+  while (!a.empty() && !a.ends_with(sep))
+    a.pop_back();
+}
+
+PathOp circt::firrtl::createPathRef(Operation *op, hw::HierPathOp nla,
+                                    mlir::ImplicitLocOpBuilder &builderOM) {
+
+  auto *context = op->getContext();
+  auto id = DistinctAttr::create(UnitAttr::get(context));
+  TargetKind kind = TargetKind::Reference;
+  // If op is null, then create an empty path.
+  if (op) {
+    NamedAttrList fields;
+    fields.append("id", id);
+    fields.append("class", StringAttr::get(context, "circt.tracker"));
+    if (nla)
+      fields.append("circt.nonlocal", mlir::FlatSymbolRefAttr::get(nla));
+    AnnotationSet annos(op);
+    annos.addAnnotations(DictionaryAttr::get(context, fields));
+    annos.applyToOperation(op);
+    if (isa<InstanceOp, FModuleLike>(op))
+      kind = TargetKind::Instance;
+  }
+
+  // Create the path operation.
+  return builderOM.create<PathOp>(kind, id);
 }

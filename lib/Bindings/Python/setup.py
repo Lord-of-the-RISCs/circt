@@ -6,9 +6,9 @@
 # Note that this includes a relatively large build of LLVM (~2400 C++ files)
 # and can take a considerable amount of time, especially with defaults.
 # To install:
-#   pip install . --use-feature=in-tree-build
+#   pip install .
 # To build a wheel:
-#   pip wheel . --use-feature=in-tree-build
+#   pip wheel .
 #
 # It is recommended to build with Ninja and ccache. To do so, set environment
 # variables by prefixing to above invocations:
@@ -75,7 +75,11 @@ class CMakeBuild(build_py):
     cmake_args = [
         "-DCMAKE_BUILD_TYPE=Release",  # not used on MSVC, but no harm
         "-DCMAKE_INSTALL_PREFIX={}".format(os.path.abspath(cmake_install_dir)),
-        "-DCMAKE_OSX_DEPLOYMENT_TARGET=10.14",  # on OSX, min target for C++17
+        # Use the minimum macOS deployment target that supports all c++17
+        # features.
+        #
+        # See: Notes column of https://developer.apple.com/xcode/cpp/#c++17
+        "-DCMAKE_OSX_DEPLOYMENT_TARGET=10.15",
         "-DPython3_EXECUTABLE={}".format(sys.executable.replace("\\", "/")),
         "-DLLVM_ENABLE_PROJECTS=mlir",
         "-DLLVM_EXTERNAL_PROJECTS=circt",

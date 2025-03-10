@@ -22,12 +22,20 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
 
+namespace circt {
+namespace esi {
+#define GEN_PASS_DEF_LOWERESITYPES
+#include "circt/Dialect/ESI/ESIPasses.h.inc"
+} // namespace esi
+} // namespace circt
+
 using namespace circt;
 using namespace circt::esi;
 
 namespace {
 /// Lower all "high-level" ESI types on modules to some lower construct.
-struct ESILowerTypesPass : public LowerESITypesBase<ESILowerTypesPass> {
+struct ESILowerTypesPass
+    : public circt::esi::impl::LowerESITypesBase<ESILowerTypesPass> {
   void runOnOperation() override;
 };
 } // anonymous namespace
@@ -45,21 +53,19 @@ public:
   }
 
 private:
-  static std::optional<mlir::Value> wrapMaterialization(OpBuilder &b,
-                                                        WindowType resultType,
-                                                        ValueRange inputs,
-                                                        Location loc) {
+  static mlir::Value wrapMaterialization(OpBuilder &b, WindowType resultType,
+                                         ValueRange inputs, Location loc) {
     if (inputs.size() != 1)
-      return std::nullopt;
+      return mlir::Value();
     auto wrap = b.create<WrapWindow>(loc, resultType, inputs[0]);
     return wrap.getWindow();
   }
 
-  static std::optional<mlir::Value>
-  unwrapMaterialization(OpBuilder &b, hw::UnionType resultType,
-                        ValueRange inputs, Location loc) {
+  static mlir::Value unwrapMaterialization(OpBuilder &b,
+                                           hw::UnionType resultType,
+                                           ValueRange inputs, Location loc) {
     if (inputs.size() != 1 || !isa<WindowType>(inputs[0].getType()))
-      return std::nullopt;
+      return mlir::Value();
     auto unwrap = b.create<UnwrapWindow>(loc, resultType, inputs[0]);
     return unwrap.getFrame();
   }

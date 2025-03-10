@@ -1,4 +1,7 @@
 add_subdirectory(Moore)
 add_subdirectory(FIRRTL)
+add_subdirectory(ESI)
 add_subdirectory(HW)
 add_subdirectory(OM)
+add_subdirectory(RTGTest)
+add_subdirectory(SMT)

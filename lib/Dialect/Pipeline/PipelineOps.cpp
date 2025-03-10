@@ -70,9 +70,9 @@ Block *circt::pipeline::getParentStageInPipeline(ScheduledPipelineOp pipeline,
 
 Block *circt::pipeline::getParentStageInPipeline(ScheduledPipelineOp pipeline,
                                                  Value v) {
-  if (v.isa<BlockArgument>())
+  if (isa<BlockArgument>(v))
     return getParentStageInPipeline(pipeline,
-                                    v.cast<BlockArgument>().getOwner());
+                                    cast<BlockArgument>(v).getOwner());
   return getParentStageInPipeline(pipeline, v.getDefiningOp());
 }
 
@@ -108,7 +108,7 @@ static void printOutputList(OpAsmPrinter &p, TypeRange types, ArrayAttr names) {
   p << "(";
   llvm::interleaveComma(llvm::zip(types, names), p, [&](auto it) {
     auto [type, name] = it;
-    p.printKeywordOrString(name.template cast<StringAttr>().str());
+    p.printKeywordOrString(cast<StringAttr>(name).str());
     p << " : " << type;
   });
   p << ")";
@@ -142,9 +142,11 @@ static ParseResult parsePipelineOp(mlir::OpAsmParser &parser,
   result.addAttribute("inputNames", inputNames);
 
   Type i1 = parser.getBuilder().getI1Type();
+
+  OpAsmParser::UnresolvedOperand stallOperand, clockOperand, resetOperand,
+      goOperand;
+
   // Parse optional 'stall (%stallArg)'
-  OpAsmParser::Argument stallArg;
-  OpAsmParser::UnresolvedOperand stallOperand;
   bool withStall = false;
   if (succeeded(parser.parseOptionalKeyword("stall"))) {
     if (parser.parseLParen() || parser.parseOperand(stallOperand) ||
@@ -154,10 +156,19 @@ static ParseResult parsePipelineOp(mlir::OpAsmParser &parser,
   }
 
   // Parse clock, reset, and go.
-  OpAsmParser::UnresolvedOperand clockOperand, resetOperand, goOperand;
-  if (parseKeywordAndOperand(parser, "clock", clockOperand) ||
-      parseKeywordAndOperand(parser, "reset", resetOperand) ||
-      parseKeywordAndOperand(parser, "go", goOperand))
+  if (parseKeywordAndOperand(parser, "clock", clockOperand))
+    return failure();
+
+  // Parse optional 'reset (%resetArg)'
+  bool withReset = false;
+  if (succeeded(parser.parseOptionalKeyword("reset"))) {
+    if (parser.parseLParen() || parser.parseOperand(resetOperand) ||
+        parser.parseRParen())
+      return failure();
+    withReset = true;
+  }
+
+  if (parseKeywordAndOperand(parser, "go", goOperand))
     return failure();
 
   // Parse entry stage enable block argument.
@@ -196,9 +207,13 @@ static ParseResult parsePipelineOp(mlir::OpAsmParser &parser,
   }
 
   Type clkType = seq::ClockType::get(parser.getContext());
-  if (parser.resolveOperand(clockOperand, clkType, result.operands) ||
-      parser.resolveOperand(resetOperand, i1, result.operands) ||
-      parser.resolveOperand(goOperand, i1, result.operands))
+  if (parser.resolveOperand(clockOperand, clkType, result.operands))
+    return failure();
+
+  if (withReset && parser.resolveOperand(resetOperand, i1, result.operands))
+    return failure();
+
+  if (parser.resolveOperand(goOperand, i1, result.operands))
     return failure();
 
   // Assemble the body region block arguments - this is where the magic happens
@@ -216,13 +231,13 @@ static ParseResult parsePipelineOp(mlir::OpAsmParser &parser,
   if (parser.parseRegion(*body, regionArgs))
     return failure();
 
-  result.addAttribute(
-      "operandSegmentSizes",
-      parser.getBuilder().getDenseI32ArrayAttr(
-          {static_cast<int32_t>(inputTypes.size()),
-           static_cast<int32_t>(withStall ? 1 : 0),
-           /*clock*/ static_cast<int32_t>(1),
-           /*reset*/ static_cast<int32_t>(1), /*go*/ static_cast<int32_t>(1)}));
+  result.addAttribute("operandSegmentSizes",
+                      parser.getBuilder().getDenseI32ArrayAttr(
+                          {static_cast<int32_t>(inputTypes.size()),
+                           static_cast<int32_t>(withStall ? 1 : 0),
+                           /*clock*/ static_cast<int32_t>(1),
+                           /*reset*/ static_cast<int32_t>(withReset ? 1 : 0),
+                           /*go*/ static_cast<int32_t>(1)}));
 
   return success();
 }
@@ -246,16 +261,17 @@ static void printPipelineOp(OpAsmPrinter &p, TPipelineOp op) {
 
   // Print the optional stall.
   if (op.hasStall()) {
-    p << "stall(";
-    p.printOperand(op.getStall());
-    p << ") ";
+    printKeywordOperand(p, "stall", op.getStall());
+    p << " ";
   }
 
   // Print the clock, reset, and go.
   printKeywordOperand(p, "clock", op.getClock());
   p << " ";
-  printKeywordOperand(p, "reset", op.getReset());
-  p << " ";
+  if (op.hasReset()) {
+    printKeywordOperand(p, "reset", op.getReset());
+    p << " ";
+  }
   printKeywordOperand(p, "go", op.getGo());
   p << " ";
 
@@ -290,7 +306,7 @@ static void printPipelineOp(OpAsmPrinter &p, TPipelineOp op) {
 static void buildPipelineLikeOp(OpBuilder &odsBuilder, OperationState &odsState,
                                 TypeRange dataOutputs, ValueRange inputs,
                                 ArrayAttr inputNames, ArrayAttr outputNames,
-                                Value clock, Value reset, Value go, Value stall,
+                                Value clock, Value go, Value reset, Value stall,
                                 StringAttr name, ArrayAttr stallability) {
   odsState.addOperands(inputs);
   if (stall)
@@ -371,7 +387,7 @@ getPipelineAsmBlockArgumentNames(TPipelineOp op, mlir::Region &region,
         auto arg = block.getArguments()[regI];
 
         if (regNames) {
-          auto nameAttr = (*regNames)[regI].dyn_cast<StringAttr>();
+          auto nameAttr = dyn_cast<StringAttr>((*regNames)[regI]);
           if (nameAttr && !nameAttr.strref().empty()) {
             setNameFn(arg, nameAttr);
             continue;
@@ -387,7 +403,7 @@ getPipelineAsmBlockArgumentNames(TPipelineOp op, mlir::Region &region,
 
         if (passthroughNames) {
           auto nameAttr =
-              (*passthroughNames)[passthroughI].dyn_cast<StringAttr>();
+              dyn_cast<StringAttr>((*passthroughNames)[passthroughI]);
           if (nameAttr && !nameAttr.strref().empty()) {
             setNameFn(arg, nameAttr);
             continue;
@@ -432,11 +448,11 @@ void UnscheduledPipelineOp::build(OpBuilder &odsBuilder,
                                   OperationState &odsState,
                                   TypeRange dataOutputs, ValueRange inputs,
                                   ArrayAttr inputNames, ArrayAttr outputNames,
-                                  Value clock, Value reset, Value go,
+                                  Value clock, Value go, Value reset,
                                   Value stall, StringAttr name,
                                   ArrayAttr stallability) {
   buildPipelineLikeOp(odsBuilder, odsState, dataOutputs, inputs, inputNames,
-                      outputNames, clock, reset, go, stall, name, stallability);
+                      outputNames, clock, go, reset, stall, name, stallability);
 }
 
 //===----------------------------------------------------------------------===//
@@ -453,10 +469,10 @@ ParseResult ScheduledPipelineOp::parse(OpAsmParser &parser,
 void ScheduledPipelineOp::build(OpBuilder &odsBuilder, OperationState &odsState,
                                 TypeRange dataOutputs, ValueRange inputs,
                                 ArrayAttr inputNames, ArrayAttr outputNames,
-                                Value clock, Value reset, Value go, Value stall,
+                                Value clock, Value go, Value reset, Value stall,
                                 StringAttr name, ArrayAttr stallability) {
   buildPipelineLikeOp(odsBuilder, odsState, dataOutputs, inputs, inputNames,
-                      outputNames, clock, reset, go, stall, name, stallability);
+                      outputNames, clock, go, reset, stall, name, stallability);
 }
 
 Block *ScheduledPipelineOp::addStage() {
@@ -543,7 +559,7 @@ LogicalResult ScheduledPipelineOp::verify() {
     bool err = true;
     if (block.getNumArguments() != 0) {
       auto lastArgType =
-          block.getArguments().back().getType().dyn_cast<IntegerType>();
+          dyn_cast<IntegerType>(block.getArguments().back().getType());
       err = !lastArgType || lastArgType.getWidth() != 1;
     }
     if (err)
@@ -631,7 +647,7 @@ StageKind ScheduledPipelineOp::getStageKind(size_t stageIndex) {
 
   if (stageIndex < stallability->size()) {
     bool stageIsStallable =
-        (*stallability)[stageIndex].cast<BoolAttr>().getValue();
+        cast<BoolAttr>((*stallability)[stageIndex]).getValue();
     if (!stageIsStallable) {
       // This is a non-stallable stage.
       return StageKind::NonStallable;
@@ -786,14 +802,13 @@ void printStageRegisters(OpAsmPrinter &p, Operation *op, ValueRange registers,
         size_t idx = it.index();
         auto &[reg, type, nClockGatesAttr] = it.value();
         if (names) {
-          if (auto nameAttr = names[idx].dyn_cast<StringAttr>();
+          if (auto nameAttr = dyn_cast<StringAttr>(names[idx]);
               nameAttr && !nameAttr.strref().empty())
             p << nameAttr << " = ";
         }
 
         p << reg << " : " << type;
-        int64_t nClockGates =
-            nClockGatesAttr.template cast<IntegerAttr>().getInt();
+        int64_t nClockGates = cast<IntegerAttr>(nClockGatesAttr).getInt();
         if (nClockGates == 0)
           return;
         p << " gated by [";
@@ -818,7 +833,7 @@ void printPassthroughs(OpAsmPrinter &p, Operation *op, ValueRange passthroughs,
         size_t idx = it.index();
         auto &[reg, type] = it.value();
         if (names) {
-          if (auto nameAttr = names[idx].dyn_cast<StringAttr>();
+          if (auto nameAttr = dyn_cast<StringAttr>(names[idx]);
               nameAttr && !nameAttr.strref().empty())
             p << nameAttr << " = ";
         }
@@ -985,6 +1000,12 @@ LogicalResult LatencyOp::verify() {
     // pipeline.
     return success();
   }
+
+  // Verify that there's at least one result type. Latency ops don't make sense
+  // if they're not delaying anything, and we're not yet prepared to support
+  // side-effectful bodies.
+  if (getNumResults() == 0)
+    return emitOpError("expected at least one result type.");
 
   // Verify that the resulting values aren't referenced before they are
   // accessible.

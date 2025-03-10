@@ -47,6 +47,7 @@ typedef struct HWModulePort HWModulePort;
 //===----------------------------------------------------------------------===//
 
 MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(HW, hw);
+MLIR_CAPI_EXPORTED void registerHWPasses(void);
 
 //===----------------------------------------------------------------------===//
 // Type API.
@@ -161,6 +162,7 @@ MLIR_CAPI_EXPORTED MlirStringRef hwTypeAliasTypeGetScope(MlirType typeAlias);
 
 MLIR_CAPI_EXPORTED bool hwAttrIsAInnerSymAttr(MlirAttribute);
 MLIR_CAPI_EXPORTED MlirAttribute hwInnerSymAttrGet(MlirAttribute symName);
+MLIR_CAPI_EXPORTED MlirAttribute hwInnerSymAttrGetEmpty(MlirContext ctx);
 MLIR_CAPI_EXPORTED MlirAttribute hwInnerSymAttrGetSymName(MlirAttribute);
 
 MLIR_CAPI_EXPORTED bool hwAttrIsAInnerRefAttr(MlirAttribute);

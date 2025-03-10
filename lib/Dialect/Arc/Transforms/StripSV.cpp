@@ -9,7 +9,6 @@
 #include "circt/Dialect/Arc/ArcOps.h"
 #include "circt/Dialect/Arc/ArcPasses.h"
 #include "circt/Dialect/Comb/CombOps.h"
-#include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -74,11 +73,6 @@ void StripSVPass::runOnOperation() {
   }
   LLVM_DEBUG(llvm::dbgs() << "Found " << clockGateModuleNames.size()
                           << " clock gates\n");
-
-  // Remove OM dialect nodes.
-  for (auto &op : llvm::make_early_inc_range(*mlirModule.getBody()))
-    if (isa<om::OMDialect>(op.getDialect()))
-      op.erase();
 
   // Remove `sv.*` operation attributes.
   mlirModule.walk([](Operation *op) {
@@ -150,9 +144,20 @@ void StripSVPass::runOnOperation() {
         else
           next = reg.getNext();
 
+        Value presetValue;
+        // Materialize initial value, assume zero initialization as default.
+        if (reg.getPreset() && !reg.getPreset()->isZero()) {
+          assert(hw::type_isa<IntegerType>(reg.getType()) &&
+                 "cannot lower non integer preset");
+          presetValue = circt::seq::createConstantInitialValue(
+              builder, reg.getLoc(),
+              IntegerAttr::get(reg.getType(), *reg.getPreset()));
+        }
+
         Value compReg = builder.create<seq::CompRegOp>(
             reg.getLoc(), next.getType(), next, reg.getClk(), reg.getNameAttr(),
-            Value{}, Value{}, Value{}, reg.getInnerSymAttr());
+            Value{}, Value{}, /*initialValue*/ presetValue,
+            reg.getInnerSymAttr());
         reg.replaceAllUsesWith(compReg);
         opsToDelete.push_back(reg);
         continue;

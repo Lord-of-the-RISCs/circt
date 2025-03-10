@@ -10,13 +10,18 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOpInterfaces.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Transforms/Passes.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Transforms/DialectConversion.h"
+
+namespace circt {
+#define GEN_PASS_DEF_MAPARITHTOCOMBPASS
+#include "circt/Transforms/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
@@ -29,7 +34,7 @@ class MapArithTypeConverter : public mlir::TypeConverter {
 public:
   MapArithTypeConverter() {
     addConversion([](Type type) {
-      if (type.isa<mlir::IntegerType>())
+      if (isa<mlir::IntegerType>(type))
         return type;
 
       return Type();
@@ -147,7 +152,8 @@ public:
   }
 };
 
-struct MapArithToCombPass : public MapArithToCombPassBase<MapArithToCombPass> {
+struct MapArithToCombPass
+    : public circt::impl::MapArithToCombPassBase<MapArithToCombPass> {
 public:
   void runOnOperation() override {
     auto *ctx = &getContext();
@@ -157,25 +163,7 @@ public:
     target.addIllegalDialect<arith::ArithDialect>();
     MapArithTypeConverter typeConverter;
     RewritePatternSet patterns(ctx);
-
-    patterns.insert<OneToOnePattern<arith::AddIOp, comb::AddOp>,
-                    OneToOnePattern<arith::SubIOp, comb::SubOp>,
-                    OneToOnePattern<arith::MulIOp, comb::MulOp>,
-                    OneToOnePattern<arith::DivSIOp, comb::DivSOp>,
-                    OneToOnePattern<arith::DivUIOp, comb::DivUOp>,
-                    OneToOnePattern<arith::RemSIOp, comb::ModSOp>,
-                    OneToOnePattern<arith::RemUIOp, comb::ModUOp>,
-                    OneToOnePattern<arith::AndIOp, comb::AndOp>,
-                    OneToOnePattern<arith::OrIOp, comb::OrOp>,
-                    OneToOnePattern<arith::XOrIOp, comb::XorOp>,
-                    OneToOnePattern<arith::ShLIOp, comb::ShlOp>,
-                    OneToOnePattern<arith::ShRSIOp, comb::ShrSOp>,
-                    OneToOnePattern<arith::ShRUIOp, comb::ShrUOp>,
-                    OneToOnePattern<arith::ConstantOp, hw::ConstantOp, true>,
-                    OneToOnePattern<arith::SelectOp, comb::MuxOp>,
-                    ExtSConversionPattern, ExtZConversionPattern,
-                    TruncateConversionPattern, CompConversionPattern>(
-        typeConverter, ctx);
+    populateArithToCombPatterns(patterns, typeConverter);
 
     if (failed(applyPartialConversion(getOperation(), target,
                                       std::move(patterns))))
@@ -184,6 +172,28 @@ public:
 };
 
 } // namespace
+
+void circt::populateArithToCombPatterns(mlir::RewritePatternSet &patterns,
+                                        TypeConverter &typeConverter) {
+  patterns.insert<OneToOnePattern<arith::AddIOp, comb::AddOp>,
+                  OneToOnePattern<arith::SubIOp, comb::SubOp>,
+                  OneToOnePattern<arith::MulIOp, comb::MulOp>,
+                  OneToOnePattern<arith::DivSIOp, comb::DivSOp>,
+                  OneToOnePattern<arith::DivUIOp, comb::DivUOp>,
+                  OneToOnePattern<arith::RemSIOp, comb::ModSOp>,
+                  OneToOnePattern<arith::RemUIOp, comb::ModUOp>,
+                  OneToOnePattern<arith::AndIOp, comb::AndOp>,
+                  OneToOnePattern<arith::OrIOp, comb::OrOp>,
+                  OneToOnePattern<arith::XOrIOp, comb::XorOp>,
+                  OneToOnePattern<arith::ShLIOp, comb::ShlOp>,
+                  OneToOnePattern<arith::ShRSIOp, comb::ShrSOp>,
+                  OneToOnePattern<arith::ShRUIOp, comb::ShrUOp>,
+                  OneToOnePattern<arith::ConstantOp, hw::ConstantOp, true>,
+                  OneToOnePattern<arith::SelectOp, comb::MuxOp>,
+                  ExtSConversionPattern, ExtZConversionPattern,
+                  TruncateConversionPattern, CompConversionPattern>(
+      typeConverter, patterns.getContext());
+}
 
 std::unique_ptr<mlir::Pass> circt::createMapArithToCombPass() {
   return std::make_unique<MapArithToCombPass>();

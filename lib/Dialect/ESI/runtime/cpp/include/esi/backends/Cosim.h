@@ -23,17 +23,25 @@
 #include "esi/Accelerator.h"
 
 #include <memory>
+#include <set>
 
 namespace esi {
+namespace cosim {
+class ChannelDesc;
+}
+
 namespace backends {
 namespace cosim {
+class CosimEngine;
 
 /// Connect to an ESI simulation.
 class CosimAccelerator : public esi::AcceleratorConnection {
-public:
-  struct Impl;
+  friend class CosimEngine;
 
+public:
   CosimAccelerator(Context &, std::string hostname, uint16_t port);
+  ~CosimAccelerator();
+
   static std::unique_ptr<AcceleratorConnection>
   connect(Context &, std::string connectionString);
 
@@ -45,11 +53,14 @@ public:
   // Set the way this connection will retrieve the manifest.
   void setManifestMethod(ManifestMethod method);
 
-  /// Request the host side channel ports for a particular instance (identified
-  /// by the AppID path). For convenience, provide the bundle type and direction
-  /// of the bundle port.
-  virtual std::map<std::string, ChannelPort &>
-  requestChannelsFor(AppIDPath, const BundleType *) override;
+  // C++ doesn't have a mechanism to forward declare a nested class and we don't
+  // want to include the generated header here. So we have to wrap it in a
+  // forward-declared struct we write ourselves.
+  struct StubContainer;
+
+  void createEngine(const std::string &engineTypeName, AppIDPath idPath,
+                    const ServiceImplDetails &details,
+                    const HWClientDetails &clients) override;
 
 protected:
   virtual Service *createService(Service::Type service, AppIDPath path,
@@ -58,7 +69,12 @@ protected:
                                  const HWClientDetails &clients) override;
 
 private:
-  std::unique_ptr<Impl> impl;
+  StubContainer *rpcClient;
+
+  // We own all channels connected to rpcClient since their lifetime is tied to
+  // rpcClient.
+  std::set<std::unique_ptr<ChannelPort>> channels;
+
   ManifestMethod manifestMethod = Cosim;
 };
 

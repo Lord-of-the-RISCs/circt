@@ -25,6 +25,12 @@ MLIR_DECLARE_CAPI_DIALECT_REGISTRATION(OM, om);
 // Type API.
 //===----------------------------------------------------------------------===//
 
+/// Is the Type an AnyType.
+MLIR_CAPI_EXPORTED bool omTypeIsAAnyType(MlirType type);
+
+/// Get the TypeID for an AnyType.
+MLIR_CAPI_EXPORTED MlirTypeID omAnyTypeGetTypeID(void);
+
 /// Is the Type a ClassType.
 MLIR_CAPI_EXPORTED bool omTypeIsAClassType(MlirType type);
 
@@ -45,6 +51,15 @@ MLIR_CAPI_EXPORTED bool omTypeIsAFrozenPathType(MlirType type);
 
 /// Get the TypeID for a FrozenPathType.
 MLIR_CAPI_EXPORTED MlirTypeID omFrozenPathTypeGetTypeID(void);
+
+/// Is the Type a ListType.
+MLIR_CAPI_EXPORTED bool omTypeIsAListType(MlirType type);
+
+/// Get the TypeID for a ListType.
+MLIR_CAPI_EXPORTED MlirTypeID omListTypeGetTypeID(void);
+
+// Return a element type of a ListType.
+MLIR_CAPI_EXPORTED MlirType omListTypeGetElementType(MlirType type);
 
 /// Is the Type a MapType.
 MLIR_CAPI_EXPORTED bool omTypeIsAMapType(MlirType type);
@@ -207,6 +222,15 @@ omEvaluatorValueIsAPath(OMEvaluatorValue evaluatorValue);
 MLIR_CAPI_EXPORTED MlirAttribute
 omEvaluatorPathGetAsString(OMEvaluatorValue evaluatorValue);
 
+/// Query if the EvaluatorValue is a Reference.
+MLIR_CAPI_EXPORTED bool
+omEvaluatorValueIsAReference(OMEvaluatorValue evaluatorValue);
+
+/// Dereference a Reference EvaluatorValue. Emits an error and returns null if
+/// the Reference cannot be dereferenced.
+MLIR_CAPI_EXPORTED OMEvaluatorValue
+omEvaluatorValueGetReferenceValue(OMEvaluatorValue evaluatorValue);
+
 //===----------------------------------------------------------------------===//
 // ReferenceAttr API
 //===----------------------------------------------------------------------===//
@@ -226,6 +250,9 @@ MLIR_CAPI_EXPORTED MlirAttribute omIntegerAttrGetInt(MlirAttribute attr);
 
 /// Get an om::IntegerAttr from mlir::IntegerAttr.
 MLIR_CAPI_EXPORTED MlirAttribute omIntegerAttrGet(MlirAttribute attr);
+
+/// Get a string representation of an om::IntegerAttr.
+MLIR_CAPI_EXPORTED MlirStringRef omIntegerAttrToString(MlirAttribute attr);
 
 //===----------------------------------------------------------------------===//
 // ListAttr API

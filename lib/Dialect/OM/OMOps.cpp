@@ -77,6 +77,37 @@ static void printPathString(OpAsmPrinter &p, Operation *op, PathAttr path,
 //===----------------------------------------------------------------------===//
 // Shared definitions
 //===----------------------------------------------------------------------===//
+static ParseResult parseClassFieldsList(OpAsmParser &parser,
+                                        SmallVectorImpl<Attribute> &fieldNames,
+                                        SmallVectorImpl<Type> &fieldTypes) {
+
+  llvm::StringMap<SMLoc> nameLocMap;
+  auto parseElt = [&]() -> ParseResult {
+    // Parse the field name.
+    std::string fieldName;
+    if (parser.parseKeywordOrString(&fieldName))
+      return failure();
+    SMLoc currLoc = parser.getCurrentLocation();
+    if (nameLocMap.count(fieldName)) {
+      parser.emitError(currLoc, "field \"")
+          << fieldName << "\" is defined twice";
+      parser.emitError(nameLocMap[fieldName]) << "previous definition is here";
+      return failure();
+    }
+    nameLocMap[fieldName] = currLoc;
+    fieldNames.push_back(StringAttr::get(parser.getContext(), fieldName));
+
+    // Parse the field type.
+    fieldTypes.emplace_back();
+    if (parser.parseColonType(fieldTypes.back()))
+      return failure();
+
+    return success();
+  };
+
+  return parser.parseCommaSeparatedList(OpAsmParser::Delimiter::Paren,
+                                        parseElt);
+}
 
 static ParseResult parseClassLike(OpAsmParser &parser, OperationState &state) {
   // Parse the Class symbol name.
@@ -90,6 +121,23 @@ static ParseResult parseClassLike(OpAsmParser &parser, OperationState &state) {
   if (parser.parseArgumentList(args, OpAsmParser::Delimiter::Paren,
                                /*allowType=*/true, /*allowAttrs=*/false))
     return failure();
+
+  SmallVector<Type> fieldTypes;
+  SmallVector<Attribute> fieldNames;
+  if (succeeded(parser.parseOptionalArrow()))
+    if (failed(parseClassFieldsList(parser, fieldNames, fieldTypes)))
+      return failure();
+
+  SmallVector<NamedAttribute> fieldTypesMap;
+  if (!fieldNames.empty()) {
+    for (auto [name, type] : zip(fieldNames, fieldTypes))
+      fieldTypesMap.push_back(
+          NamedAttribute(cast<StringAttr>(name), TypeAttr::get(type)));
+  }
+  auto *ctx = parser.getContext();
+  state.addAttribute("fieldNames", mlir::ArrayAttr::get(ctx, fieldNames));
+  state.addAttribute("fieldTypes",
+                     mlir::DictionaryAttr::get(ctx, fieldTypesMap));
 
   // Parse the optional attribute dictionary.
   if (failed(parser.parseOptionalAttrDictWithKeyword(state.attributes)))
@@ -134,9 +182,27 @@ static void printClassLike(ClassLike classLike, OpAsmPrinter &printer) {
   }
   printer << ") ";
 
+  ArrayRef<Attribute> fieldNames =
+      cast<ArrayAttr>(classLike->getAttr("fieldNames")).getValue();
+
+  if (!fieldNames.empty()) {
+    printer << " -> (";
+    for (size_t i = 0, e = fieldNames.size(); i < e; ++i) {
+      if (i != 0)
+        printer << ", ";
+      StringAttr name = cast<StringAttr>(fieldNames[i]);
+      printer.printKeywordOrString(name.getValue());
+      printer << ": ";
+      Type type = classLike.getFieldType(name).value();
+      printer.printType(type);
+    }
+    printer << ") ";
+  }
+
   // Print the optional attribute dictionary.
   SmallVector<StringRef> elidedAttrs{classLike.getSymNameAttrName(),
-                                     classLike.getFormalParamNamesAttrName()};
+                                     classLike.getFormalParamNamesAttrName(),
+                                     "fieldTypes", "fieldNames"};
   printer.printOptionalAttrDictWithKeyword(classLike.getOperation()->getAttrs(),
                                            elidedAttrs);
 
@@ -174,6 +240,32 @@ void getClassLikeAsmBlockArgumentNames(ClassLike classLike, Region &region,
     setNameFn(args[i], argNames[i]);
 }
 
+NamedAttribute makeFieldType(StringAttr name, Type type) {
+  return NamedAttribute(name, TypeAttr::get(type));
+}
+
+NamedAttribute makeFieldIdx(MLIRContext *ctx, mlir::StringAttr name,
+                            unsigned i) {
+  return NamedAttribute(StringAttr(name),
+                        mlir::IntegerAttr::get(mlir::IndexType::get(ctx), i));
+}
+
+std::optional<Type> getClassLikeFieldType(ClassLike classLike,
+                                          StringAttr name) {
+  DictionaryAttr fieldTypes = mlir::cast<DictionaryAttr>(
+      classLike.getOperation()->getAttr("fieldTypes"));
+  Attribute type = fieldTypes.get(name);
+  if (!type)
+    return std::nullopt;
+  return cast<TypeAttr>(type).getValue();
+}
+
+void replaceClassLikeFieldTypes(ClassLike classLike,
+                                AttrTypeReplacer &replacer) {
+  classLike->setAttr("fieldTypes", cast<DictionaryAttr>(replacer.replace(
+                                       classLike.getFieldTypes())));
+}
+
 //===----------------------------------------------------------------------===//
 // ClassOp
 //===----------------------------------------------------------------------===//
@@ -183,35 +275,29 @@ ParseResult circt::om::ClassOp::parse(OpAsmParser &parser,
   return parseClassLike(parser, state);
 }
 
-void circt::om::ClassOp::build(OpBuilder &odsBuilder, OperationState &odsState,
-                               Twine name,
-                               ArrayRef<StringRef> formalParamNames) {
-  return build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
-               odsBuilder.getStrArrayAttr(formalParamNames));
-}
-
 circt::om::ClassOp circt::om::ClassOp::buildSimpleClassOp(
     OpBuilder &odsBuilder, Location loc, Twine name,
     ArrayRef<StringRef> formalParamNames, ArrayRef<StringRef> fieldNames,
     ArrayRef<Type> fieldTypes) {
   circt::om::ClassOp classOp = odsBuilder.create<circt::om::ClassOp>(
       loc, odsBuilder.getStringAttr(name),
-      odsBuilder.getStrArrayAttr(formalParamNames));
+      odsBuilder.getStrArrayAttr(formalParamNames),
+      odsBuilder.getStrArrayAttr(fieldNames),
+      odsBuilder.getDictionaryAttr(llvm::map_to_vector(
+          llvm::zip(fieldNames, fieldTypes), [&](auto field) -> NamedAttribute {
+            return NamedAttribute(odsBuilder.getStringAttr(std::get<0>(field)),
+                                  TypeAttr::get(std::get<1>(field)));
+          })));
   Block *body = &classOp.getRegion().emplaceBlock();
   auto prevLoc = odsBuilder.saveInsertionPoint();
   odsBuilder.setInsertionPointToEnd(body);
-  for (auto [name, type] : llvm::zip(fieldNames, fieldTypes))
-    odsBuilder.create<circt::om::ClassFieldOp>(loc, name,
-                                               body->addArgument(type, loc));
+  odsBuilder.create<ClassFieldsOp>(
+      loc, llvm::map_to_vector(fieldTypes, [&](Type type) -> Value {
+        return body->addArgument(type, loc);
+      }));
   odsBuilder.restoreInsertionPoint(prevLoc);
 
   return classOp;
-}
-
-void circt::om::ClassOp::build(OpBuilder &odsBuilder, OperationState &odsState,
-                               Twine name) {
-  return build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
-               odsBuilder.getStrArrayAttr({}));
 }
 
 void circt::om::ClassOp::print(OpAsmPrinter &printer) {
@@ -220,16 +306,135 @@ void circt::om::ClassOp::print(OpAsmPrinter &printer) {
 
 LogicalResult circt::om::ClassOp::verify() { return verifyClassLike(*this); }
 
+LogicalResult circt::om::ClassOp::verifyRegions() {
+  auto fieldsOp = cast<ClassFieldsOp>(this->getBodyBlock()->getTerminator());
+
+  // The number of results matches the number of terminator operands.
+  if (fieldsOp.getNumOperands() != this->getFieldNames().size()) {
+    auto diag = this->emitOpError()
+                << "returns '" << this->getFieldNames().size()
+                << "' fields, but its terminator returned '"
+                << fieldsOp.getNumOperands() << "' fields";
+    return diag.attachNote(fieldsOp.getLoc()) << "see terminator:";
+  }
+
+  // The type of each result matches the corresponding terminator operand type.
+  auto types = this->getFieldTypes();
+  for (auto [fieldName, terminatorOperandType] :
+       llvm::zip(this->getFieldNames(), fieldsOp.getOperandTypes())) {
+
+    if (terminatorOperandType ==
+        cast<TypeAttr>(types.get(cast<StringAttr>(fieldName))).getValue())
+      continue;
+
+    auto diag = this->emitOpError()
+                << "returns different field types than its terminator";
+    return diag.attachNote(fieldsOp.getLoc()) << "see terminator:";
+  }
+
+  return success();
+}
+
 void circt::om::ClassOp::getAsmBlockArgumentNames(
     Region &region, OpAsmSetValueNameFn setNameFn) {
   getClassLikeAsmBlockArgumentNames(*this, region, setNameFn);
 }
 
-//===----------------------------------------------------------------------===//
-// ClassFieldOp
-//===----------------------------------------------------------------------===//
+std::optional<mlir::Type>
+circt::om::ClassOp::getFieldType(mlir::StringAttr field) {
+  return getClassLikeFieldType(*this, field);
+}
 
-Type circt::om::ClassFieldOp::getType() { return getValue().getType(); }
+void circt::om::ClassOp::replaceFieldTypes(AttrTypeReplacer replacer) {
+  replaceClassLikeFieldTypes(*this, replacer);
+}
+
+void circt::om::ClassOp::updateFields(
+    mlir::ArrayRef<mlir::Location> newLocations,
+    mlir::ArrayRef<mlir::Value> newValues,
+    mlir::ArrayRef<mlir::Attribute> newNames) {
+
+  auto fieldsOp = getFieldsOp();
+  assert(fieldsOp && "The fields op should exist");
+  // Get field names.
+  SmallVector<Attribute> names(getFieldNamesAttr().getAsRange<StringAttr>());
+  // Get the field types.
+  SmallVector<NamedAttribute> fieldTypes(getFieldTypesAttr().getValue());
+  // Get the field values.
+  SmallVector<Value> fieldVals(fieldsOp.getFields());
+  // Get the field locations.
+  Location fieldOpLoc = fieldsOp->getLoc();
+
+  // Extract the locations per field.
+  SmallVector<Location> locations;
+  if (auto fl = dyn_cast<FusedLoc>(fieldOpLoc)) {
+    auto metadataArr = dyn_cast<ArrayAttr>(fl.getMetadata());
+    assert(metadataArr && "Expected the metadata for the fused location");
+    auto r = metadataArr.getAsRange<LocationAttr>();
+    locations.append(r.begin(), r.end());
+  } else {
+    // Assume same loc for every field.
+    locations.append(names.size(), fieldOpLoc);
+  }
+
+  // Append the new names, locations and values.
+  names.append(newNames.begin(), newNames.end());
+  locations.append(newLocations.begin(), newLocations.end());
+  fieldVals.append(newValues.begin(), newValues.end());
+
+  // Construct the new field types from values and names.
+  for (auto [v, n] : llvm::zip(newValues, newNames))
+    fieldTypes.emplace_back(
+        NamedAttribute(llvm::cast<StringAttr>(n), TypeAttr::get(v.getType())));
+
+  // Keep the locations as array on the metadata.
+  SmallVector<Attribute> locationsAttr;
+  llvm::for_each(locations, [&](Location &l) {
+    locationsAttr.push_back(cast<Attribute>(l));
+  });
+
+  ImplicitLocOpBuilder builder(getLoc(), *this);
+  // Update the field names attribute.
+  setFieldNamesAttr(builder.getArrayAttr(names));
+  // Update the fields type attribute.
+  setFieldTypesAttr(builder.getDictionaryAttr(fieldTypes));
+  fieldsOp.getFieldsMutable().assign(fieldVals);
+  // Update the location.
+  fieldsOp->setLoc(builder.getFusedLoc(
+      locations, ArrayAttr::get(getContext(), locationsAttr)));
+}
+
+void circt::om::ClassOp::addNewFieldsOp(mlir::OpBuilder &builder,
+                                        mlir::ArrayRef<Location> locs,
+                                        mlir::ArrayRef<Value> values) {
+  // Store the original locations as a metadata array so that unique locations
+  // are preserved as a mapping from field index to location
+  mlir::SmallVector<Attribute> locAttrs;
+  for (auto loc : locs) {
+    locAttrs.push_back(cast<Attribute>(LocationAttr(loc)));
+  }
+  // Also store the locations incase there's some other analysis that might
+  // be able to use the default FusedLoc representation.
+  builder.create<ClassFieldsOp>(
+      builder.getFusedLoc(locs, builder.getArrayAttr(locAttrs)), values);
+}
+
+mlir::Location circt::om::ClassOp::getFieldLocByIndex(size_t i) {
+  Location loc = this->getFieldsOp()->getLoc();
+  if (auto locs = dyn_cast<FusedLoc>(loc)) {
+    // Because it's possible for a user to construct a fields op directly and
+    // place a FusedLoc that doersn't follow the storage format of
+    // addNewFieldsOp, we assert the information has been stored appropriately
+    ArrayAttr metadataArr = dyn_cast<ArrayAttr>(locs.getMetadata());
+    assert(metadataArr && "Expected fused loc to store metadata array");
+    assert(i < metadataArr.size() &&
+           "expected index to be less than array size");
+    LocationAttr locAttr = dyn_cast<LocationAttr>(metadataArr[i]);
+    assert(locAttr && "expected metadataArr entry to be location attribute");
+    loc = Location(locAttr);
+  }
+  return loc;
+}
 
 //===----------------------------------------------------------------------===//
 // ClassExternOp
@@ -240,19 +445,6 @@ ParseResult circt::om::ClassExternOp::parse(OpAsmParser &parser,
   return parseClassLike(parser, state);
 }
 
-void circt::om::ClassExternOp::build(OpBuilder &odsBuilder,
-                                     OperationState &odsState, Twine name) {
-  return build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
-               odsBuilder.getStrArrayAttr({}));
-}
-
-void circt::om::ClassExternOp::build(OpBuilder &odsBuilder,
-                                     OperationState &odsState, Twine name,
-                                     ArrayRef<StringRef> formalParamNames) {
-  return build(odsBuilder, odsState, odsBuilder.getStringAttr(name),
-               odsBuilder.getStrArrayAttr(formalParamNames));
-}
-
 void circt::om::ClassExternOp::print(OpAsmPrinter &printer) {
   printClassLike(*this, printer);
 }
@@ -261,11 +453,10 @@ LogicalResult circt::om::ClassExternOp::verify() {
   if (failed(verifyClassLike(*this))) {
     return failure();
   }
-
-  // Verify that only external class field declarations are present in the body.
-  for (auto &op : getOps())
-    if (!isa<ClassExternFieldOp>(op))
-      return op.emitOpError("not allowed in external class");
+  // Verify body is empty
+  if (!this->getBodyBlock()->getOperations().empty()) {
+    return this->emitOpError("external class body should be empty");
+  }
 
   return success();
 }
@@ -273,6 +464,15 @@ LogicalResult circt::om::ClassExternOp::verify() {
 void circt::om::ClassExternOp::getAsmBlockArgumentNames(
     Region &region, OpAsmSetValueNameFn setNameFn) {
   getClassLikeAsmBlockArgumentNames(*this, region, setNameFn);
+}
+
+std::optional<mlir::Type>
+circt::om::ClassExternOp::getFieldType(mlir::StringAttr field) {
+  return getClassLikeFieldType(*this, field);
+}
+
+void circt::om::ClassExternOp::replaceFieldTypes(AttrTypeReplacer replacer) {
+  replaceClassLikeFieldTypes(*this, replacer);
 }
 
 //===----------------------------------------------------------------------===//
@@ -326,69 +526,6 @@ circt::om::ObjectOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
              << formalTypes[i] << ')';
     }
   }
-
-  return success();
-}
-
-//===----------------------------------------------------------------------===//
-// ObjectFieldOp
-//===----------------------------------------------------------------------===//
-
-LogicalResult
-circt::om::ObjectFieldOp::verifySymbolUses(SymbolTableCollection &symbolTable) {
-  // Get the ObjectInstOp and the ClassLike it is an instance of.
-  ObjectOp objectInst = getObject().getDefiningOp<ObjectOp>();
-  ClassLike classDef = cast<ClassLike>(symbolTable.lookupNearestSymbolFrom(
-      *this, objectInst.getClassNameAttr()));
-
-  // Traverse the field path, verifying each field exists.
-  ClassFieldLike finalField;
-  auto fields = SmallVector<FlatSymbolRefAttr>(
-      getFieldPath().getAsRange<FlatSymbolRefAttr>());
-  for (size_t i = 0, e = fields.size(); i < e; ++i) {
-    // Verify the field exists on the ClassOp.
-    auto field = fields[i];
-    ClassFieldLike fieldDef;
-    classDef.walk([&](ClassFieldLike fieldLike) {
-      if (fieldLike.getNameAttr() == field.getAttr()) {
-        fieldDef = fieldLike;
-        return WalkResult::interrupt();
-      }
-      return WalkResult::advance();
-    });
-    if (!fieldDef) {
-      auto error = emitOpError("referenced non-existant field ") << field;
-      error.attachNote(classDef.getLoc()) << "class defined here";
-      return error;
-    }
-
-    // If there are more fields, verify the current field is of ClassType, and
-    // look up the ClassOp for that field.
-    if (i < e - 1) {
-      auto classType = fieldDef.getType().dyn_cast<ClassType>();
-      if (!classType)
-        return emitOpError("nested field access into ")
-               << field << " requires a ClassType, but found "
-               << fieldDef.getType();
-
-      // The nested ClassOp must exist, since a field with ClassType must be
-      // an ObjectInstOp, which already verifies the class exists.
-      classDef = cast<ClassLike>(
-          symbolTable.lookupNearestSymbolFrom(*this, classType.getClassName()));
-
-      // Proceed to the next field in the path.
-      continue;
-    }
-
-    // On the last iteration down the path, save the final field being accessed.
-    finalField = fieldDef;
-  }
-
-  // Verify the accessed field type matches the result type.
-  if (finalField.getType() != getResult().getType())
-    return emitOpError("expected type ")
-           << getResult().getType() << ", but accessed field has type "
-           << finalField.getType();
 
   return success();
 }
@@ -457,13 +594,14 @@ LogicalResult TupleCreateOp::inferReturnTypes(
 
 LogicalResult TupleGetOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> location, ValueRange operands,
-    DictionaryAttr attributes, OpaqueProperties, RegionRange regions,
+    DictionaryAttr attributes, OpaqueProperties properties, RegionRange regions,
     llvm::SmallVectorImpl<Type> &inferredReturnTypes) {
-  auto idx = attributes.getAs<mlir::IntegerAttr>("index");
+  Adaptor adaptor(operands, attributes, properties, regions);
+  auto idx = adaptor.getIndexAttr();
   if (operands.empty() || !idx)
     return failure();
 
-  auto tupleTypes = operands[0].getType().cast<TupleType>().getTypes();
+  auto tupleTypes = cast<TupleType>(adaptor.getInput().getType()).getTypes();
   if (tupleTypes.size() <= idx.getValue().getLimitedValue()) {
     if (location)
       mlir::emitError(*location,
@@ -485,8 +623,8 @@ void circt::om::MapCreateOp::print(OpAsmPrinter &p) {
   p << " ";
   p.printOperands(getInputs());
   p.printOptionalAttrDict((*this)->getAttrs());
-  p << " : " << getType().cast<circt::om::MapType>().getKeyType() << ", "
-    << getType().cast<circt::om::MapType>().getValueType();
+  p << " : " << cast<circt::om::MapType>(getType()).getKeyType() << ", "
+    << cast<circt::om::MapType>(getType()).getValueType();
 }
 
 ParseResult circt::om::MapCreateOp::parse(OpAsmParser &parser,
@@ -543,6 +681,48 @@ FailureOr<llvm::APSInt>
 IntegerAddOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
                                        const llvm::APSInt &rhs) {
   return success(lhs + rhs);
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerMulOp
+//===----------------------------------------------------------------------===//
+
+FailureOr<llvm::APSInt>
+IntegerMulOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
+                                       const llvm::APSInt &rhs) {
+  return success(lhs * rhs);
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerShrOp
+//===----------------------------------------------------------------------===//
+
+FailureOr<llvm::APSInt>
+IntegerShrOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
+                                       const llvm::APSInt &rhs) {
+  // Check non-negative constraint from operation semantics.
+  if (!rhs.isNonNegative())
+    return emitOpError("shift amount must be non-negative");
+  // Check size constraint from implementation detail of using getExtValue.
+  if (!rhs.isRepresentableByInt64())
+    return emitOpError("shift amount must be representable in 64 bits");
+  return success(lhs >> rhs.getExtValue());
+}
+
+//===----------------------------------------------------------------------===//
+// IntegerShlOp
+//===----------------------------------------------------------------------===//
+
+FailureOr<llvm::APSInt>
+IntegerShlOp::evaluateIntegerOperation(const llvm::APSInt &lhs,
+                                       const llvm::APSInt &rhs) {
+  // Check non-negative constraint from operation semantics.
+  if (!rhs.isNonNegative())
+    return emitOpError("shift amount must be non-negative");
+  // Check size constraint from implementation detail of using getExtValue.
+  if (!rhs.isRepresentableByInt64())
+    return emitOpError("shift amount must be representable in 64 bits");
+  return success(lhs << rhs.getExtValue());
 }
 
 //===----------------------------------------------------------------------===//

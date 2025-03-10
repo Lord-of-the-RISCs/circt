@@ -33,6 +33,7 @@ hw.module @Loopback (in %clk: !seq.clock) {
 }
 
 esi.manifest.sym @Loopback name "LoopbackIP" version "v0.0" summary "IP which simply echos bytes" {foo=1}
+esi.manifest.constants @Loopback {depth=5:ui32}
 
 esi.service.std.func @funcs
 
@@ -54,13 +55,13 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 
 // HIER-LABEL:  esi.manifest.compressed <"{{.+}}">
 // HIER-LABEL:  esi.manifest.hier_root @top {
-// HIER-NEXT:     esi.manifest.service_impl #esi.appid<"cosim"> svc @HostComms by "cosim" with {} {
-// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[0]>, #esi.appid<"loopback_tohw">] req <@HostComms::@Recv>(!esi.bundle<[!esi.channel<i8> to "recv"]>) with {channel_assignments = {recv = "loopback_inst[0].loopback_tohw.recv"}}
-// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[0]>, #esi.appid<"loopback_fromhw">] req <@HostComms::@Send>(!esi.bundle<[!esi.channel<i8> from "send"]>) with {channel_assignments = {send = "loopback_inst[0].loopback_fromhw.send"}}
-// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[0]>, #esi.appid<"loopback_fromhw_i0">] req <@HostComms::@SendI0>(!esi.bundle<[!esi.channel<i0> from "send"]>) with {channel_assignments = {send = "loopback_inst[0].loopback_fromhw_i0.send"}}
-// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[1]>, #esi.appid<"loopback_tohw">] req <@HostComms::@Recv>(!esi.bundle<[!esi.channel<i8> to "recv"]>) with {channel_assignments = {recv = "loopback_inst[1].loopback_tohw.recv"}}
-// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[1]>, #esi.appid<"loopback_fromhw">] req <@HostComms::@Send>(!esi.bundle<[!esi.channel<i8> from "send"]>) with {channel_assignments = {send = "loopback_inst[1].loopback_fromhw.send"}}
-// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[1]>, #esi.appid<"loopback_fromhw_i0">] req <@HostComms::@SendI0>(!esi.bundle<[!esi.channel<i0> from "send"]>) with {channel_assignments = {send = "loopback_inst[1].loopback_fromhw_i0.send"}}
+// HIER-NEXT:     esi.manifest.service_impl #esi.appid<"cosim"> svc @HostComms by "cosim" engine with {} {
+// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[0]>, #esi.appid<"loopback_tohw">] req <@HostComms::@Recv>(!esi.bundle<[!esi.channel<i8> to "recv"]>) channels {recv = {name = "loopback_inst[0].loopback_tohw.recv", type = "cosim"}}
+// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[0]>, #esi.appid<"loopback_fromhw">] req <@HostComms::@Send>(!esi.bundle<[!esi.channel<i8> from "send"]>) channels {send = {name = "loopback_inst[0].loopback_fromhw.send", type = "cosim"}}
+// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[0]>, #esi.appid<"loopback_fromhw_i0">] req <@HostComms::@SendI0>(!esi.bundle<[!esi.channel<i0> from "send"]>) channels {send = {name = "loopback_inst[0].loopback_fromhw_i0.send", type = "cosim"}}
+// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[1]>, #esi.appid<"loopback_tohw">] req <@HostComms::@Recv>(!esi.bundle<[!esi.channel<i8> to "recv"]>) channels {recv = {name = "loopback_inst[1].loopback_tohw.recv", type = "cosim"}}
+// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[1]>, #esi.appid<"loopback_fromhw">] req <@HostComms::@Send>(!esi.bundle<[!esi.channel<i8> from "send"]>) channels {send = {name = "loopback_inst[1].loopback_fromhw.send", type = "cosim"}}
+// HIER-NEXT:       esi.manifest.impl_conn [#esi.appid<"loopback_inst"[1]>, #esi.appid<"loopback_fromhw_i0">] req <@HostComms::@SendI0>(!esi.bundle<[!esi.channel<i0> from "send"]>) channels {send = {name = "loopback_inst[1].loopback_fromhw_i0.send", type = "cosim"}}
 // HIER-NEXT:     }
 // HIER-NEXT:     esi.manifest.hier_node #esi.appid<"loopback_inst"[0]> mod @Loopback {
 // HIER-NEXT:       esi.manifest.req #esi.appid<"loopback_tohw">, <@HostComms::@Recv>, !esi.bundle<[!esi.channel<i8> to "recv"]>
@@ -75,16 +76,16 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // HIER-NEXT:     esi.manifest.req #esi.appid<"func1">, <@funcs::@call> std "esi.service.std.func", !esi.bundle<[!esi.channel<i16> to "arg", !esi.channel<i16> from "result"]>
 // HIER-NEXT:   }
 
-// HW-LABEL:    hw.module @__ESI_Manifest_ROM(in %clk : !seq.clock, in %address : i30, out data : i32) {
+// HW-LABEL:    hw.module @__ESI_Manifest_ROM(in %clk : !seq.clock, in %address : i29, out data : i64) {
 // HW:            [[R0:%.+]] = hw.aggregate_constant
-// HW:            [[R1:%.+]] = sv.reg : !hw.inout<uarray<{{.*}}xi32>>
-// HW:            sv.assign [[R1]], [[R0]] : !hw.uarray<{{.*}}xi32>
-// HW:            [[R2:%.+]] = comb.extract %address from 0 : (i30) -> i9
-// HW:            [[R3:%.+]] = seq.compreg  [[R2]], %clk : i9
-// HW:            [[R4:%.+]] = sv.array_index_inout [[R1]][[[R3]]] : !hw.inout<uarray<{{.*}}xi32>>, i9
-// HW:            [[R5:%.+]] = sv.read_inout [[R4]] : !hw.inout<i32>
-// HW:            [[R6:%.+]] = seq.compreg  [[R5]], %clk : i32
-// HW:            hw.output [[R6]] : i32
+// HW:            [[R1:%.+]] = sv.reg : !hw.inout<uarray<{{.*}}xi64>>
+// HW:            sv.assign [[R1]], [[R0]] : !hw.uarray<{{.*}}xi64>
+// HW:            [[R2:%.+]] = comb.extract %address from 0 : (i29) -> i8
+// HW:            [[R3:%.+]] = seq.compreg  [[R2]], %clk : i8
+// HW:            [[R4:%.+]] = sv.array_index_inout [[R1]][[[R3]]] : !hw.inout<uarray<{{.*}}xi64>>, i8
+// HW:            [[R5:%.+]] = sv.read_inout [[R4]] : !hw.inout<i64>
+// HW:            [[R6:%.+]] = seq.compreg  [[R5]], %clk : i64
+// HW:            hw.output [[R6]] : i64
 
 // HW-LABEL:    hw.module @top
 // HW:            hw.instance "__manifest" @__ESIManifest() -> ()
@@ -92,33 +93,38 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // HW-LABEL:    hw.module @__ESIManifest()
 // HW:            hw.instance "__manifest" @Cosim_Manifest<COMPRESSED_MANIFEST_SIZE: i32 = {{.+}}>(compressed_manifest: %{{.+}}: !hw.array<{{.+}}xi8>) -> ()
 
-// CHECK:       {
-// CHECK-LABEL:   "api_version": 1,
-
-// CHECK-LABEL:   "symbols": [
-// CHECK-NEXT:      {
-// CHECK-NEXT:        "foo": 1,
-// CHECK-NEXT:        "name": "LoopbackIP",
-// CHECK-NEXT:        "summary": "IP which simply echos bytes",
-// CHECK-NEXT:        "symbolRef": "@Loopback",
-// CHECK-NEXT:        "version": "v0.0"
-// CHECK-NEXT:      }
-// CHECK-NEXT:    ],
+// CHECK-LABEL: {
+// CHECK-LABEL:   "apiVersion": 0,
 
 // CHECK-LABEL:   "design": {
-// CHECK-NEXT:      "inst_of": "@top",
-// CHECK-NEXT:      "contents": [
+// CHECK-NEXT:      "instanceOf": "@top",
+// CHECK-NEXT:      "clientPorts": [
 // CHECK-NEXT:        {
-// CHECK-NEXT:          "class": "service",
+// CHECK-NEXT:          "appID": {
+// CHECK-NEXT:            "name": "func1"
+// CHECK-NEXT:          },
+// CHECK-NEXT:          "typeID": "!esi.bundle<[!esi.channel<i16> to \"arg\", !esi.channel<i16> from \"result\"]>",
+// CHECK-NEXT:          "servicePort": {
+// CHECK-NEXT:            "port": "call",
+// CHECK-NEXT:            "serviceName": "@funcs"
+// CHECK-NEXT:          }
+// CHECK-NEXT:        }
+// CHECK-NEXT:      ],
+
+// CHECK-LABEL:     "engines": [
+// CHECK-NEXT:        {
 // CHECK-NEXT:          "appID": {
 // CHECK-NEXT:            "name": "cosim"
 // CHECK-NEXT:          },
 // CHECK-NEXT:          "service": "@HostComms",
 // CHECK-NEXT:          "serviceImplName": "cosim",
-// CHECK-NEXT:          "client_details": [
+// CHECK-NEXT:          "clientDetails": [
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "channel_assignments": {
-// CHECK-NEXT:                "recv": "loopback_inst[0].loopback_tohw.recv"
+// CHECK-NEXT:              "channelAssignments": {
+// CHECK-NEXT:                "recv": {
+// CHECK-NEXT:                  "name": "loopback_inst[0].loopback_tohw.recv",
+// CHECK-NEXT:                  "type": "cosim"
+// CHECK-NEXT:                }
 // CHECK-NEXT:              },
 // CHECK-NEXT:              "relAppIDPath": [
 // CHECK-NEXT:                {
@@ -130,13 +136,16 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:                }
 // CHECK-NEXT:              ],
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Recv",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Recv",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "channel_assignments": {
-// CHECK-NEXT:                "send": "loopback_inst[0].loopback_fromhw.send"
+// CHECK-NEXT:              "channelAssignments": {
+// CHECK-NEXT:                "send": {
+// CHECK-NEXT:                  "name": "loopback_inst[0].loopback_fromhw.send",
+// CHECK-NEXT:                  "type": "cosim"
+// CHECK-NEXT:                }
 // CHECK-NEXT:              },
 // CHECK-NEXT:              "relAppIDPath": [
 // CHECK-NEXT:                {
@@ -148,13 +157,16 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:                }
 // CHECK-NEXT:              ],
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Send",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Send",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "channel_assignments": {
-// CHECK-NEXT:                "send": "loopback_inst[0].loopback_fromhw_i0.send"
+// CHECK-NEXT:              "channelAssignments": {
+// CHECK-NEXT:                "send": {
+// CHECK-NEXT:                  "name": "loopback_inst[0].loopback_fromhw_i0.send",
+// CHECK-NEXT:                  "type": "cosim"
+// CHECK-NEXT:                }
 // CHECK-NEXT:              },
 // CHECK-NEXT:              "relAppIDPath": [
 // CHECK-NEXT:                {
@@ -166,13 +178,16 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:                }
 // CHECK-NEXT:              ],
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "SendI0",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "SendI0",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "channel_assignments": {
-// CHECK-NEXT:                "recv": "loopback_inst[1].loopback_tohw.recv"
+// CHECK-NEXT:              "channelAssignments": {
+// CHECK-NEXT:                "recv": {
+// CHECK-NEXT:                  "name": "loopback_inst[1].loopback_tohw.recv",
+// CHECK-NEXT:                  "type": "cosim"
+// CHECK-NEXT:                }
 // CHECK-NEXT:              },
 // CHECK-NEXT:              "relAppIDPath": [
 // CHECK-NEXT:                {
@@ -184,13 +199,16 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:                }
 // CHECK-NEXT:              ],
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Recv",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Recv",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "channel_assignments": {
-// CHECK-NEXT:                "send": "loopback_inst[1].loopback_fromhw.send"
+// CHECK-NEXT:              "channelAssignments": {
+// CHECK-NEXT:                "send": {
+// CHECK-NEXT:                  "name": "loopback_inst[1].loopback_fromhw.send",
+// CHECK-NEXT:                  "type": "cosim"
+// CHECK-NEXT:                }
 // CHECK-NEXT:              },
 // CHECK-NEXT:              "relAppIDPath": [
 // CHECK-NEXT:                {
@@ -202,13 +220,16 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:                }
 // CHECK-NEXT:              ],
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Send",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Send",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "channel_assignments": {
-// CHECK-NEXT:                "send": "loopback_inst[1].loopback_fromhw_i0.send"
+// CHECK-NEXT:              "channelAssignments": {
+// CHECK-NEXT:                "send": {
+// CHECK-NEXT:                  "name": "loopback_inst[1].loopback_fromhw_i0.send",
+// CHECK-NEXT:                  "type": "cosim"
+// CHECK-NEXT:                }
 // CHECK-NEXT:              },
 // CHECK-NEXT:              "relAppIDPath": [
 // CHECK-NEXT:                {
@@ -220,121 +241,90 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:                }
 // CHECK-NEXT:              ],
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "SendI0",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "SendI0",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            }
 // CHECK-NEXT:          ]
-// CHECK-NEXT:        },
-// CHECK-NEXT:        {
-// CHECK-NEXT:          "class": "client_port",
-// CHECK-NEXT:          "appID": {
-// CHECK-NEXT:            "name": "func1"
-// CHECK-NEXT:          },
-// CHECK-NEXT:          "bundleType": {
-// CHECK-NEXT:            "circt_name": "!esi.bundle<[!esi.channel<i16> to \"arg\", !esi.channel<i16> from \"result\"]>"
-// CHECK-NEXT:          },
-// CHECK-NEXT:          "servicePort": {
-// CHECK-NEXT:            "inner": "call",
-// CHECK-NEXT:            "outer_sym": "funcs"
-// CHECK-NEXT:          },
-// CHECK-NEXT:          "stdService": "esi.service.std.func"
 // CHECK-NEXT:        }
 // CHECK-NEXT:      ],
-// CHECK-NEXT:      "children": [
+
+// CHECK-LABEL:     "children": [
 // CHECK-NEXT:        {
-// CHECK-NEXT:          "app_id": {
+// CHECK-NEXT:          "appID": {
 // CHECK-NEXT:            "index": 0,
 // CHECK-NEXT:            "name": "loopback_inst"
 // CHECK-NEXT:          },
-// CHECK-NEXT:          "inst_of": "@Loopback",
-// CHECK-NEXT:          "contents": [
+// CHECK-NEXT:          "instanceOf": "@Loopback",
+// CHECK-NEXT:          "clientPorts": [
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "class": "client_port",
 // CHECK-NEXT:              "appID": {
 // CHECK-NEXT:                "name": "loopback_tohw"
 // CHECK-NEXT:              },
-// CHECK-NEXT:              "bundleType": {
-// CHECK-NEXT:                "circt_name": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>"
-// CHECK-NEXT:              },
+// CHECK-NEXT:              "typeID": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>",
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Recv",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Recv",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "class": "client_port",
 // CHECK-NEXT:              "appID": {
 // CHECK-NEXT:                "name": "loopback_fromhw"
 // CHECK-NEXT:              },
-// CHECK-NEXT:              "bundleType": {
-// CHECK-NEXT:                "circt_name": "!esi.bundle<[!esi.channel<i8> from \"send\"]>"
-// CHECK-NEXT:              },
+// CHECK-NEXT:              "typeID": "!esi.bundle<[!esi.channel<i8> from \"send\"]>",
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Send",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Send",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "class": "client_port",
 // CHECK-NEXT:              "appID": {
 // CHECK-NEXT:                "name": "loopback_fromhw_i0"
 // CHECK-NEXT:              },
-// CHECK-NEXT:              "bundleType": {
-// CHECK-NEXT:                "circt_name": "!esi.bundle<[!esi.channel<i0> from \"send\"]>"
-// CHECK-NEXT:              },
+// CHECK-NEXT:              "typeID": "!esi.bundle<[!esi.channel<i0> from \"send\"]>",
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "SendI0",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "SendI0",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            }
 // CHECK-NEXT:          ],
 // CHECK-NEXT:          "children": []
 // CHECK-NEXT:        },
 // CHECK-NEXT:        {
-// CHECK-NEXT:          "app_id": {
+// CHECK-NEXT:          "appID": {
 // CHECK-NEXT:            "index": 1,
 // CHECK-NEXT:            "name": "loopback_inst"
 // CHECK-NEXT:          },
-// CHECK-NEXT:          "inst_of": "@Loopback",
-// CHECK-NEXT:          "contents": [
+// CHECK-NEXT:          "instanceOf": "@Loopback",
+// CHECK-NEXT:          "clientPorts": [
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "class": "client_port",
 // CHECK-NEXT:              "appID": {
 // CHECK-NEXT:                "name": "loopback_tohw"
 // CHECK-NEXT:              },
-// CHECK-NEXT:              "bundleType": {
-// CHECK-NEXT:                "circt_name": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>"
-// CHECK-NEXT:              },
+// CHECK-NEXT:              "typeID": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>",
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Recv",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Recv",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "class": "client_port",
 // CHECK-NEXT:              "appID": {
 // CHECK-NEXT:                "name": "loopback_fromhw"
 // CHECK-NEXT:              },
-// CHECK-NEXT:              "bundleType": {
-// CHECK-NEXT:                "circt_name": "!esi.bundle<[!esi.channel<i8> from \"send\"]>"
-// CHECK-NEXT:              },
+// CHECK-NEXT:              "typeID": "!esi.bundle<[!esi.channel<i8> from \"send\"]>",
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "Send",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "Send",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            },
 // CHECK-NEXT:            {
-// CHECK-NEXT:              "class": "client_port",
 // CHECK-NEXT:              "appID": {
 // CHECK-NEXT:                "name": "loopback_fromhw_i0"
 // CHECK-NEXT:              },
-// CHECK-NEXT:              "bundleType": {
-// CHECK-NEXT:                "circt_name": "!esi.bundle<[!esi.channel<i0> from \"send\"]>"
-// CHECK-NEXT:              },
+// CHECK-NEXT:              "typeID": "!esi.bundle<[!esi.channel<i0> from \"send\"]>",
 // CHECK-NEXT:              "servicePort": {
-// CHECK-NEXT:                "inner": "SendI0",
-// CHECK-NEXT:                "outer_sym": "HostComms"
+// CHECK-NEXT:                "port": "SendI0",
+// CHECK-NEXT:                "serviceName": "@HostComms"
 // CHECK-NEXT:              }
 // CHECK-NEXT:            }
 // CHECK-NEXT:          ],
@@ -343,75 +333,57 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:      ]
 // CHECK-NEXT:    },
 
-// CHECK-LABEL:   "service_decls": [
+// CHECK-LABEL:   "serviceDeclarations": [
 // CHECK-NEXT:      {
-// CHECK-NEXT:        "symbol": "HostComms",
+// CHECK-NEXT:        "symbol": "@HostComms",
 // CHECK-NEXT:        "ports": [
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "name": "Send",
-// CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.bundle<[!esi.channel<i8> from \"send\"]>"
-// CHECK-NEXT:            }
+// CHECK-NEXT:            "typeID": "!esi.bundle<[!esi.channel<i8> from \"send\"]>"
 // CHECK-NEXT:          },
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "name": "Recv",
-// CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>"
-// CHECK-NEXT:            }
+// CHECK-NEXT:            "typeID": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>"
 // CHECK-NEXT:          },
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "name": "SendI0",
-// CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.bundle<[!esi.channel<i0> from \"send\"]>"
-// CHECK-NEXT:            }
+// CHECK-NEXT:            "typeID": "!esi.bundle<[!esi.channel<i0> from \"send\"]>"
 // CHECK-NEXT:          }
 // CHECK-NEXT:        ]
 // CHECK-NEXT:      },
 // CHECK-NEXT:      {
-// CHECK-NEXT:        "symbol": "funcs",
-// CHECK-NEXT:        "type_name": "esi.service.std.func",
+// CHECK-NEXT:        "symbol": "@funcs",
+// CHECK-NEXT:        "serviceName": "esi.service.std.func",
 // CHECK-NEXT:        "ports": [
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "name": "call",
-// CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "type": {
-// CHECK-NEXT:                "channels": [
-// CHECK-NEXT:                  {
-// CHECK-NEXT:                    "direction": "to",
-// CHECK-NEXT:                    "name": "arg",
-// CHECK-NEXT:                    "type": {
-// CHECK-NEXT:                      "circt_name": "!esi.channel<!esi.any>",
-// CHECK-NEXT:                      "dialect": "esi",
-// CHECK-NEXT:                      "inner": {
-// CHECK-NEXT:                        "circt_name": "!esi.any",
-// CHECK-NEXT:                        "dialect": "esi",
-// CHECK-NEXT:                        "mnemonic": "any"
-// CHECK-NEXT:                      },
-// CHECK-NEXT:                      "mnemonic": "channel"
-// CHECK-NEXT:                    }
-// CHECK-NEXT:                  },
-// CHECK-NEXT:                  {
-// CHECK-NEXT:                    "direction": "from",
-// CHECK-NEXT:                    "name": "result",
-// CHECK-NEXT:                    "type": {
-// CHECK-NEXT:                      "circt_name": "!esi.channel<!esi.any>",
-// CHECK-NEXT:                      "dialect": "esi",
-// CHECK-NEXT:                      "inner": {
-// CHECK-NEXT:                        "circt_name": "!esi.any",
-// CHECK-NEXT:                        "dialect": "esi",
-// CHECK-NEXT:                        "mnemonic": "any"
-// CHECK-NEXT:                      },
-// CHECK-NEXT:                      "mnemonic": "channel"
-// CHECK-NEXT:                    }
-// CHECK-NEXT:                  }
-// CHECK-NEXT:                ],
-// CHECK-NEXT:                "circt_name": "!esi.bundle<[!esi.channel<!esi.any> to \"arg\", !esi.channel<!esi.any> from \"result\"]>",
-// CHECK-NEXT:                "dialect": "esi",
-// CHECK-NEXT:                "mnemonic": "bundle"
-// CHECK-NEXT:              }
-// CHECK-NEXT:            }
+// CHECK-NEXT:            "typeID": "!esi.bundle<[!esi.channel<!esi.any> to \"arg\", !esi.channel<!esi.any> from \"result\"]>"
 // CHECK-NEXT:          }
 // CHECK-NEXT:        ]
+// CHECK-NEXT:      }
+// CHECK-NEXT:    ],
+
+// CHECK-LABEL:   "modules": [
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "symbol": "@top"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "symbol": "@Loopback",
+// CHECK-NEXT:        "symInfo": {
+// CHECK-NEXT:          "foo": {
+// CHECK-NEXT:            "type": "i64",
+// CHECK-NEXT:            "value": 1
+// CHECK-NEXT:          },
+// CHECK-NEXT:          "name": "LoopbackIP",
+// CHECK-NEXT:          "summary": "IP which simply echos bytes",
+// CHECK-NEXT:          "version": "v0.0"
+// CHECK-NEXT:        },
+// CHECK-NEXT:        "symConsts": {
+// CHECK-NEXT:          "depth": {
+// CHECK-NEXT:            "type": "ui32",
+// CHECK-NEXT:            "value": 5
+// CHECK-NEXT:          }
+// CHECK-NEXT:        }
 // CHECK-NEXT:      }
 // CHECK-NEXT:    ],
 
@@ -420,87 +392,15 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:        "channels": [
 // CHECK-NEXT:          {
 // CHECK-NEXT:            "direction": "to",
-// CHECK-NEXT:            "name": "recv",
-// CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.channel<i8>",
-// CHECK-NEXT:              "dialect": "esi",
-// CHECK-NEXT:              "hw_bitwidth": 8,
-// CHECK-NEXT:              "inner": {
-// CHECK-NEXT:                "circt_name": "i8",
-// CHECK-NEXT:                "dialect": "builtin",
-// CHECK-NEXT:                "hw_bitwidth": 8,
-// CHECK-NEXT:                "mnemonic": "int",
-// CHECK-NEXT:                "signedness": "signless"
-// CHECK-NEXT:              },
-// CHECK-NEXT:              "mnemonic": "channel"
-// CHECK-NEXT:            }
-// CHECK-NEXT:          }
-// CHECK-NEXT:        ],
-// CHECK-NEXT:        "circt_name": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>",
-// CHECK-NEXT:        "dialect": "esi",
-// CHECK-NEXT:        "mnemonic": "bundle"
-// CHECK-NEXT:      },
-// CHECK-NEXT:      {
-// CHECK-NEXT:        "channels": [
-// CHECK-NEXT:          {
-// CHECK-NEXT:            "direction": "from",
-// CHECK-NEXT:            "name": "send",
-// CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.channel<i8>",
-// CHECK-NEXT:              "dialect": "esi",
-// CHECK-NEXT:              "hw_bitwidth": 8,
-// CHECK-NEXT:              "inner": {
-// CHECK-NEXT:                "circt_name": "i8",
-// CHECK-NEXT:                "dialect": "builtin",
-// CHECK-NEXT:                "hw_bitwidth": 8,
-// CHECK-NEXT:                "mnemonic": "int",
-// CHECK-NEXT:                "signedness": "signless"
-// CHECK-NEXT:              },
-// CHECK-NEXT:              "mnemonic": "channel"
-// CHECK-NEXT:            }
-// CHECK-NEXT:          }
-// CHECK-NEXT:        ],
-// CHECK-NEXT:        "circt_name": "!esi.bundle<[!esi.channel<i8> from \"send\"]>",
-// CHECK-NEXT:        "dialect": "esi",
-// CHECK-NEXT:        "mnemonic": "bundle"
-// CHECK-NEXT:      },
-// CHECK-NEXT:      {
-// CHECK-NEXT:        "channels": [
-// CHECK-NEXT:          {
-// CHECK-NEXT:            "direction": "from",
-// CHECK-NEXT:            "name": "send",
-// CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.channel<i0>",
-// CHECK-NEXT:              "dialect": "esi",
-// CHECK-NEXT:              "hw_bitwidth": 0,
-// CHECK-NEXT:              "inner": {
-// CHECK-NEXT:                "circt_name": "i0",
-// CHECK-NEXT:                "dialect": "builtin",
-// CHECK-NEXT:                "hw_bitwidth": 0,
-// CHECK-NEXT:                "mnemonic": "int",
-// CHECK-NEXT:                "signedness": "signless"
-// CHECK-NEXT:              },
-// CHECK-NEXT:              "mnemonic": "channel"
-// CHECK-NEXT:            }
-// CHECK-NEXT:          }
-// CHECK-NEXT:        ],
-// CHECK-NEXT:        "circt_name": "!esi.bundle<[!esi.channel<i0> from \"send\"]>",
-// CHECK-NEXT:        "dialect": "esi",
-// CHECK-NEXT:        "mnemonic": "bundle"
-// CHECK-NEXT:      },
-// CHECK-NEXT:      {
-// CHECK-NEXT:        "channels": [
-// CHECK-NEXT:          {
-// CHECK-NEXT:            "direction": "to",
 // CHECK-NEXT:            "name": "arg",
 // CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.channel<i16>",
 // CHECK-NEXT:              "dialect": "esi",
-// CHECK-NEXT:              "hw_bitwidth": 16,
+// CHECK-NEXT:              "hwBitwidth": 16,
+// CHECK-NEXT:              "id": "!esi.channel<i16>",
 // CHECK-NEXT:              "inner": {
-// CHECK-NEXT:                "circt_name": "i16",
 // CHECK-NEXT:                "dialect": "builtin",
-// CHECK-NEXT:                "hw_bitwidth": 16,
+// CHECK-NEXT:                "hwBitwidth": 16,
+// CHECK-NEXT:                "id": "i16",
 // CHECK-NEXT:                "mnemonic": "int",
 // CHECK-NEXT:                "signedness": "signless"
 // CHECK-NEXT:              },
@@ -511,13 +411,13 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:            "direction": "from",
 // CHECK-NEXT:            "name": "result",
 // CHECK-NEXT:            "type": {
-// CHECK-NEXT:              "circt_name": "!esi.channel<i16>",
 // CHECK-NEXT:              "dialect": "esi",
-// CHECK-NEXT:              "hw_bitwidth": 16,
+// CHECK-NEXT:              "hwBitwidth": 16,
+// CHECK-NEXT:              "id": "!esi.channel<i16>",
 // CHECK-NEXT:              "inner": {
-// CHECK-NEXT:                "circt_name": "i16",
 // CHECK-NEXT:                "dialect": "builtin",
-// CHECK-NEXT:                "hw_bitwidth": 16,
+// CHECK-NEXT:                "hwBitwidth": 16,
+// CHECK-NEXT:                "id": "i16",
 // CHECK-NEXT:                "mnemonic": "int",
 // CHECK-NEXT:                "signedness": "signless"
 // CHECK-NEXT:              },
@@ -525,9 +425,130 @@ hw.module @top(in %clk: !seq.clock, in %rst: i1) {
 // CHECK-NEXT:            }
 // CHECK-NEXT:          }
 // CHECK-NEXT:        ],
-// CHECK-NEXT:        "circt_name": "!esi.bundle<[!esi.channel<i16> to \"arg\", !esi.channel<i16> from \"result\"]>",
 // CHECK-NEXT:        "dialect": "esi",
+// CHECK-NEXT:        "id": "!esi.bundle<[!esi.channel<i16> to \"arg\", !esi.channel<i16> from \"result\"]>",
 // CHECK-NEXT:        "mnemonic": "bundle"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "channels": [
+// CHECK-NEXT:          {
+// CHECK-NEXT:            "direction": "to",
+// CHECK-NEXT:            "name": "recv",
+// CHECK-NEXT:            "type": {
+// CHECK-NEXT:              "dialect": "esi",
+// CHECK-NEXT:              "hwBitwidth": 8,
+// CHECK-NEXT:              "id": "!esi.channel<i8>",
+// CHECK-NEXT:              "inner": {
+// CHECK-NEXT:                "dialect": "builtin",
+// CHECK-NEXT:                "hwBitwidth": 8,
+// CHECK-NEXT:                "id": "i8",
+// CHECK-NEXT:                "mnemonic": "int",
+// CHECK-NEXT:                "signedness": "signless"
+// CHECK-NEXT:              },
+// CHECK-NEXT:              "mnemonic": "channel"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          }
+// CHECK-NEXT:        ],
+// CHECK-NEXT:        "dialect": "esi",
+// CHECK-NEXT:        "id": "!esi.bundle<[!esi.channel<i8> to \"recv\"]>",
+// CHECK-NEXT:        "mnemonic": "bundle"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "channels": [
+// CHECK-NEXT:          {
+// CHECK-NEXT:            "direction": "from",
+// CHECK-NEXT:            "name": "send",
+// CHECK-NEXT:            "type": {
+// CHECK-NEXT:              "dialect": "esi",
+// CHECK-NEXT:              "hwBitwidth": 8,
+// CHECK-NEXT:              "id": "!esi.channel<i8>",
+// CHECK-NEXT:              "inner": {
+// CHECK-NEXT:                "dialect": "builtin",
+// CHECK-NEXT:                "hwBitwidth": 8,
+// CHECK-NEXT:                "id": "i8",
+// CHECK-NEXT:                "mnemonic": "int",
+// CHECK-NEXT:                "signedness": "signless"
+// CHECK-NEXT:              },
+// CHECK-NEXT:              "mnemonic": "channel"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          }
+// CHECK-NEXT:        ],
+// CHECK-NEXT:        "dialect": "esi",
+// CHECK-NEXT:        "id": "!esi.bundle<[!esi.channel<i8> from \"send\"]>",
+// CHECK-NEXT:        "mnemonic": "bundle"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "channels": [
+// CHECK-NEXT:          {
+// CHECK-NEXT:            "direction": "from",
+// CHECK-NEXT:            "name": "send",
+// CHECK-NEXT:            "type": {
+// CHECK-NEXT:              "dialect": "esi",
+// CHECK-NEXT:              "hwBitwidth": 0,
+// CHECK-NEXT:              "id": "!esi.channel<i0>",
+// CHECK-NEXT:              "inner": {
+// CHECK-NEXT:                "dialect": "builtin",
+// CHECK-NEXT:                "hwBitwidth": 0,
+// CHECK-NEXT:                "id": "i0",
+// CHECK-NEXT:                "mnemonic": "int",
+// CHECK-NEXT:                "signedness": "signless"
+// CHECK-NEXT:              },
+// CHECK-NEXT:              "mnemonic": "channel"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          }
+// CHECK-NEXT:        ],
+// CHECK-NEXT:        "dialect": "esi",
+// CHECK-NEXT:        "id": "!esi.bundle<[!esi.channel<i0> from \"send\"]>",
+// CHECK-NEXT:        "mnemonic": "bundle"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "channels": [
+// CHECK-NEXT:          {
+// CHECK-NEXT:            "direction": "to",
+// CHECK-NEXT:            "name": "arg",
+// CHECK-NEXT:            "type": {
+// CHECK-NEXT:              "dialect": "esi",
+// CHECK-NEXT:              "id": "!esi.channel<!esi.any>",
+// CHECK-NEXT:              "inner": {
+// CHECK-NEXT:                "dialect": "esi",
+// CHECK-NEXT:                "id": "!esi.any",
+// CHECK-NEXT:                "mnemonic": "any"
+// CHECK-NEXT:              },
+// CHECK-NEXT:              "mnemonic": "channel"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          },
+// CHECK-NEXT:          {
+// CHECK-NEXT:            "direction": "from",
+// CHECK-NEXT:            "name": "result",
+// CHECK-NEXT:            "type": {
+// CHECK-NEXT:              "dialect": "esi",
+// CHECK-NEXT:              "id": "!esi.channel<!esi.any>",
+// CHECK-NEXT:              "inner": {
+// CHECK-NEXT:                "dialect": "esi",
+// CHECK-NEXT:                "id": "!esi.any",
+// CHECK-NEXT:                "mnemonic": "any"
+// CHECK-NEXT:              },
+// CHECK-NEXT:              "mnemonic": "channel"
+// CHECK-NEXT:            }
+// CHECK-NEXT:          }
+// CHECK-NEXT:        ],
+// CHECK-NEXT:        "dialect": "esi",
+// CHECK-NEXT:        "id": "!esi.bundle<[!esi.channel<!esi.any> to \"arg\", !esi.channel<!esi.any> from \"result\"]>",
+// CHECK-NEXT:        "mnemonic": "bundle"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "dialect": "builtin",
+// CHECK-NEXT:        "hwBitwidth": 64,
+// CHECK-NEXT:        "id": "i64",
+// CHECK-NEXT:        "mnemonic": "int",
+// CHECK-NEXT:        "signedness": "signless"
+// CHECK-NEXT:      },
+// CHECK-NEXT:      {
+// CHECK-NEXT:        "dialect": "builtin",
+// CHECK-NEXT:        "hwBitwidth": 32,
+// CHECK-NEXT:        "id": "ui32",
+// CHECK-NEXT:        "mnemonic": "int",
+// CHECK-NEXT:        "signedness": "unsigned"
 // CHECK-NEXT:      }
 // CHECK-NEXT:    ]
 // CHECK-NEXT:  }

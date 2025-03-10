@@ -10,7 +10,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/HWToBTOR2.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Comb/CombVisitors.h"
@@ -27,9 +26,18 @@
 #include "circt/Dialect/SV/SVVisitors.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Seq/SeqOps.h"
+#include "circt/Dialect/Verif/VerifDialect.h"
+#include "circt/Dialect/Verif/VerifOps.h"
+#include "circt/Dialect/Verif/VerifVisitors.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/raw_ostream.h"
+
+namespace circt {
+#define GEN_PASS_DEF_CONVERTHWTOBTOR2
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace circt;
 using namespace hw;
@@ -38,11 +46,14 @@ namespace {
 // The goal here is to traverse the operations in order and convert them one by
 // one into btor2
 struct ConvertHWToBTOR2Pass
-    : public ConvertHWToBTOR2Base<ConvertHWToBTOR2Pass>,
+    : public circt::impl::ConvertHWToBTOR2Base<ConvertHWToBTOR2Pass>,
       public comb::CombinationalVisitor<ConvertHWToBTOR2Pass>,
       public sv::Visitor<ConvertHWToBTOR2Pass>,
-      public hw::TypeOpVisitor<ConvertHWToBTOR2Pass> {
+      public hw::TypeOpVisitor<ConvertHWToBTOR2Pass>,
+      public verif::Visitor<ConvertHWToBTOR2Pass> {
 public:
+  using verif::Visitor<ConvertHWToBTOR2Pass>::visitVerif;
+
   ConvertHWToBTOR2Pass(raw_ostream &os) : os(os) {}
   // Executes the pass
   void runOnOperation() override;
@@ -52,8 +63,7 @@ private:
   raw_ostream &os;
 
   // Create a counter that attributes a unique id to each generated btor2 line
-  size_t lid = 1;          // btor2 line identifiers usually start at 1
-  size_t resetLID = noLID; // keeps track of the reset's LID
+  size_t lid = 1; // btor2 line identifiers usually start at 1
   size_t nclocks = 0;
 
   // Create maps to keep track of lid associations
@@ -73,12 +83,6 @@ private:
   // with their most recent expression. Btor uses unique identifiers for each
   // instruction, so we need to have an association between those and MLIR Ops.
   DenseMap<Operation *, size_t> opLIDMap;
-  // Keeps track of operation aliases. This is used for wire inlining, as
-  // btor2 does not have the concept of a wire. This means that wires in
-  // hw will simply create an alias for the operation that will point to
-  // the same LID as the original op.
-  // key: alias, value: original op
-  DenseMap<Operation *, Operation *> opAliasMap;
   // Stores the LID of the associated input.
   // This holds a similar function as the opLIDMap but keeps
   // track of block argument index -> LID mappings
@@ -99,7 +103,7 @@ private:
 
   // Constants used during the conversion
   static constexpr size_t noLID = -1UL;
-  static constexpr int64_t noWidth = -1L;
+  [[maybe_unused]] static constexpr int64_t noWidth = -1L;
 
   /// Field helper functions
 public:
@@ -109,7 +113,7 @@ public:
   size_t getOpLID(Operation *op) {
     // Look for the original operation declaration
     // Make sure that wires are considered when looking for an lid
-    Operation *defOp = getOpAlias(op);
+    Operation *defOp = op;
     auto &f = opLIDMap[defOp];
 
     // If the op isn't associated to an lid, assign it a new one
@@ -130,8 +134,7 @@ public:
   // If so, its lid will be returned
   // Otherwise -1 will be returned
   size_t getOpLID(Value value) {
-    // Check for an operation alias
-    Operation *defOp = getOpAlias(value.getDefiningOp());
+    Operation *defOp = value.getDefiningOp();
 
     if (auto it = opLIDMap.find(defOp); it != opLIDMap.end())
       return it->second;
@@ -152,25 +155,6 @@ public:
   }
 
 private:
-  // Checks if an operation has an alias. This is the case for wires
-  // If so, the original operation is returned
-  // Otherwise the argument is returned as it is the original op
-  Operation *getOpAlias(Operation *op) {
-
-    // Remove the alias until none are left (for wires of wires of wires ...)
-    if (auto it = opAliasMap.find(op); it != opAliasMap.end())
-      return it->second;
-
-    // If the op isn't an alias then simply return it
-    return op;
-  }
-
-  // Updates or creates an entry for the given operation
-  // associating it with the current lid
-  void setOpAlias(Operation *alias, Operation *op) {
-    opAliasMap[alias] = getOpAlias(op);
-  }
-
   // Checks if a sort was declared with the given width
   // If so, its lid will be returned
   // Otherwise -1 will be returned
@@ -239,9 +223,9 @@ private:
   }
 
   // Generates a constant declaration given a value, a width and a name.
-  void genConst(int64_t value, size_t width, Operation *op) {
-    // For now we're going to assume that the name isn't taken, given that hw is
-    // already in SSA form
+  void genConst(APInt value, size_t width, Operation *op) {
+    // For now we're going to assume that the name isn't taken, given that hw
+    // is already in SSA form
     size_t opLID = getOpLID(op);
 
     // Retrieve the lid associated with the sort (sid)
@@ -272,10 +256,31 @@ private:
     return constlid;
   }
 
-  // Generates a binary operation instruction given an op name, two operands and
-  // a result width.
+  // Generates an init statement, which allows for the use of initial values
+  // operands in compreg registers
+  void genInit(Operation *reg, Value initVal, int64_t width) {
+    // Retrieve the various identifiers we require for this
+    size_t regLID = getOpLID(reg);
+    size_t sid = sortToLIDMap.at(width);
+    size_t initValLID = getOpLID(initVal);
+
+    // Build and emit the string (the lid here doesn't need to be associated
+    // to an op as it won't be used)
+    os << lid++ << " "
+       << "init"
+       << " " << sid << " " << regLID << " " << initValLID << "\n";
+  }
+
+  // Generates a binary operation instruction given an op name, two operands
+  // and a result width.
   void genBinOp(StringRef inst, Operation *binop, Value op1, Value op2,
                 size_t width) {
+    // TODO: adding support for most variadic ops shouldn't be too hard
+    if (binop->getNumOperands() != 2) {
+      binop->emitError("variadic operations not are not currently supported");
+      return;
+    }
+
     // Set the LID for this operation
     size_t opLID = getOpLID(binop);
 
@@ -307,8 +312,8 @@ private:
     // Build and return the slice instruction
     os << opLID << " "
        << "slice"
-       << " " << sid << " " << op0LID << " " << (width - 1) << " " << lowbit
-       << "\n";
+       << " " << sid << " " << op0LID << " " << (lowbit + width - 1) << " "
+       << lowbit << "\n";
   }
 
   // Generates a constant declaration given a value, a width and a name
@@ -327,9 +332,33 @@ private:
     os << opLID << " " << inst << " " << sid << " " << op0LID << "\n";
   }
 
-  // Generates a constant declaration given a value, a width and a name
+  // Generates a constant declaration given a value, a width and a name and
+  // returns the LID associated to it
   void genUnaryOp(Operation *srcop, Value op0, StringRef inst, size_t width) {
     genUnaryOp(srcop, op0.getDefiningOp(), inst, width);
+  }
+
+  // Generates a constant declaration given a operand lid, a width and a name
+  size_t genUnaryOp(size_t op0LID, StringRef inst, size_t width) {
+    // Register the source operation with the current line id
+    size_t curLid = lid++;
+
+    // Retrieve the lid associated with the sort (sid)
+    size_t sid = sortToLIDMap.at(width);
+
+    os << curLid << " " << inst << " " << sid << " " << op0LID << "\n";
+    return curLid;
+  }
+
+  // Generates a constant declaration given a value, a width and a name
+  size_t genUnaryOp(Operation *op0, StringRef inst, size_t width) {
+    return genUnaryOp(getOpLID(op0), inst, width);
+  }
+
+  // Generates a constant declaration given a value, a width and a name and
+  // returns the LID associated to it
+  size_t genUnaryOp(Value op0, StringRef inst, size_t width) {
+    return genUnaryOp(getOpLID(op0), inst, width);
   }
 
   // Generate a btor2 assertion given an assertion operation
@@ -338,7 +367,13 @@ private:
   void genBad(Operation *assertop) {
     // Start by finding the expression lid
     size_t assertLID = getOpLID(assertop);
+    genBad(assertLID);
+  }
 
+  // Generate a btor2 assertion given an assertion operation's LID
+  // Note that a predicate inversion must have already been generated at this
+  // point
+  void genBad(size_t assertLID) {
     // Build and return the btor2 string
     // Also update the lid as this instruction is not associated to an mlir op
     os << lid++ << " "
@@ -393,26 +428,29 @@ private:
   }
 
   // Generate a logical implication given a lhs and a rhs
-  void genImplies(Operation *srcop, Value lhs, Value rhs) {
+  size_t genImplies(Operation *srcop, Value lhs, Value rhs) {
     // Retrieve LIDs for the lhs and rhs
     size_t lhsLID = getOpLID(lhs);
     size_t rhsLID = getOpLID(rhs);
 
-    genImplies(srcop, lhsLID, rhsLID);
+    return genImplies(srcop, lhsLID, rhsLID);
   }
 
   // Generate a logical implication given a lhs and a rhs
-  void genImplies(Operation *srcop, size_t lhsLID, size_t rhsLID) {
+  size_t genImplies(Operation *srcop, size_t lhsLID, size_t rhsLID) {
     // Register the source operation with the current line id
     size_t opLID = getOpLID(srcop);
+    return genImplies(opLID, lhsLID, rhsLID);
+  }
 
+  size_t genImplies(size_t opLID, size_t lhsLID, size_t rhsLID) {
     // Retrieve the lid associated with the sort (sid)
     size_t sid = sortToLIDMap.at(1);
-
     // Build and emit the implies operation
     os << opLID << " "
        << "implies"
        << " " << sid << " " << lhsLID << " " << rhsLID << "\n";
+    return opLID;
   }
 
   // Generates a state instruction given a width and a name
@@ -429,8 +467,8 @@ private:
        << " " << sid << " " << name << "\n";
   }
 
-  // Generates a next instruction, given a width, a state LID, and a next value
-  // LID
+  // Generates a next instruction, given a width, a state LID, and a next
+  // value LID
   void genNext(Value next, Operation *reg, int64_t width) {
     // Retrieve the lid associated with the sort (sid)
     size_t sid = sortToLIDMap.at(width);
@@ -452,13 +490,13 @@ private:
     // Start by figuring out what sort needs to be generated
     int64_t width = hw::getBitWidth(type);
 
-    // Sanity check: getBitWidth can technically return -1 it is a type with no
-    // width (like a clock). This shouldn't be allowed as width is required to
-    // generate a sort
+    // Sanity check: getBitWidth can technically return -1 it is a type with
+    // no width (like a clock). This shouldn't be allowed as width is required
+    // to generate a sort
     assert(width != noWidth);
 
-    // Generate the sort regardles of resulting width (nothing will be added if
-    // the sort already exists)
+    // Generate the sort regardles of resulting width (nothing will be added
+    // if the sort already exists)
     genSort("bitvec", width);
     return width;
   }
@@ -467,16 +505,18 @@ private:
   // transition system conversion
   void finalizeRegVisit(Operation *op) {
     int64_t width;
-    Value next, resetVal;
+    Value next, reset, resetVal;
 
     // Extract the operands depending on the register type
     if (auto reg = dyn_cast<seq::CompRegOp>(op)) {
       width = hw::getBitWidth(reg.getType());
       next = reg.getInput();
+      reset = reg.getReset();
       resetVal = reg.getResetValue();
     } else if (auto reg = dyn_cast<seq::FirRegOp>(op)) {
       width = hw::getBitWidth(reg.getType());
       next = reg.getNext();
+      reset = reg.getReset();
       resetVal = reg.getResetValue();
     } else {
       op->emitError("Invalid register operation !");
@@ -503,16 +543,24 @@ private:
       nextLID = getOpLID(next);
     }
 
-    // Assign a new LID to next
-    setOpLID(next.getDefiningOp());
-
-    // Sanity check: at this point the next operation should have had it's btor2
-    // counterpart emitted if not then something terrible must have happened.
-    assert(nextLID != noLID);
-
     // Check if the register has a reset
-    if (resetLID != noLID) {
+    if (reset) {
       size_t resetValLID = noLID;
+
+      // Check if the reset signal is a port to avoid nullptrs (as done above
+      // with next)
+      size_t resetLID = noLID;
+      if (BlockArgument barg = dyn_cast<BlockArgument>(reset)) {
+        // Extract the block argument index and use that to get the line
+        // number
+        size_t argIdx = barg.getArgNumber();
+
+        // Check that the extracted argument is in range before using it
+        resetLID = inputLIDs[argIdx];
+
+      } else {
+        resetLID = getOpLID(reset);
+      }
 
       // Check for a reset value, if none exists assume it's zero
       if (resetVal)
@@ -520,9 +568,24 @@ private:
       else
         resetValLID = genZero(width);
 
+      // Assign a new LID to next
+      setOpLID(next.getDefiningOp());
+
+      // Sanity check: at this point the next operation should have had it's
+      // btor2 counterpart emitted if not then something terrible must have
+      // happened.
+      assert(nextLID != noLID);
+
       // Generate the ite for the register update reset condition
       // i.e. reg <= reset ? 0 : next
       genIte(next.getDefiningOp(), resetLID, resetValLID, nextLID, width);
+    } else {
+      // Sanity check: next should have been assigned
+      if (nextLID == noLID) {
+        next.getDefiningOp()->emitError(
+            "Register input does not point to a valid op!");
+        return;
+      }
     }
 
     // Finally generate the next statement
@@ -539,8 +602,8 @@ public:
   void visit(hw::PortInfo &port) {
     // Separate the inputs from outputs and generate the first btor2 lines for
     // input declaration We only consider ports with an explicit bit-width (so
-    // ignore clocks)
-    if (port.isInput() && !port.type.isa<seq::ClockType>()) {
+    // ignore clocks and immutables)
+    if (port.isInput() && !isa<seq::ClockType, seq::ImmutableType>(port.type)) {
       // Generate the associated btor declaration for the inputs
       StringRef iName = port.getName();
 
@@ -551,13 +614,9 @@ public:
       // Save lid for later
       size_t inlid = lid;
 
-      // Record the defining operation's line ID (the module itself in the case
-      // of ports)
+      // Record the defining operation's line ID (the module itself in the
+      // case of ports)
       inputLIDs[port.argNum] = lid;
-
-      // We assume that the explicit name is always %reset for reset ports
-      if (iName == "reset")
-        resetLID = lid;
 
       // Increment the lid to keep it unique
       lid++;
@@ -570,22 +629,22 @@ public:
   // simplicity, we will only emit `constd` in order to avoid bit-string
   // conversions
   void visitTypeOp(hw::ConstantOp op) {
+    // Make sure the constant hasn't already been created
+    if (handledOps.contains(op))
+      return;
+
     // Make sure that a sort has been created for our operation
     int64_t w = requireSort(op.getType());
 
     // Prepare for for const generation by extracting the const value and
     // generting the btor2 string
-    int64_t value = op.getValue().getSExtValue();
-    genConst(value, w, op);
+    genConst(op.getValue(), w, op);
   }
 
-  // Wires can generally be ignored in bto2, however we do need
-  // to keep track of the new alias it creates
+  // Wires should have been removed in PrepareForFormal
   void visit(hw::WireOp op) {
-    // Retrieve the aliased operation
-    Operation *defOp = op.getOperand().getDefiningOp();
-    // Wires don't output anything so just record alias
-    setOpAlias(op, defOp);
+    op->emitError("Wires are not supported in btor!");
+    return signalPassFailure();
   }
 
   void visitTypeOp(Operation *op) { visitInvalidTypeOp(op); }
@@ -598,58 +657,36 @@ public:
 
   // Binary operations are all emitted the same way, so we can group them into
   // a single method.
-  void visitBinOp(Operation *op, StringRef inst, int64_t w) {
+  template <typename Op>
+  void visitBinOp(Op op, StringRef inst) {
+    // Generete the sort
+    int64_t w = requireSort(op.getType());
 
     // Start by extracting the operands
-    Value op1 = op->getOperand(0);
-    Value op2 = op->getOperand(1);
+    Value op1 = op.getOperand(0);
+    Value op2 = op.getOperand(1);
 
     // Generate the line
     genBinOp(inst, op, op1, op2, w);
   }
 
   // Visitors for the binary ops
-  void visitComb(comb::AddOp op) {
-    visitBinOp(op, "add", requireSort(op.getType()));
-  }
-  void visitComb(comb::SubOp op) {
-    visitBinOp(op, "sub", requireSort(op.getType()));
-  }
-  void visitComb(comb::MulOp op) {
-    visitBinOp(op, "mul", requireSort(op.getType()));
-  }
-  void visitComb(comb::DivSOp op) {
-    visitBinOp(op, "sdiv", requireSort(op.getType()));
-  }
-  void visitComb(comb::DivUOp op) {
-    visitBinOp(op, "udiv", requireSort(op.getType()));
-  }
-  void visitComb(comb::ModSOp op) {
-    visitBinOp(op, "smod", requireSort(op.getType()));
-  }
-  void visitComb(comb::ShlOp op) {
-    visitBinOp(op, "sll", requireSort(op.getType()));
-  }
-  void visitComb(comb::ShrUOp op) {
-    visitBinOp(op, "srl", requireSort(op.getType()));
-  }
-  void visitComb(comb::ShrSOp op) {
-    visitBinOp(op, "sra", requireSort(op.getType()));
-  }
-  void visitComb(comb::AndOp op) {
-    visitBinOp(op, "and", requireSort(op.getType()));
-  }
-  void visitComb(comb::OrOp op) {
-    visitBinOp(op, "or", requireSort(op.getType()));
-  }
-  void visitComb(comb::XorOp op) {
-    visitBinOp(op, "xor", requireSort(op.getType()));
-  }
-  void visitComb(comb::ConcatOp op) {
-    visitBinOp(op, "concat", requireSort(op.getType()));
-  }
+  void visitComb(comb::AddOp op) { visitBinOp(op, "add"); }
+  void visitComb(comb::SubOp op) { visitBinOp(op, "sub"); }
+  void visitComb(comb::MulOp op) { visitBinOp(op, "mul"); }
+  void visitComb(comb::DivSOp op) { visitBinOp(op, "sdiv"); }
+  void visitComb(comb::DivUOp op) { visitBinOp(op, "udiv"); }
+  void visitComb(comb::ModSOp op) { visitBinOp(op, "smod"); }
+  void visitComb(comb::ShlOp op) { visitBinOp(op, "sll"); }
+  void visitComb(comb::ShrUOp op) { visitBinOp(op, "srl"); }
+  void visitComb(comb::ShrSOp op) { visitBinOp(op, "sra"); }
+  void visitComb(comb::AndOp op) { visitBinOp(op, "and"); }
+  void visitComb(comb::OrOp op) { visitBinOp(op, "or"); }
+  void visitComb(comb::XorOp op) { visitBinOp(op, "xor"); }
+  void visitComb(comb::ConcatOp op) { visitBinOp(op, "concat"); }
 
-  // Extract ops translate to a slice operation in btor2 in a one-to-one manner
+  // Extract ops translate to a slice operation in btor2 in a one-to-one
+  // manner
   void visitComb(comb::ExtractOp op) {
     int64_t w = requireSort(op.getType());
 
@@ -676,6 +713,14 @@ public:
     // Check for special cases where hw doesn't align with btor syntax
     if (pred == "ne")
       pred = "neq";
+    else if (pred == "ule")
+      pred = "ulte";
+    else if (pred == "sle")
+      pred = "slte";
+    else if (pred == "uge")
+      pred = "ugte";
+    else if (pred == "sge")
+      pred = "sgte";
 
     // Width of result is always 1 for comparison
     genSort("bitvec", 1);
@@ -730,7 +775,7 @@ public:
       genUnaryOp(op, expr, "not", 1);
     }
 
-    // Genrate the bad btor2 intruction
+    // Generate the bad btor2 instruction
     genBad(op);
   }
   // Assumptions are converted to a btor2 constraint instruction
@@ -743,7 +788,69 @@ public:
   void visitSV(Operation *op) { visitInvalidSV(op); }
 
   // Once SV Ops are visited, we need to check for seq ops
-  void visitInvalidSV(Operation *op) { visit(op); }
+  void visitInvalidSV(Operation *op) { dispatchVerifVisitor(op); }
+
+  template <typename Op>
+  void visitAssertLike(Op op) {
+    // Expression is what we will try to invert for our assertion
+    Value prop = op.getProperty();
+    Value en = op.getEnable();
+
+    // This sort is for assertion inversion and potential implies
+    genSort("bitvec", 1);
+
+    size_t assertLID = noLID;
+    // Check for a related enable signal
+    if (en) {
+      // Generate the implication
+      genImplies(op, en, prop);
+
+      // Generate the implies inversion
+      assertLID = genUnaryOp(op, "not", 1);
+    } else {
+      // Generate the expression inversion
+      assertLID = genUnaryOp(prop.getDefiningOp(), "not", 1);
+    }
+
+    // Generate the bad btor2 instruction
+    genBad(assertLID);
+  }
+
+  template <typename Op>
+  void visitAssumeLike(Op op) {
+    // Expression is what we will try to invert for our assertion
+    Value prop = op.getProperty();
+    Value en = op.getEnable();
+
+    size_t assumeLID = getOpLID(prop);
+    // Check for a related enable signal
+    if (en) {
+      // This sort is for assertion inversion and potential implies
+      genSort("bitvec", 1);
+      // Generate the implication
+      assumeLID = genImplies(op, en, prop);
+    }
+
+    // Generate the bad btor2 instruction
+    genConstraint(assumeLID);
+  }
+
+  // Folds the enable signal into the property and converts the result into a
+  // bad instruction.
+  void visitVerif(verif::AssertOp op) { visitAssertLike(op); }
+  void visitVerif(verif::ClockedAssertOp op) { visitAssertLike(op); }
+
+  // Fold the enable into the property and convert the assumption into a
+  // constraint instruction.
+  void visitVerif(verif::AssumeOp op) { visitAssumeLike(op); }
+  void visitVerif(verif::ClockedAssumeOp op) { visitAssumeLike(op); }
+
+  void visitUnhandledVerif(Operation *op) {
+    op->emitError("not supported in btor2!");
+    return signalPassFailure();
+  }
+
+  void visitInvalidVerif(Operation *op) { visit(op); }
 
   // Seq operation visitor, that dispatches to other seq ops
   // Also handles all remaining operations that should be explicitly ignored
@@ -751,7 +858,7 @@ public:
     // Typeswitch is used here because other seq types will be supported
     // like all operations relating to memories and CompRegs
     TypeSwitch<Operation *, void>(op)
-        .Case<seq::FirRegOp, hw::WireOp>([&](auto expr) { visit(expr); })
+        .Case<seq::FirRegOp, seq::CompRegOp>([&](auto expr) { visit(expr); })
         .Default([&](auto expr) { visitUnsupportedOp(op); });
   }
 
@@ -778,8 +885,40 @@ public:
     StringRef regName = reg.getName().value();
     int64_t w = requireSort(reg.getType());
 
-    // Generate state instruction (represents the register declaration)
-    genState(reg, w, regName);
+    // Check for initial values which must be emitted before the state in
+    // btor2
+    auto init = reg.getInitialValue();
+
+    // If there's an initial value, we need to generate a constant for the
+    // initial value, then declare the state, then generate the init statement
+    // (BTOR2 parsers are picky about it being in this order)
+    if (init) {
+      if (!init.getDefiningOp<seq::InitialOp>()) {
+        reg->emitError(
+            "Initial value must be emitted directly by a seq.initial op");
+        return;
+      }
+      // Check that the initial value is a non-null constant
+      auto initialConstant = circt::seq::unwrapImmutableValue(init)
+                                 .getDefiningOp<hw::ConstantOp>();
+      if (!initialConstant)
+        reg->emitError("initial value must be constant");
+
+      // Visit the initial Value to generate the constant
+      dispatchTypeOpVisitor(initialConstant);
+
+      // Add it to the list of visited operations
+      handledOps.insert(initialConstant);
+
+      // Now we can declare the state
+      genState(reg, w, regName);
+
+      // Finally generate the init statement
+      genInit(reg, initialConstant, w);
+    } else {
+      // Just generate state instruction (represents the register declaration)
+      genState(reg, w, regName);
+    }
 
     // Record the operation for future `next` instruction generation
     // This is required to model transitions between states (i.e. how a
@@ -801,7 +940,8 @@ public:
         .Case<sv::MacroDefOp, sv::MacroDeclOp, sv::VerbatimOp,
               sv::VerbatimExprOp, sv::VerbatimExprSEOp, sv::IfOp, sv::IfDefOp,
               sv::IfDefProceduralOp, sv::AlwaysOp, sv::AlwaysCombOp,
-              sv::AlwaysFFOp, seq::FromClockOp, hw::OutputOp, hw::HWModuleOp>(
+              seq::InitialOp, sv::AlwaysFFOp, seq::FromClockOp, seq::InitialOp,
+              seq::YieldOp, hw::OutputOp, hw::HWModuleOp>(
             [&](auto expr) { ignore(op); })
 
         // Make sure that the design only contains one clock
@@ -832,7 +972,7 @@ void ConvertHWToBTOR2Pass::runOnOperation() {
       visit(port);
     }
 
-    // Previsit all registers in the module in order to avoid dependency cylcles
+    // Previsit all registers in the module in order to avoid dependency cycles
     module.walk([&](Operation *op) {
       TypeSwitch<Operation *, void>(op)
           .Case<seq::FirRegOp, seq::CompRegOp>([&](auto reg) {
@@ -882,7 +1022,7 @@ void ConvertHWToBTOR2Pass::runOnOperation() {
         // This is triggered if our operand is already in the worklist and
         // wasn't handled
         if (!worklist.insert({defOp, defOp->operand_begin()}).second) {
-          op->emitError("dependency cycle");
+          defOp->emitError("dependency cycle");
           return;
         }
       }
@@ -897,7 +1037,6 @@ void ConvertHWToBTOR2Pass::runOnOperation() {
   sortToLIDMap.clear();
   constToLIDMap.clear();
   opLIDMap.clear();
-  opAliasMap.clear();
   inputLIDs.clear();
   regOps.clear();
   handledOps.clear();

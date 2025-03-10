@@ -13,7 +13,7 @@
 #ifndef CIRCT_DIALECT_LLHD_IR_LLHDOPS_H
 #define CIRCT_DIALECT_LLHD_IR_LLHDOPS_H
 
-#include "circt/Dialect/HW/HWTypes.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/LLHD/IR/LLHDDialect.h"
 #include "circt/Dialect/LLHD/IR/LLHDEnums.h.inc"
 #include "circt/Dialect/LLHD/IR/LLHDTypes.h"
@@ -23,6 +23,7 @@
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
 #include "mlir/Interfaces/InferTypeOpInterface.h"
+#include "mlir/Interfaces/MemorySlotInterfaces.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 namespace circt {

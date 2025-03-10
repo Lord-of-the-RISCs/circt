@@ -67,6 +67,22 @@ def FuncServiceDeclOp : ESI_Op<"service.std.func",
   }];
 }
 
+def CallServiceDeclOp : ESI_Op<"service.std.call",
+          [SingleBlock, NoTerminator, HasParent<"::mlir::ModuleOp">,
+           Symbol, DeclareOpInterfaceMethods<ServiceDeclOpInterface>]> {
+  let summary = "Service against which hardware can call into software";
+
+  let arguments = (ins SymbolNameAttr:$sym_name);
+
+  let assemblyFormat = [{
+    $sym_name attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    std::optional<StringRef> getTypeName() { return "esi.service.std.call"; }
+  }];
+}
+
 def MMIOServiceDeclOp: ESI_Op<"service.std.mmio",
           [HasParent<"::mlir::ModuleOp">, Symbol,
            DeclareOpInterfaceMethods<ServiceDeclOpInterface>]> {
@@ -80,5 +96,31 @@ def MMIOServiceDeclOp: ESI_Op<"service.std.mmio",
 
   let assemblyFormat = [{
     $sym_name attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    std::optional<StringRef> getTypeName() { return "esi.service.std.mmio"; }
+  }];
+}
+
+def HostMemServiceDeclOp: ESI_Op<"service.std.hostmem",
+          [HasParent<"::mlir::ModuleOp">, Symbol,
+           DeclareOpInterfaceMethods<ServiceDeclOpInterface>]> {
+  let summary = "Host memory service";
+  let description = [{
+    Declares a service to read/write host memory. Used for DMA services. Must be
+    implemented by a BSP.
+  }];
+
+  let arguments = (ins SymbolNameAttr:$sym_name);
+
+  let assemblyFormat = [{
+    $sym_name attr-dict
+  }];
+
+  let extraClassDeclaration = [{
+    ServicePortInfo readPortInfo();
+    ServicePortInfo writePortInfo();
+    std::optional<StringRef> getTypeName() { return "esi.service.std.hostmem"; }
   }];
 }

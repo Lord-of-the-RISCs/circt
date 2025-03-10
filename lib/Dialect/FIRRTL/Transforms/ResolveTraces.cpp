@@ -10,7 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotationHelper.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
@@ -21,12 +21,19 @@
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
-#include "llvm/ADT/APSInt.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/JSON.h"
 
 #define DEBUG_TYPE "firrtl-resolve-traces"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_RESOLVETRACES
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
@@ -65,7 +72,8 @@ LogicalResult circt::firrtl::applyTraceName(const AnnoPathValue &target,
   return success();
 }
 
-struct ResolveTracesPass : public ResolveTracesBase<ResolveTracesPass> {
+struct ResolveTracesPass
+    : public circt::firrtl::impl::ResolveTracesBase<ResolveTracesPass> {
   using ResolveTracesBase::outputAnnotationFilename;
 
   void runOnOperation() override;
@@ -136,7 +144,7 @@ private:
 
     // If this targets a module or an instance, then we're done.  There is no
     // "reference" part of the FIRRTL target.
-    if (path.ref.isa<OpAnnoTarget>() &&
+    if (isa<OpAnnoTarget>(path.ref) &&
         path.isOpOfType<FModuleOp, FExtModuleOp, InstanceOp>())
       return;
 
@@ -398,21 +406,20 @@ void ResolveTracesPass::runOnOperation() {
   });
 
   // Write the JSON-encoded Trace Annotation to a file called
-  // "$circuitName.anno.json".  (This is implemented via an SVVerbatimOp that is
-  // inserted before the FIRRTL circuit.
-  auto b = OpBuilder::atBlockBegin(circuit.getBodyBlock());
-  auto verbatimOp = b.create<sv::VerbatimOp>(
-      b.getUnknownLoc(), jsonBuffer, ValueRange{}, b.getArrayAttr(symbols));
-  hw::OutputFileAttr fileAttr;
+  // "$circuitName.anno.json".
+  auto builder = ImplicitLocOpBuilder::atBlockBegin(UnknownLoc::get(context),
+                                                    circuit.getBodyBlock());
+
+  StringAttr fileAttr;
   if (this->outputAnnotationFilename.empty())
-    fileAttr = hw::OutputFileAttr::getFromFilename(
-        context, circuit.getName() + ".anno.json",
-        /*excludeFromFilelist=*/true, false);
+    fileAttr = builder.getStringAttr(circuit.getName() + ".anno.json");
   else
-    fileAttr = hw::OutputFileAttr::getFromFilename(
-        context, outputAnnotationFilename,
-        /*excludeFromFilelist=*/true, false);
-  verbatimOp->setAttr("output_file", fileAttr);
+    fileAttr = builder.getStringAttr(outputAnnotationFilename);
+
+  builder.create<emit::FileOp>(fileAttr, [&] {
+    builder.create<sv::VerbatimOp>(jsonBuffer, ValueRange{},
+                                   builder.getArrayAttr(symbols));
+  });
 
   return markAllAnalysesPreserved();
 }

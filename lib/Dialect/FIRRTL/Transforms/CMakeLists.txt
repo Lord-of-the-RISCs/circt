@@ -1,18 +1,22 @@
 add_circt_dialect_library(CIRCTFIRRTLTransforms
   AddSeqMemPorts.cpp
+  AdvancedLayerSink.cpp
+  AssignOutputDirs.cpp
   BlackBoxReader.cpp
   CheckCombLoops.cpp
+  CheckLayers.cpp
+  CheckRecursiveInstantiation.cpp
+  CreateCompanionAssume.cpp
   CreateSiFiveMetadata.cpp
   Dedup.cpp
   DropConst.cpp
   DropName.cpp
-  EmitOMIR.cpp
+  EliminateWires.cpp
   ExpandWhens.cpp
   ExtractInstances.cpp
   FinalizeIR.cpp
   FlattenMemory.cpp
   GrandCentral.cpp
-  HoistPassthrough.cpp
   IMConstProp.cpp
   IMDeadCodeElim.cpp
   InferReadWrite.cpp
@@ -27,6 +31,8 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   LowerAnnotations.cpp
   LowerCHIRRTL.cpp
   LowerClasses.cpp
+  LowerDPI.cpp
+  LowerIntmodules.cpp
   LowerIntrinsics.cpp
   LowerLayers.cpp
   LowerMatches.cpp
@@ -39,22 +45,22 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
   MemToRegOfVec.cpp
   MergeConnections.cpp
   ModuleInliner.cpp
+  ModuleSummary.cpp
   PassiveWires.cpp
-  PrefixModules.cpp
   PrintFIRRTLFieldSource.cpp
   PrintInstanceGraph.cpp
   PrintNLATable.cpp
-  ProbeDCE.cpp
+  ProbesToSignals.cpp
   RandomizeRegisterInit.cpp
   RegisterOptimizer.cpp
   RemoveUnusedPorts.cpp
   ResolvePaths.cpp
   ResolveTraces.cpp
   SFCCompat.cpp
+  SpecializeLayers.cpp
   SpecializeOption.cpp
   VBToBV.cpp
   Vectorization.cpp
-  WireDFT.cpp
 
   DEPENDS
   CIRCTFIRRTLTransformsIncGen
@@ -64,9 +70,13 @@ add_circt_dialect_library(CIRCTFIRRTLTransforms
 
   LINK_LIBS PUBLIC
   CIRCTFIRRTL
+  CIRCTFIRRTLAnalysis
   CIRCTDebug
+  CIRCTEmit
   CIRCTHW
   CIRCTOM
+  CIRCTSeq
+  CIRCTSim
   CIRCTSV
   CIRCTSupport
   MLIRIR

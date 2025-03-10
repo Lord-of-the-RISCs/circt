@@ -1,5 +1,7 @@
 ; RUN: firtool -lower-annotations-no-ref-type-ports %s | FileCheck %s
+; RUN: firtool -probes-to-signals %s | FileCheck %s
 
+FIRRTL version 4.0.0
 circuit Foo: %[[
   {
     "class": "sifive.enterprise.grandcentral.DataTapsAnnotation",
@@ -22,13 +24,13 @@ circuit Foo: %[[
 ]]
   module Bar:
     wire a: UInt<1>
-    a is invalid
+    invalidate a
 
   module Baz:
     wire a: UInt<1>
-    a is invalid
+    invalidate a
 
-  module Foo:
+  public module Foo:
 
     inst bar of Bar
     inst baz of Baz

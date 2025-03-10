@@ -78,6 +78,15 @@ LogicalResult InnerSymbolTable::walkSymbols(Operation *op,
     return success();
   };
 
+  // Check for ports
+  if (auto mod = dyn_cast<PortList>(op)) {
+    for (auto [i, port] : llvm::enumerate(mod.getPortList())) {
+      if (auto symAttr = port.getSym())
+        if (failed(walkSyms(symAttr, InnerSymTarget(i, mod))))
+          return failure();
+    }
+  }
+
   // Walk the operation and add InnerSymbolTarget's to the table.
   return success(
       !op->walk<mlir::WalkOrder::PreOrder>([&](Operation *curOp) -> WalkResult {
@@ -86,14 +95,6 @@ LogicalResult InnerSymbolTable::walkSymbols(Operation *op,
                if (failed(walkSyms(symAttr, InnerSymTarget(symOp))))
                  return WalkResult::interrupt();
 
-           // Check for ports
-           if (auto mod = dyn_cast<PortList>(curOp)) {
-             for (auto [i, port] : llvm::enumerate(mod.getPortList())) {
-               if (auto symAttr = port.getSym())
-                 if (failed(walkSyms(symAttr, InnerSymTarget(i, curOp))))
-                   return WalkResult::interrupt();
-             }
-           }
            return WalkResult::advance();
          }).wasInterrupted());
 }
@@ -197,7 +198,7 @@ InnerSymbolTableCollection::populateAndVerifyTables(Operation *innerRefNSOp) {
 // InnerRefNamespace
 //===----------------------------------------------------------------------===//
 
-InnerSymTarget InnerRefNamespace::lookup(hw::InnerRefAttr inner) {
+InnerSymTarget InnerRefNamespace::lookup(hw::InnerRefAttr inner) const {
   auto *mod = symTable.lookup(inner.getModule());
   if (!mod)
     return {};
@@ -205,7 +206,7 @@ InnerSymTarget InnerRefNamespace::lookup(hw::InnerRefAttr inner) {
   return innerSymTables.getInnerSymbolTable(mod).lookup(inner.getName());
 }
 
-Operation *InnerRefNamespace::lookupOp(hw::InnerRefAttr inner) {
+Operation *InnerRefNamespace::lookupOp(hw::InnerRefAttr inner) const {
   auto *mod = symTable.lookup(inner.getModule());
   if (!mod)
     return nullptr;
@@ -235,9 +236,21 @@ LogicalResult verifyInnerRefNamespace(Operation *op) {
       return WalkResult(user.verifyInnerRefs(ns));
     return WalkResult::advance();
   };
+
+  SmallVector<Operation *> topLevelOps;
+  for (auto &op : op->getRegion(0).front()) {
+    // Gather operations with regions for parallel processing.
+    if (op.getNumRegions() != 0) {
+      topLevelOps.push_back(&op);
+      continue;
+    }
+    // Otherwise, handle right now -- not worth the cost.
+    if (verifySymbolUserFn(&op).wasInterrupted())
+      return failure();
+  }
   return mlir::failableParallelForEach(
-      op->getContext(), op->getRegion(0).front(), [&](auto &op) {
-        return success(!op.walk(verifySymbolUserFn).wasInterrupted());
+      op->getContext(), topLevelOps, [&](Operation *op) {
+        return success(!op->walk(verifySymbolUserFn).wasInterrupted());
       });
 }
 

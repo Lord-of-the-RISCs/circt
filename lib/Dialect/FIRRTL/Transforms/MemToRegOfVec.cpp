@@ -10,53 +10,46 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
-#include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
-#include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
-#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Threading.h"
-#include "llvm/ADT/DepthFirstIterator.h"
-#include "llvm/ADT/TypeSwitch.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/Support/Debug.h"
 
 #define DEBUG_TYPE "mem-to-reg-of-vec"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_MEMTOREGOFVEC
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
 
 namespace {
-struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
+struct MemToRegOfVecPass
+    : public circt::firrtl::impl::MemToRegOfVecBase<MemToRegOfVecPass> {
   MemToRegOfVecPass(bool replSeqMem, bool ignoreReadEnable)
       : replSeqMem(replSeqMem), ignoreReadEnable(ignoreReadEnable){};
 
   void runOnOperation() override {
     auto circtOp = getOperation();
-    DenseSet<Operation *> dutModuleSet;
+    auto &instanceInfo = getAnalysis<InstanceInfo>();
+
     if (!AnnotationSet::removeAnnotations(circtOp,
                                           convertMemToRegOfVecAnnoClass))
-      return;
-    auto *body = circtOp.getBodyBlock();
+      return markAllAnalysesPreserved();
 
-    // Find the device under test and create a set of all modules underneath it.
-    auto it = llvm::find_if(*body, [&](Operation &op) -> bool {
-      return AnnotationSet(&op).hasAnnotation(dutAnnoClass);
-    });
-    if (it != body->end()) {
-      auto &instanceGraph = getAnalysis<InstanceGraph>();
-      auto *node = instanceGraph.lookup(cast<igraph::ModuleOpInterface>(*it));
-      llvm::for_each(llvm::depth_first(node),
-                     [&](igraph::InstanceGraphNode *node) {
-                       dutModuleSet.insert(node->getModule());
-                     });
-    } else {
-      auto mods = circtOp.getOps<FModuleOp>();
-      dutModuleSet.insert(mods.begin(), mods.end());
-    }
+    DenseSet<Operation *> dutModuleSet;
+    for (auto moduleOp : circtOp.getOps<FModuleOp>())
+      if (instanceInfo.anyInstanceInEffectiveDesign(moduleOp))
+        dutModuleSet.insert(moduleOp);
 
     mlir::parallelForEach(circtOp.getContext(), dutModuleSet,
                           [&](Operation *op) {
@@ -98,10 +91,11 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
     while (stages--) {
       auto reg = b.create<RegOp>(pipeInput.getType(), clock, name).getResult();
       if (gate) {
-        b.create<WhenOp>(gate, /*withElseRegion*/ false,
-                         [&]() { b.create<StrictConnectOp>(reg, pipeInput); });
+        b.create<WhenOp>(gate, /*withElseRegion*/ false, [&]() {
+          b.create<MatchingConnectOp>(reg, pipeInput);
+        });
       } else
-        b.create<StrictConnectOp>(reg, pipeInput);
+        b.create<MatchingConnectOp>(reg, pipeInput);
 
       pipeInput = reg;
     }
@@ -167,15 +161,15 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
     Value rdata = builder.create<SubaccessOp>(regOfVec, addr);
     if (!ignoreReadEnable) {
       // Initialize read data out with invalid.
-      builder.create<StrictConnectOp>(
+      builder.create<MatchingConnectOp>(
           data, builder.create<InvalidValueOp>(data.getType()));
       // If enable is true, then connect the data read from memory register.
       builder.create<WhenOp>(enable, /*withElseRegion*/ false, [&]() {
-        builder.create<StrictConnectOp>(data, rdata);
+        builder.create<MatchingConnectOp>(data, rdata);
       });
     } else {
       // Ignore read enable signal.
-      builder.create<StrictConnectOp>(data, rdata);
+      builder.create<MatchingConnectOp>(data, rdata);
     }
   }
 
@@ -228,7 +222,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
         auto maskField = std::get<2>(regDataMask);
         // If mask, then update the register field.
         builder.create<WhenOp>(maskField, /*withElseRegion*/ false, [&]() {
-          builder.create<StrictConnectOp>(regField, dataField);
+          builder.create<MatchingConnectOp>(regField, dataField);
         });
       }
     });
@@ -258,7 +252,7 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
       return;
     }
     // Initialize read data out with invalid.
-    builder.create<StrictConnectOp>(
+    builder.create<MatchingConnectOp>(
         rdataOut, builder.create<InvalidValueOp>(rdataOut.getType()));
     // If enable:
     builder.create<WhenOp>(enable, /*withElseRegion*/ false, [&]() {
@@ -275,12 +269,12 @@ struct MemToRegOfVecPass : public MemToRegOfVecBase<MemToRegOfVecPass> {
               // If mask true, then set the field.
               builder.create<WhenOp>(
                   maskField, /*withElseRegion*/ false, [&]() {
-                    builder.create<StrictConnectOp>(regField, dataField);
+                    builder.create<MatchingConnectOp>(regField, dataField);
                   });
             }
           },
           // Read block:
-          [&]() { builder.create<StrictConnectOp>(rdataOut, rdata); });
+          [&]() { builder.create<MatchingConnectOp>(rdataOut, rdata); });
     });
   }
 

@@ -11,23 +11,24 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/PipelineToHW.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/Pipeline/PipelineOps.h"
 #include "circt/Dialect/Seq/SeqOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/TypeSwitch.h"
+
+namespace circt {
+#define GEN_PASS_DEF_PIPELINETOHW
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace mlir;
 using namespace circt;
 using namespace pipeline;
 
 namespace {
-
-#define GEN_PASS_DEF_PIPELINETOHW
-#include "circt/Conversion/Passes.h.inc"
-
 // Base class for all pipeline lowerings.
 class PipelineLowering {
 public:
@@ -164,7 +165,7 @@ public:
       auto regIdx = it.index();
       auto regIn = it.value();
 
-      StringAttr regName = registerNames[regIdx].cast<StringAttr>();
+      StringAttr regName = cast<StringAttr>(registerNames[regIdx]);
       Value dataReg;
       if (this->clockGateRegs) {
         // Use the clock gate instead of clock enable.
@@ -360,12 +361,15 @@ public:
         vInput.replaceAllUsesWith(vArg);
     }
 
-    // Build stage enable register. The enable register is always reset to 0.
-    // The stage enable register takes the previous-stage combinational valid
-    // output and determines whether this stage is active or not in the next
-    // cycle.
-    // A non-stallable stage always registers the incoming enable signal,
-    // whereas other stages register based on the current stall state.
+    // Build stage enable register. The enable register is reset to 0 iff a
+    // reset signal is available. We here rely on the compreg builders, which
+    // accept reset signal/reset value mlir::Value's that are null.
+    //
+    // The stage enable register takes the
+    // previous-stage combinational valid output and determines whether this
+    // stage is active or not in the next cycle. A non-stallable stage always
+    // registers the incoming enable signal, whereas other stages register based
+    // on the current stall state.
     StageKind stageKind = pipeline.getStageKind(stageIndex);
     Value stageEnabled;
     if (stageIndex == 0) {
@@ -373,8 +377,11 @@ public:
     } else {
       auto stageRegPrefix = getStagePrefix(stageIndex);
       auto enableRegName = (stageRegPrefix.strref() + "_enable").str();
-      Value enableRegResetVal =
-          builder.create<hw::ConstantOp>(loc, APInt(1, 0, false)).getResult();
+
+      Value enableRegResetVal;
+      if (args.reset)
+        enableRegResetVal =
+            builder.create<hw::ConstantOp>(loc, APInt(1, 0, false)).getResult();
 
       switch (stageKind) {
       case StageKind::Continuous:
@@ -405,7 +412,11 @@ public:
       if (enablePowerOnValues) {
         llvm::TypeSwitch<Operation *, void>(stageEnabled.getDefiningOp())
             .Case<seq::CompRegOp, seq::CompRegClockEnabledOp>([&](auto op) {
-              op.getPowerOnValueMutable().assign(enableRegResetVal);
+              op.getInitialValueMutable().assign(
+                  circt::seq::createConstantInitialValue(
+                      builder, loc,
+                      builder.getIntegerAttr(builder.getI1Type(),
+                                             APInt(1, 0, false))));
             });
       }
     }
@@ -458,7 +469,8 @@ public:
 //===----------------------------------------------------------------------===//
 
 namespace {
-struct PipelineToHWPass : public impl::PipelineToHWBase<PipelineToHWPass> {
+struct PipelineToHWPass
+    : public circt::impl::PipelineToHWBase<PipelineToHWPass> {
   using PipelineToHWBase::PipelineToHWBase;
   void runOnOperation() override;
 

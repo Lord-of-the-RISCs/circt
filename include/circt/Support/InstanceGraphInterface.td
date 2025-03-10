@@ -37,7 +37,7 @@ def InstanceGraphInstanceOpInterface : OpInterface<"InstanceOpInterface"> {
       ::llvm::SmallVector<::llvm::StringRef, 1> targetNames;
       for (::mlir::Attribute targetNameAttr : $_op.getReferencedModuleNamesAttr())
         targetNames.push_back(
-            targetNameAttr.cast<::mlir::StringAttr>().getValue());
+            llvm::cast<::mlir::StringAttr>(targetNameAttr).getValue());
       return targetNames;
     }]>,
 
@@ -49,6 +49,14 @@ def InstanceGraphInstanceOpInterface : OpInterface<"InstanceOpInterface"> {
       return ::mlir::ArrayAttr::get(attr.getContext(), {attr});
     }]>,
   ];
+
+  let verify = [{
+    if (mlir::cast<ConcreteOp>($_op)
+            .getReferencedModuleNamesAttr()
+            .size())
+      return success();
+    return $_op->emitOpError("expected a non-empty list of referenced modules");
+  }];
 }
 
 def InstanceGraphModuleOpInterface : OpInterface<"ModuleOpInterface"> {

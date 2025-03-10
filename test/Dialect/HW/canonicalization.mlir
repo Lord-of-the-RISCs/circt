@@ -1,4 +1,4 @@
-// RUN: circt-opt -canonicalize='top-down=true region-simplify=true' %s | FileCheck %s
+// RUN: circt-opt -canonicalize='top-down=true region-simplify=aggressive' %s | FileCheck %s
 
 // CHECK-LABEL: hw.module @extract_noop(in %arg0 : i3, out "" : i3) {
 // CHECK-NEXT:    hw.output %arg0
@@ -1493,6 +1493,13 @@ hw.module @ConcatOfConstants(in %index: i2, out r0: !hw.array<2xi2>) {
   // CHECK: [[OUT:%.+]] = hw.aggregate_constant [-1 : i2, -1 : i2] : !hw.array<2xi2>
   // CHECK: hw.output [[OUT]] : !hw.array<2xi2>
   hw.output %concat : !hw.array<2xi2>
+}
+
+// CHECK-LABEL: hw.module @ConcatOfSingleElement
+hw.module @ConcatOfSingleElement(in %i0: !hw.array<2xi2>, out r0: !hw.array<2xi2>) {
+  %r0 = hw.array_concat %i0 : !hw.array<2xi2>
+  // CHECK: hw.output %i0 : !hw.array<2xi2>
+  hw.output %r0 : !hw.array<2xi2>
 }
 
 // CHECK-LABEL: hw.module @ConcatOfCreate

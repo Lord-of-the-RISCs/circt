@@ -33,12 +33,12 @@ include "circt/Dialect/ESI/ESITypes.td"
 def ChannelSignalingValidReady : I32EnumAttrCase<"ValidReady", 0>;
 // FIFO interface with a read latency of zero. Very similiar to valid-ready, but
 // cannot assert ready if data is not available.
-def ChannelSignalingFIFO0      : I32EnumAttrCase<"FIFO0",      1>;
+def ChannelSignalingFIFO      : I32EnumAttrCase<"FIFO",      1>;
 
 def ChannelSignaling : I32EnumAttr<
     "ChannelSignaling",
     "ESI channel wire signaling standard",
-    [ChannelSignalingValidReady, ChannelSignalingFIFO0]>{
+    [ChannelSignalingValidReady, ChannelSignalingFIFO]>{
   let cppNamespace = "::circt::esi";
 }
 
@@ -49,6 +49,12 @@ def ChannelTypeImpl : ESI_Type<"Channel"> {
     point-to-point data stream. Channels are typed (like all of ESI). Said
     type can be any MLIR type, but must be lowered to something a backend
     knows how to output (i.e. something emitVerilog knows about).
+
+    Parameters:
+      signaling: the style of the control signals (valid/ready vs FIFO).
+      dataDelay: the number of cycles data takes to arrive after the control
+      indicates a transaction has occured. For instance, on a FIFO without read
+      ahead, this would be 1. Defaults to 0.
 
     Example:
 
@@ -63,16 +69,65 @@ def ChannelTypeImpl : ESI_Type<"Channel"> {
       "Type":$inner,
       DefaultValuedParameter<
         "::circt::esi::ChannelSignaling",
-        "::circt::esi::ChannelSignaling::ValidReady">:$signaling);
+        "::circt::esi::ChannelSignaling::ValidReady">:$signaling,
+      DefaultValuedParameter<"uint64_t", "0">:$dataDelay);
 
-  let assemblyFormat = "`<` $inner (`,` $signaling^)? `>`";
+  let assemblyFormat = [{
+    `<` $inner (`,` $signaling^ ( `(` $dataDelay^ `)` )? )? `>`
+  }];
 
   let builders = [
     TypeBuilder<(ins "Type":$type), [{
         return Base::get(type.getContext(), type,
-                         ::circt::esi::ChannelSignaling::ValidReady);
+                         ::circt::esi::ChannelSignaling::ValidReady, 0);
       }]>,
   ];
+
+  let extraClassDeclaration = [{
+    /// Consumers are ones which actually absorb tokens. Non-consumer ops
+    /// include any snooping operations.
+    static SmallVector<std::reference_wrapper<OpOperand>, 4> getConsumers(
+      mlir::TypedValue<ChannelType>);
+    static bool hasOneConsumer(mlir::TypedValue<ChannelType>);
+    static bool hasNoConsumers(mlir::TypedValue<ChannelType>);
+    static LogicalResult verifyChannel(mlir::TypedValue<ChannelType>);
+
+    /// Get the single consumer of a channel. Returns nullptr if there are zero
+    /// or more than one.
+    static OpOperand* getSingleConsumer(mlir::TypedValue<ChannelType>);
+  }];
+}
+
+//===----------------------------------------------------------------------===//
+// Snoop operations reveal the internal signals of a channel.
+//===----------------------------------------------------------------------===//
+
+def SnoopValidReadyOp : ESI_Physical_Op<"snoop.vr", [InferTypeOpInterface]> {
+  let summary = "Get the valid, ready, and data signals from a channel";
+  let description = [{
+    A snoop allows one to combinationally observe a channel's internal signals.
+    It does not count as another user of the channel. Useful for constructing
+    control logic which can be combinationally driven. Also potentially useful
+    for debugging.
+  }];
+
+  let arguments = (ins ChannelType:$input);
+  let results = (outs I1:$valid, I1:$ready, AnyType:$data);
+  let hasVerifier = 1;
+  let assemblyFormat = [{
+    $input attr-dict `:` qualified(type($input))
+  }];
+
+  let extraClassDeclaration = [{
+    /// Infer the return types of this operation.
+    static LogicalResult inferReturnTypes(MLIRContext *context,
+                                          std::optional<Location> loc,
+                                          ValueRange operands,
+                                          DictionaryAttr attrs,
+                                          mlir::OpaqueProperties properties,
+                                          mlir::RegionRange regions,
+                                          SmallVectorImpl<Type> &results);
+  }];
 }
 
 //===----------------------------------------------------------------------===//
@@ -158,7 +213,7 @@ def UnwrapFIFOOp : ESI_Op<"unwrap.fifo", [
 }
 
 def ModportType:
-  Type<CPred<"$_self.isa<::circt::sv::ModportType>()">, "sv.interface">;
+  Type<CPred<"llvm::isa<::circt::sv::ModportType>($_self)">, "sv.interface">;
 
 def WrapSVInterfaceOp: ESI_Op<"wrap.iface", [
     DeclareOpInterfaceMethods<ChannelOpInterface>
@@ -443,6 +498,7 @@ def ChannelBufferOp : ESI_Abstract_Op<"buffer", [
     OptionalAttr<StrAttr>:$name);
   let results = (outs ChannelType:$output);
   let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
 }
 
 def PipelineStageOp : ESI_Physical_Op<"stage", [
@@ -465,6 +521,27 @@ def PipelineStageOp : ESI_Physical_Op<"stage", [
 //===----------------------------------------------------------------------===//
 // Misc operations
 //===----------------------------------------------------------------------===//
+
+def FIFOOp : ESI_Physical_Op<"fifo", []> {
+  let summary = "A FIFO with ESI channel connections";
+  let description = [{
+    A FIFO is a first-in-first-out buffer. This operation is a simple FIFO
+    which can be used to connect two ESI channels. The ESI channels MUST have
+    FIFO signaling semantics.
+  }];
+
+  let arguments = (ins
+    ClockType:$clk, I1:$rst, ChannelType:$input,
+    ConfinedAttr<I64Attr, [IntMinValue<1>]>:$depth
+  );
+  let results = (outs ChannelType:$output);
+
+  let assemblyFormat = [{
+    `in` $input `clk` $clk `rst` $rst `depth` $depth attr-dict
+      `:` type($input) `->` type($output)
+  }];
+  let hasVerifier = 1;
+}
 
 def CosimToHostEndpointOp : ESI_Physical_Op<"cosim.to_host", []> {
   let summary = "Co-simulation endpoint sending data to the host.";

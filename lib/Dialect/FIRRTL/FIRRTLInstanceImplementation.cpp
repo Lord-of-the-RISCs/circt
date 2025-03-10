@@ -16,7 +16,6 @@ LogicalResult
 instance_like_impl::verifyReferencedModule(Operation *instanceOp,
                                            SymbolTableCollection &symbolTable,
                                            mlir::FlatSymbolRefAttr moduleName) {
-  auto module = instanceOp->getParentOfType<FModuleOp>();
   auto referencedModule =
       symbolTable.lookupNearestSymbolFrom<FModuleLike>(instanceOp, moduleName);
   if (!referencedModule) {
@@ -28,15 +27,6 @@ instance_like_impl::verifyReferencedModule(Operation *instanceOp,
     return instanceOp->emitOpError("must instantiate a module not a class")
                .attachNote(referencedModule.getLoc())
            << "class declared here";
-
-  // Check that this instance doesn't recursively instantiate its wrapping
-  // module.
-  if (referencedModule == module) {
-    auto diag = instanceOp->emitOpError()
-                << "is a recursive instantiation of its containing module";
-    return diag.attachNote(module.getLoc())
-           << "containing module declared here";
-  }
 
   // Small helper add a note to the original declaration.
   auto emitNote = [&](InFlightDiagnostic &&diag) -> InFlightDiagnostic && {
@@ -55,8 +45,8 @@ instance_like_impl::verifyReferencedModule(Operation *instanceOp,
                     << " but got " << numResults);
   }
   auto portDirections =
-      instanceOp->getAttrOfType<IntegerAttr>("portDirections");
-  if (portDirections.getValue().getBitWidth() != numExpected)
+      instanceOp->getAttrOfType<mlir::DenseBoolArrayAttr>("portDirections");
+  if (static_cast<size_t>(portDirections.size()) != numExpected)
     return emitNote(
         instanceOp->emitOpError("the number of port directions should be "
                                 "equal to the number of results"));
@@ -111,21 +101,20 @@ instance_like_impl::verifyReferencedModule(Operation *instanceOp,
     // We know there is an error, try to figure out whats wrong.
     auto moduleDirectionAttr = referencedModule.getPortDirectionsAttr();
     // First compare the sizes:
-    auto expectedWidth = moduleDirectionAttr.getValue().getBitWidth();
-    auto actualWidth = portDirections.getValue().getBitWidth();
+    auto expectedWidth = moduleDirectionAttr.size();
+    auto actualWidth = portDirections.size();
     if (expectedWidth != actualWidth) {
       return emitNote(instanceOp->emitOpError()
                       << "has a wrong number of directions; expected "
                       << expectedWidth << " but got " << actualWidth);
     }
     // Next check the values.
-    auto instanceDirs = direction::unpackAttribute(portDirections);
-    auto moduleDirs = direction::unpackAttribute(moduleDirectionAttr);
+    auto instanceDirs = portDirections;
     for (size_t i = 0; i != numResults; ++i) {
-      if (instanceDirs[i] != moduleDirs[i]) {
+      if (instanceDirs[i] != moduleDirectionAttr[i]) {
         return emitNote(instanceOp->emitOpError()
                         << "direction for " << portNames[i] << " must be \""
-                        << direction::toString(moduleDirs[i])
+                        << direction::toString(moduleDirectionAttr[i])
                         << "\", but got \""
                         << direction::toString(instanceDirs[i]) << "\"");
       }

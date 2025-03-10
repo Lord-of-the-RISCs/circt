@@ -10,79 +10,130 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "PassDetails.h"
+#include "circt/Analysis/FIRRTLInstanceInfo.h"
+#include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLTypes.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
-#include "circt/Dialect/HW/HWAttributes.h"
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
-#include "circt/Dialect/OM/OMAttributes.h"
-#include "circt/Dialect/OM/OMDialect.h"
-#include "circt/Dialect/OM/OMOps.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/Location.h"
-#include "llvm/ADT/DepthFirstIterator.h"
+#include "mlir/Pass/Pass.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/Support/Path.h"
+
+namespace circt {
+namespace firrtl {
+#define GEN_PASS_DEF_CREATESIFIVEMETADATA
+#include "circt/Dialect/FIRRTL/Passes.h.inc"
+} // namespace firrtl
+} // namespace circt
 
 using namespace circt;
 using namespace firrtl;
-using circt::igraph::InstancePath;
 
 namespace {
 
 struct ObjectModelIR {
-  ObjectModelIR(mlir::ModuleOp moduleOp) : moduleOp(moduleOp) {}
+  ObjectModelIR(
+      CircuitOp circtOp, InstanceGraph &instanceGraph,
+      InstanceInfo &instanceInfo,
+      DenseMap<Operation *, hw::InnerSymbolNamespace> &moduleNamespaces)
+      : context(circtOp->getContext()), circtOp(circtOp),
+        circtNamespace(CircuitNamespace(circtOp)),
+        instancePathCache(InstancePathCache(instanceGraph)),
+        instanceInfo(instanceInfo), moduleNamespaces(moduleNamespaces) {}
+
+  // Add the tracker annotation to the op and get a PathOp to the op.
+  PathOp createPathRef(Operation *op, hw::HierPathOp nla,
+                       mlir::ImplicitLocOpBuilder &builderOM) {
+
+    auto id = DistinctAttr::create(UnitAttr::get(context));
+    TargetKind kind = TargetKind::Reference;
+    // If op is null, then create an empty path.
+    if (op) {
+      NamedAttrList fields;
+      fields.append("id", id);
+      fields.append("class", StringAttr::get(context, "circt.tracker"));
+      if (nla)
+        fields.append("circt.nonlocal", mlir::FlatSymbolRefAttr::get(nla));
+      AnnotationSet annos(op);
+      annos.addAnnotations(DictionaryAttr::get(context, fields));
+      annos.applyToOperation(op);
+      if (isa<InstanceOp, FModuleLike>(op))
+        kind = TargetKind::Instance;
+    }
+
+    // Create the path operation.
+    return builderOM.create<PathOp>(kind, id);
+  }
+
   void createMemorySchema() {
-    auto *context = moduleOp.getContext();
+
     auto unknownLoc = mlir::UnknownLoc::get(context);
-    auto builderOM =
-        mlir::ImplicitLocOpBuilder::atBlockEnd(unknownLoc, moduleOp.getBody());
+    auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+        unknownLoc, circtOp.getBodyBlock());
 
     // Add all the properties of a memory as fields of the class.
     // The types must match exactly with the FMemModuleOp attribute type.
 
-    mlir::Type classFieldTypes[] = {
-        om::SymbolRefType::get(context),
-        mlir::IntegerType::get(context, 64, IntegerType::Unsigned),
-        mlir::IntegerType::get(context, 32, IntegerType::Unsigned),
-        mlir::IntegerType::get(context, 32, IntegerType::Unsigned),
-        mlir::IntegerType::get(context, 32, IntegerType::Unsigned),
-        mlir::IntegerType::get(context, 32, IntegerType::Unsigned),
-        mlir::IntegerType::get(context, 32, IntegerType::Unsigned),
-        mlir::IntegerType::get(context, 32, IntegerType::Unsigned),
-        mlir::IntegerType::get(context, 32, IntegerType::Unsigned)};
+    mlir::Type extraPortsType[] = {
+        StringType::get(context),  // name
+        StringType::get(context),  // direction
+        FIntegerType::get(context) // Width
+    };
+    StringRef extraPortFields[3] = {"name", "direction", "width"};
 
-    memorySchemaClass = om::ClassOp::buildSimpleClassOp(
-        builderOM, unknownLoc, "MemorySchema", memoryParamNames,
-        memoryParamNames, classFieldTypes);
+    extraPortsClass = builderOM.create<ClassOp>(
+        "ExtraPortsMemorySchema", extraPortFields, extraPortsType);
+
+    mlir::Type classFieldTypes[13] = {
+        StringType::get(context),
+        FIntegerType::get(context),
+        FIntegerType::get(context),
+        FIntegerType::get(context),
+        FIntegerType::get(context),
+        FIntegerType::get(context),
+        FIntegerType::get(context),
+        FIntegerType::get(context),
+        FIntegerType::get(context),
+        ListType::get(context, cast<PropertyType>(PathType::get(context))),
+        BoolType::get(context),
+        ListType::get(
+            context, cast<PropertyType>(
+                         detail::getInstanceTypeForClassLike(extraPortsClass))),
+        ListType::get(context, cast<PropertyType>(StringType::get(context))),
+    };
+
+    memorySchemaClass = builderOM.create<ClassOp>(
+        "MemorySchema", memoryParamNames, classFieldTypes);
 
     // Now create the class that will instantiate metadata class with all the
     // memories of the circt.
-    memoryMetadataClass =
-        builderOM.create<circt::om::ClassOp>("MemoryMetadata");
-    memoryMetadataClass.getRegion().emplaceBlock();
+    SmallVector<PortInfo> mports;
+    memoryMetadataClass = builderOM.create<ClassOp>(
+        builderOM.getStringAttr("MemoryMetadata"), mports);
   }
 
   void createRetimeModulesSchema() {
-    auto *context = moduleOp.getContext();
     auto unknownLoc = mlir::UnknownLoc::get(context);
-    auto builderOM =
-        mlir::ImplicitLocOpBuilder::atBlockEnd(unknownLoc, moduleOp.getBody());
-    Type classFieldTypes[] = {om::SymbolRefType::get(context)};
-    retimeModulesSchemaClass = om::ClassOp::buildSimpleClassOp(
-        builderOM, unknownLoc, "RetimeModulesSchema", retimeModulesParamNames,
-        retimeModulesParamNames, classFieldTypes);
+    auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+        unknownLoc, circtOp.getBodyBlock());
+    Type classFieldTypes[] = {StringType::get(context)};
+    retimeModulesSchemaClass = builderOM.create<ClassOp>(
+        "RetimeModulesSchema", retimeModulesParamNames, classFieldTypes);
 
-    retimeModulesMetadataClass =
-        builderOM.create<circt::om::ClassOp>("RetimeModulesMetadata");
-    retimeModulesMetadataClass.getRegion().emplaceBlock();
+    SmallVector<PortInfo> mports;
+    retimeModulesMetadataClass = builderOM.create<ClassOp>(
+        builderOM.getStringAttr("RetimeModulesMetadata"), mports);
   }
 
   void addRetimeModule(FModuleLike module) {
@@ -90,39 +141,62 @@ struct ObjectModelIR {
       createRetimeModulesSchema();
     auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
         module->getLoc(), retimeModulesMetadataClass.getBodyBlock());
+
+    // Create the path operation.
     auto modEntry =
-        builderOM.create<om::ConstantOp>(om::SymbolRefAttr::get(module));
-    auto object = builderOM.create<om::ObjectOp>(retimeModulesSchemaClass,
-                                                 ValueRange({modEntry}));
-    builderOM.create<om::ClassFieldOp>(
-        builderOM.getStringAttr("mod_" + module.getModuleName()), object);
+        builderOM.create<StringConstantOp>(module.getModuleNameAttr());
+    auto object = builderOM.create<ObjectOp>(retimeModulesSchemaClass,
+                                             module.getModuleNameAttr());
+
+    auto inPort = builderOM.create<ObjectSubfieldOp>(object, 0);
+    builderOM.create<PropAssignOp>(inPort, modEntry);
+    auto portIndex = retimeModulesMetadataClass.getNumPorts();
+    SmallVector<std::pair<unsigned, PortInfo>> newPorts = {
+        {portIndex,
+         PortInfo(builderOM.getStringAttr(module.getName() + "_field"),
+                  object.getType(), Direction::Out)}};
+    retimeModulesMetadataClass.insertPorts(newPorts);
+    auto blockarg = retimeModulesMetadataClass.getBodyBlock()->addArgument(
+        object.getType(), module->getLoc());
+    builderOM.create<PropAssignOp>(blockarg, object);
   }
 
   void addBlackBoxModulesSchema() {
-    auto *context = moduleOp.getContext();
     auto unknownLoc = mlir::UnknownLoc::get(context);
-    auto builderOM =
-        mlir::ImplicitLocOpBuilder::atBlockEnd(unknownLoc, moduleOp.getBody());
-    Type classFieldTypes[] = {om::SymbolRefType::get(context)};
-    blackBoxModulesSchemaClass = om::ClassOp::buildSimpleClassOp(
-        builderOM, unknownLoc, "SitestBlackBoxModulesSchema",
-        blackBoxModulesParamNames, blackBoxModulesParamNames, classFieldTypes);
-    blackBoxMetadataClass =
-        builderOM.create<circt::om::ClassOp>("SitestBlackBoxMetadata");
-    blackBoxMetadataClass.getRegion().emplaceBlock();
+    auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+        unknownLoc, circtOp.getBodyBlock());
+    Type classFieldTypes[] = {StringType::get(context)};
+    blackBoxModulesSchemaClass =
+        builderOM.create<ClassOp>("SitestBlackBoxModulesSchema",
+                                  blackBoxModulesParamNames, classFieldTypes);
+    SmallVector<PortInfo> mports;
+    blackBoxMetadataClass = builderOM.create<ClassOp>(
+        builderOM.getStringAttr("SitestBlackBoxMetadata"), mports);
   }
 
   void addBlackBoxModule(FExtModuleOp module) {
     if (!blackBoxModulesSchemaClass)
       addBlackBoxModulesSchema();
+    StringRef defName = *module.getDefname();
+    if (!blackboxModules.insert(defName).second)
+      return;
     auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
         module.getLoc(), blackBoxMetadataClass.getBodyBlock());
-    auto modEntry =
-        builderOM.create<om::ConstantOp>(om::SymbolRefAttr::get(module));
-    auto object = builderOM.create<om::ObjectOp>(blackBoxModulesSchemaClass,
-                                                 ValueRange({modEntry}));
-    builderOM.create<om::ClassFieldOp>(
-        builderOM.getStringAttr("exterMod_" + module.getName()), object);
+    auto modEntry = builderOM.create<StringConstantOp>(module.getDefnameAttr());
+    auto object = builderOM.create<ObjectOp>(blackBoxModulesSchemaClass,
+                                             module.getModuleNameAttr());
+
+    auto inPort = builderOM.create<ObjectSubfieldOp>(object, 0);
+    builderOM.create<PropAssignOp>(inPort, modEntry);
+    auto portIndex = blackBoxMetadataClass.getNumPorts();
+    SmallVector<std::pair<unsigned, PortInfo>> newPorts = {
+        {portIndex,
+         PortInfo(builderOM.getStringAttr(module.getName() + "_field"),
+                  object.getType(), Direction::Out)}};
+    blackBoxMetadataClass.insertPorts(newPorts);
+    auto blockarg = blackBoxMetadataClass.getBodyBlock()->addArgument(
+        object.getType(), module->getLoc());
+    builderOM.create<PropAssignOp>(blockarg, object);
   }
 
   void addMemory(FMemModuleOp mem) {
@@ -130,15 +204,118 @@ struct ObjectModelIR {
       createMemorySchema();
     auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
         mem.getLoc(), memoryMetadataClass.getBodyBlock());
-    auto createConstField = [&](Attribute constVal) {
-      return builderOM.create<om::ConstantOp>(constVal.cast<mlir::TypedAttr>());
+    auto createConstField = [&](Attribute constVal) -> Value {
+      if (auto boolConstant = dyn_cast_or_null<mlir::BoolAttr>(constVal))
+        return builderOM.create<BoolConstantOp>(boolConstant);
+      if (auto intConstant = dyn_cast_or_null<mlir::IntegerAttr>(constVal))
+        return builderOM.create<FIntegerConstantOp>(intConstant);
+      if (auto strConstant = dyn_cast_or_null<mlir::StringAttr>(constVal))
+        return builderOM.create<StringConstantOp>(strConstant);
+      return {};
     };
+    auto nlaBuilder = OpBuilder::atBlockBegin(circtOp.getBodyBlock());
 
+    auto memPaths = instancePathCache.getAbsolutePaths(mem);
+    SmallVector<Value> memoryHierPaths;
+    SmallVector<Value> finalInstanceNames;
+    // Add metadata for memory paths that are in the design.  There are two
+    // slightly different code paths here.  If no instance is in the design,
+    // then just skip the memory.  If some instances are in the designs and some
+    // are not, then add paths for memories in the design.  For memories which
+    // are then _not_ in the design, give them unresolvable distinct attribute
+    // paths.  The LowerClasses pass will later treat these as "optimized away"
+    // and create an empty path.
+    //
+    // TODO: This incongruity seems bad.  Can we instead not generate metadata
+    // for any path not in the design?
+    bool inDut = instanceInfo.anyInstanceInEffectiveDesign(mem);
+    if (inDut) {
+      for (auto memPath : memPaths) {
+        {
+          igraph::InstanceOpInterface finalInst = memPath.leaf();
+          finalInstanceNames.emplace_back(builderOM.create<StringConstantOp>(
+              finalInst.getInstanceNameAttr()));
+        }
+        SmallVector<Attribute> namepath;
+        bool foundDut = false;
+        // The hierpath will be created to the pre-extracted
+        // instance, thus drop the leaf instance of the path, which can be
+        // extracted in subsequent passes.
+        igraph::InstanceOpInterface preExtractedLeafInstance;
+        for (auto inst : llvm::drop_end(memPath)) {
+          if (!foundDut) {
+            if (!instanceInfo.isEffectiveDut(
+                    inst->getParentOfType<FModuleOp>()))
+              continue;
+            foundDut = true;
+          }
+
+          // This path is not in the design.  Do not record it.
+          if (inst->getParentOfType<LayerBlockOp>()) {
+            namepath.clear();
+            break;
+          }
+
+          namepath.emplace_back(firrtl::getInnerRefTo(
+              inst, [&](auto mod) -> hw::InnerSymbolNamespace & {
+                return getModuleNamespace(mod);
+              }));
+          preExtractedLeafInstance = inst;
+        }
+        PathOp pathRef;
+        if (!namepath.empty()) {
+          // This is a path that is in the design.
+          auto nla = nlaBuilder.create<hw::HierPathOp>(
+              mem->getLoc(),
+              nlaBuilder.getStringAttr(circtNamespace.newName("memNLA")),
+              nlaBuilder.getArrayAttr(namepath));
+          nla.setVisibility(SymbolTable::Visibility::Private);
+          pathRef = createPathRef(preExtractedLeafInstance, nla, builderOM);
+        } else {
+          // This is a path _not_ in the design.
+          //
+          // TODO: This unresolvable distinct seems sketchy.
+          pathRef = createPathRef({}, {}, builderOM);
+        }
+
+        // Create the path operation.
+        memoryHierPaths.push_back(pathRef);
+      }
+    }
+    auto finalInstNamesList = builderOM.create<ListCreateOp>(
+        ListType::get(context, cast<PropertyType>(StringType::get(context))),
+        finalInstanceNames);
+    auto hierpaths = builderOM.create<ListCreateOp>(
+        ListType::get(context, cast<PropertyType>(PathType::get(context))),
+        memoryHierPaths);
     SmallVector<Value> memFields;
-    for (auto field : memoryParamNames)
-      memFields.push_back(createConstField(
-          llvm::StringSwitch<TypedAttr>(field)
-              .Case("name", om::SymbolRefAttr::get(mem))
+
+    auto object = builderOM.create<ObjectOp>(memorySchemaClass, mem.getName());
+    SmallVector<Value> extraPortsList;
+    ClassType extraPortsType;
+    for (auto attr : mem.getExtraPortsAttr()) {
+
+      auto port = cast<DictionaryAttr>(attr);
+      auto portName = createConstField(port.getAs<StringAttr>("name"));
+      auto direction = createConstField(port.getAs<StringAttr>("direction"));
+      auto width = createConstField(port.getAs<IntegerAttr>("width"));
+      auto extraPortsObj =
+          builderOM.create<ObjectOp>(extraPortsClass, "extraPorts");
+      extraPortsType = extraPortsObj.getType();
+      auto inPort = builderOM.create<ObjectSubfieldOp>(extraPortsObj, 0);
+      builderOM.create<PropAssignOp>(inPort, portName);
+      inPort = builderOM.create<ObjectSubfieldOp>(extraPortsObj, 2);
+      builderOM.create<PropAssignOp>(inPort, direction);
+      inPort = builderOM.create<ObjectSubfieldOp>(extraPortsObj, 4);
+      builderOM.create<PropAssignOp>(inPort, width);
+      extraPortsList.push_back(extraPortsObj);
+    }
+    auto extraPorts = builderOM.create<ListCreateOp>(
+        memorySchemaClass.getPortType(22), extraPortsList);
+    for (auto field : llvm::enumerate(memoryParamNames)) {
+      auto propVal = createConstField(
+          llvm::StringSwitch<TypedAttr>(field.value())
+              .Case("name", builderOM.getStringAttr(mem.getName()))
               .Case("depth", mem.getDepthAttr())
               .Case("width", mem.getDataWidthAttr())
               .Case("maskBits", mem.getMaskBitsAttr())
@@ -146,43 +323,164 @@ struct ObjectModelIR {
               .Case("writePorts", mem.getNumWritePortsAttr())
               .Case("readwritePorts", mem.getNumReadWritePortsAttr())
               .Case("readLatency", mem.getReadLatencyAttr())
-              .Case("writeLatency", mem.getWriteLatencyAttr())));
+              .Case("writeLatency", mem.getWriteLatencyAttr())
+              .Case("hierarchy", {})
+              .Case("inDut", BoolAttr::get(context, inDut))
+              .Case("extraPorts", {})
+              .Case("preExtInstName", {}));
+      if (!propVal) {
+        if (field.value() == "hierarchy")
+          propVal = hierpaths;
+        else if (field.value() == "preExtInstName")
+          propVal = finalInstNamesList;
+        else
+          propVal = extraPorts;
+      }
 
-    auto object = builderOM.create<om::ObjectOp>(memorySchemaClass, memFields);
-    builderOM.create<om::ClassFieldOp>(
-        builderOM.getStringAttr("mem_" + mem.getName()), object);
+      // The memory schema is a simple class, with input tied to output. The
+      // arguments are ordered such that, port index i is the input that is tied
+      // to i+1 which is the output.
+      // The following `2*index` translates the index to the memory schema input
+      // port number.
+      auto inPort =
+          builderOM.create<ObjectSubfieldOp>(object, 2 * field.index());
+      builderOM.create<PropAssignOp>(inPort, propVal);
+    }
+    auto portIndex = memoryMetadataClass.getNumPorts();
+    SmallVector<std::pair<unsigned, PortInfo>> newPorts = {
+        {portIndex, PortInfo(builderOM.getStringAttr(mem.getName() + "_field"),
+                             object.getType(), Direction::Out)}};
+    memoryMetadataClass.insertPorts(newPorts);
+    auto blockarg = memoryMetadataClass.getBodyBlock()->addArgument(
+        object.getType(), mem->getLoc());
+    builderOM.create<PropAssignOp>(blockarg, object);
   }
-  mlir::ModuleOp moduleOp;
-  om::ClassOp memorySchemaClass;
-  om::ClassOp memoryMetadataClass;
-  om::ClassOp retimeModulesMetadataClass, retimeModulesSchemaClass;
-  om::ClassOp blackBoxModulesSchemaClass, blackBoxMetadataClass;
-  StringRef memoryParamNames[9] = {
-      "name",       "depth",          "width",        "maskBits",   "readPorts",
-      "writePorts", "readwritePorts", "writeLatency", "readLatency"};
+
+  ObjectOp instantiateSifiveMetadata(FModuleOp topMod) {
+    if (!blackBoxMetadataClass && !memoryMetadataClass &&
+        !retimeModulesMetadataClass && !instanceInfo.hasDut())
+      return {};
+    auto builder = mlir::ImplicitLocOpBuilder::atBlockEnd(
+        mlir::UnknownLoc::get(circtOp->getContext()), circtOp.getBodyBlock());
+    SmallVector<PortInfo> mports;
+    auto sifiveMetadataClass = builder.create<ClassOp>(
+        builder.getStringAttr("SiFive_Metadata"), mports);
+    builder.setInsertionPointToStart(sifiveMetadataClass.getBodyBlock());
+
+    auto addPort = [&](Value obj, StringRef fieldName) {
+      auto portIndex = sifiveMetadataClass.getNumPorts();
+      SmallVector<std::pair<unsigned, PortInfo>> newPorts = {
+          {portIndex, PortInfo(builder.getStringAttr(fieldName + "_field_" +
+                                                     Twine(portIndex)),
+                               obj.getType(), Direction::Out)}};
+      sifiveMetadataClass.insertPorts(newPorts);
+      auto blockarg = sifiveMetadataClass.getBodyBlock()->addArgument(
+          obj.getType(), topMod->getLoc());
+      builder.create<PropAssignOp>(blockarg, obj);
+    };
+    if (blackBoxMetadataClass)
+      addPort(
+          builder.create<ObjectOp>(blackBoxMetadataClass,
+                                   builder.getStringAttr("blackbox_metadata")),
+          "blackbox");
+
+    if (memoryMetadataClass)
+      addPort(
+          builder.create<ObjectOp>(memoryMetadataClass,
+                                   builder.getStringAttr("memory_metadata")),
+          "memory");
+
+    if (retimeModulesMetadataClass)
+      addPort(builder.create<ObjectOp>(
+                  retimeModulesMetadataClass,
+                  builder.getStringAttr("retime_modules_metadata")),
+              "retime");
+
+    if (instanceInfo.hasDut()) {
+      auto dutMod = instanceInfo.getDut();
+
+      // This can handle multiple DUTs or multiple paths to a DUT.
+      // Create a list of paths to the DUTs.
+      SmallVector<Value, 2> pathOpsToDut;
+
+      auto dutPaths = instancePathCache.getAbsolutePaths(dutMod);
+      // For each path to the DUT.
+      for (auto dutPath : dutPaths) {
+        SmallVector<Attribute> namepath;
+        // Construct the list of inner refs to the instances in the path.
+        for (auto inst : dutPath)
+          namepath.emplace_back(firrtl::getInnerRefTo(
+              inst, [&](auto mod) -> hw::InnerSymbolNamespace & {
+                return getModuleNamespace(mod);
+              }));
+        if (namepath.empty())
+          continue;
+        // The path op will refer to the leaf instance in the path (and not the
+        // actual DUT module!!).
+        auto leafInst = dutPath.leaf();
+        auto nlaBuilder = OpBuilder::atBlockBegin(circtOp.getBodyBlock());
+        auto nla = nlaBuilder.create<hw::HierPathOp>(
+            dutMod->getLoc(),
+            nlaBuilder.getStringAttr(circtNamespace.newName("dutNLA")),
+            nlaBuilder.getArrayAttr(namepath));
+        nla.setVisibility(SymbolTable::Visibility::Private);
+        // Create the path ref op and record it.
+        pathOpsToDut.emplace_back(createPathRef(leafInst, nla, builder));
+      }
+      // Create the list of paths op and add it as a field of the class.
+      auto pathList = builder.create<ListCreateOp>(
+          ListType::get(context, cast<PropertyType>(PathType::get(context))),
+          pathOpsToDut);
+      addPort(pathList, "dutModulePath");
+    }
+
+    builder.setInsertionPointToEnd(topMod.getBodyBlock());
+    return builder.create<ObjectOp>(sifiveMetadataClass,
+                                    builder.getStringAttr("sifive_metadata"));
+  }
+
+  /// Get the cached namespace for a module.
+  hw::InnerSymbolNamespace &getModuleNamespace(FModuleLike module) {
+    return moduleNamespaces.try_emplace(module, module).first->second;
+  }
+  MLIRContext *context;
+  CircuitOp circtOp;
+  CircuitNamespace circtNamespace;
+  InstancePathCache instancePathCache;
+  InstanceInfo &instanceInfo;
+  /// Cached module namespaces.
+  DenseMap<Operation *, hw::InnerSymbolNamespace> &moduleNamespaces;
+  ClassOp memorySchemaClass, extraPortsClass;
+  ClassOp memoryMetadataClass;
+  ClassOp retimeModulesMetadataClass, retimeModulesSchemaClass;
+  ClassOp blackBoxModulesSchemaClass, blackBoxMetadataClass;
+  StringRef memoryParamNames[13] = {
+      "name",          "depth",      "width",          "maskBits",
+      "readPorts",     "writePorts", "readwritePorts", "writeLatency",
+      "readLatency",   "hierarchy",  "inDut",          "extraPorts",
+      "preExtInstName"};
   StringRef retimeModulesParamNames[1] = {"moduleName"};
   StringRef blackBoxModulesParamNames[1] = {"moduleName"};
-};
+  llvm::SmallDenseSet<StringRef> blackboxModules;
+}; // namespace
 
 class CreateSiFiveMetadataPass
-    : public CreateSiFiveMetadataBase<CreateSiFiveMetadataPass> {
+    : public circt::firrtl::impl::CreateSiFiveMetadataBase<
+          CreateSiFiveMetadataPass> {
   LogicalResult emitRetimeModulesMetadata(ObjectModelIR &omir);
   LogicalResult emitSitestBlackboxMetadata(ObjectModelIR &omir);
   LogicalResult emitMemoryMetadata(ObjectModelIR &omir);
-  void getDependentDialects(mlir::DialectRegistry &registry) const override;
   void runOnOperation() override;
 
   /// Get the cached namespace for a module.
   hw::InnerSymbolNamespace &getModuleNamespace(FModuleLike module) {
     return moduleNamespaces.try_emplace(module, module).first->second;
   }
-  // The set of all modules underneath the design under test module.
-  DenseSet<Operation *> dutModuleSet;
   /// Cached module namespaces.
   DenseMap<Operation *, hw::InnerSymbolNamespace> moduleNamespaces;
-  // The design under test module.
-  FModuleOp dutMod;
   CircuitOp circuitOp;
+  // Precomputed instanceinfo analysis
+  InstanceInfo *instanceInfo;
 
 public:
   CreateSiFiveMetadataPass(bool replSeqMem, StringRef replSeqMemFile) {
@@ -199,15 +497,6 @@ CreateSiFiveMetadataPass::emitMemoryMetadata(ObjectModelIR &omir) {
   if (!replSeqMem)
     return success();
 
-  // The instance graph analysis will be required to print the hierarchy names
-  // of the memory.
-  auto instancePathCache = InstancePathCache(getAnalysis<InstanceGraph>());
-
-  // Everything goes in the DUT if (1) there is no DUT specified or (2) if the
-  // DUT is the top module.
-  bool everythingInDUT =
-      !dutMod ||
-      instancePathCache.instanceGraph.getTopLevelNode()->getModule() == dutMod;
   SmallDenseMap<Attribute, unsigned> symbolIndices;
   auto addSymbolToVerbatimOp =
       [&](Operation *op,
@@ -244,15 +533,16 @@ CreateSiFiveMetadataPass::emitMemoryMetadata(ObjectModelIR &omir) {
     // macro replacement. The requirements for macro replacement::
     // 1. read latency and write latency of one.
     // 2. undefined read-under-write behavior.
-    if (!((mem.getReadLatency() == 1 && mem.getWriteLatency() == 1) &&
-          width > 0))
+    if (mem.getReadLatency() != 1 || mem.getWriteLatency() != 1 || width <= 0)
       return;
     auto memExtSym = FlatSymbolRefAttr::get(SymbolTable::getSymbolName(mem));
     auto symId = seqMemSymbols.size();
     seqMemSymbols.push_back(memExtSym);
     // Compute the mask granularity.
     auto isMasked = mem.isMasked();
-    auto maskGran = width / mem.getMaskBits();
+    auto maskGran = width;
+    if (isMasked)
+      maskGran /= mem.getMaskBits();
     // Now create the config string for the memory.
     std::string portStr;
     for (uint32_t i = 0; i < mem.getNumWritePorts(); ++i) {
@@ -279,7 +569,7 @@ CreateSiFiveMetadataPass::emitMemoryMetadata(ObjectModelIR &omir) {
                         .str();
 
     // Do not emit any JSON for memories which are not in the DUT.
-    if (!everythingInDUT && !dutModuleSet.contains(mem))
+    if (!instanceInfo->anyInstanceInEffectiveDesign(mem))
       return;
     // This adds a Json array element entry corresponding to this memory.
     jsonStream.object([&] {
@@ -307,14 +597,28 @@ CreateSiFiveMetadataPass::emitMemoryMetadata(ObjectModelIR &omir) {
         }
       });
       // Record all the hierarchy names.
-      SmallVector<std::string> hierNames;
       jsonStream.attributeArray("hierarchy", [&] {
         // Get the absolute path for the parent memory, to create the
         // hierarchy names.
-        auto paths = instancePathCache.getAbsolutePaths(mem);
+        auto paths = omir.instancePathCache.getAbsolutePaths(mem);
         for (auto p : paths) {
           if (p.empty())
             continue;
+
+          // Only include the memory paths that are in the design.  This means
+          // that the path has to both include the design and not be under a
+          // layer.
+          auto dutMod = instanceInfo->getEffectiveDut();
+          bool inDut = false, underLayer = false;
+          for (auto inst : p) {
+            auto parent = inst->getParentOfType<FModuleOp>();
+            inDut |= parent == dutMod;
+            if (inst->getParentOfType<LayerBlockOp>())
+              underLayer = true;
+          }
+          if (!inDut || underLayer)
+            continue;
+
           auto top = p.top();
           std::string hierName =
               addSymbolToVerbatimOp(top->getParentOfType<FModuleOp>(),
@@ -323,7 +627,7 @@ CreateSiFiveMetadataPass::emitMemoryMetadata(ObjectModelIR &omir) {
           auto finalInst = p.leaf();
           for (auto inst : llvm::drop_end(p)) {
             auto parentModule = inst->getParentOfType<FModuleOp>();
-            if (dutMod == parentModule)
+            if (instanceInfo->getDut() == parentModule)
               hierName =
                   addSymbolToVerbatimOp(parentModule, jsonSymbols).c_str();
 
@@ -332,18 +636,7 @@ CreateSiFiveMetadataPass::emitMemoryMetadata(ObjectModelIR &omir) {
           }
           hierName += ("." + finalInst.getInstanceName()).str();
 
-          hierNames.push_back(hierName);
-          // Only include the memory path if it is under the DUT or we are in a
-          // situation where everything is deemed to be "in the DUT", i.e., when
-          // the DUT is the top module or when no DUT is specified.
-          if (everythingInDUT ||
-              llvm::any_of(p, [&](circt::igraph::InstanceOpInterface inst) {
-                return llvm::all_of(inst.getReferencedModuleNamesAttr(),
-                                    [&](Attribute attr) {
-                                      return attr == dutMod.getNameAttr();
-                                    });
-              }))
-            jsonStream.value(hierName);
+          jsonStream.value(hierName);
         }
       });
     });
@@ -373,25 +666,29 @@ CreateSiFiveMetadataPass::emitMemoryMetadata(ObjectModelIR &omir) {
       metadataDir = dir.getValue();
 
   // Use unknown loc to avoid printing the location in the metadata files.
-  auto dutVerbatimOp = builder.create<sv::VerbatimOp>(
-      dutJsonBuffer, ValueRange(), builder.getArrayAttr(jsonSymbols));
-  auto fileAttr = hw::OutputFileAttr::getFromDirectoryAndFilename(
-      context, metadataDir, "seq_mems.json", /*excludeFromFilelist=*/true);
-  dutVerbatimOp->setAttr("output_file", fileAttr);
-
-  auto confVerbatimOp = builder.create<sv::VerbatimOp>(
-      seqMemConfStr, ValueRange(), builder.getArrayAttr(seqMemSymbols));
-  if (replSeqMemFile.empty()) {
-    emitError(circuitOp->getLoc())
-        << "metadata emission failed, the option "
-           "`-repl-seq-mem-file=<filename>` is mandatory for specifying a "
-           "valid seq mem metadata file";
-    return failure();
+  {
+    SmallString<128> seqMemsJsonPath(metadataDir);
+    llvm::sys::path::append(seqMemsJsonPath, "seq_mems.json");
+    builder.create<emit::FileOp>(seqMemsJsonPath, [&] {
+      builder.create<sv::VerbatimOp>(dutJsonBuffer, ValueRange{},
+                                     builder.getArrayAttr(jsonSymbols));
+    });
   }
 
-  fileAttr = hw::OutputFileAttr::getFromFilename(context, replSeqMemFile,
-                                                 /*excludeFromFilelist=*/true);
-  confVerbatimOp->setAttr("output_file", fileAttr);
+  {
+    if (replSeqMemFile.empty()) {
+      emitError(circuitOp->getLoc())
+          << "metadata emission failed, the option "
+             "`-repl-seq-mem-file=<filename>` is mandatory for specifying a "
+             "valid seq mem metadata file";
+      return failure();
+    }
+
+    builder.create<emit::FileOp>(replSeqMemFile, [&] {
+      builder.create<sv::VerbatimOp>(seqMemConfStr, ValueRange{},
+                                     builder.getArrayAttr(seqMemSymbols));
+    });
+  }
 
   return success();
 }
@@ -469,7 +766,8 @@ CreateSiFiveMetadataPass::emitRetimeModulesMetadata(ObjectModelIR &omir) {
   j.array([&] {
     for (auto module : circuitOp.getBodyBlock()->getOps<FModuleLike>()) {
       // The annotation has no supplemental information, just remove it.
-      if (!AnnotationSet::removeAnnotations(module, retimeModuleAnnoClass))
+      if (!AnnotationSet::removeAnnotations(module, retimeModuleAnnoClass) ||
+          !instanceInfo->anyInstanceInEffectiveDesign(module))
         continue;
 
       // We use symbol substitution to make sure we output the correct thing
@@ -481,13 +779,12 @@ CreateSiFiveMetadataPass::emitRetimeModulesMetadata(ObjectModelIR &omir) {
   });
 
   // Put the retime information in a verbatim operation.
-  auto builder = OpBuilder::atBlockEnd(circuitOp.getBodyBlock());
-  auto verbatimOp = builder.create<sv::VerbatimOp>(
-      builder.getUnknownLoc(), buffer, ValueRange(),
-      builder.getArrayAttr(symbols));
-  auto fileAttr = hw::OutputFileAttr::getFromFilename(
-      context, filename, /*excludeFromFilelist=*/true);
-  verbatimOp->setAttr("output_file", fileAttr);
+  auto builder = ImplicitLocOpBuilder::atBlockEnd(UnknownLoc::get(context),
+                                                  circuitOp.getBodyBlock());
+  builder.create<emit::FileOp>(filename, [&] {
+    builder.create<sv::VerbatimOp>(builder.getStringAttr(buffer), ValueRange{},
+                                   builder.getArrayAttr(symbols));
+  });
   return success();
 }
 
@@ -496,11 +793,8 @@ CreateSiFiveMetadataPass::emitRetimeModulesMetadata(ObjectModelIR &omir) {
 LogicalResult
 CreateSiFiveMetadataPass::emitSitestBlackboxMetadata(ObjectModelIR &omir) {
 
-  // Any extmodule with these annotations or one of these ScalaClass classes
-  // should be excluded from the blackbox list.
-  std::array<StringRef, 3> classBlackList = {
-      "freechips.rocketchip.util.BlackBoxedROM",
-      "sifive.enterprise.grandcentral.MemTap"};
+  // Any extmodule with these annotations should be excluded from the blackbox
+  // list.
   std::array<StringRef, 6> blackListedAnnos = {
       blackBoxAnnoClass, blackBoxInlineAnnoClass, blackBoxPathAnnoClass,
       dataTapsBlackboxClass, memTapBlackboxClass};
@@ -537,16 +831,8 @@ CreateSiFiveMetadataPass::emitSitestBlackboxMetadata(ObjectModelIR &omir) {
         }))
       continue;
 
-    // If its a blacklisted scala class, skip it.
-    if (auto scalaAnno = annos.getAnnotation(scalaClassAnnoClass)) {
-      auto scalaClass = scalaAnno.getMember<StringAttr>("className");
-      if (scalaClass &&
-          llvm::is_contained(classBlackList, scalaClass.getValue()))
-        continue;
-    }
-
     // Record the defname of the module.
-    if (!dutMod || dutModuleSet.contains(extModule)) {
+    if (instanceInfo->anyInstanceInEffectiveDesign(extModule)) {
       dutModules.push_back(*extModule.getDefname());
     } else {
       testModules.push_back(*extModule.getDefname());
@@ -574,73 +860,64 @@ CreateSiFiveMetadataPass::emitSitestBlackboxMetadata(ObjectModelIR &omir) {
         j.value(name);
     });
 
-    auto *body = circuitOp.getBodyBlock();
     // Put the information in a verbatim operation.
-    auto builder = OpBuilder::atBlockEnd(body);
-    auto verbatimOp =
-        builder.create<sv::VerbatimOp>(builder.getUnknownLoc(), buffer);
-    auto fileAttr = hw::OutputFileAttr::getFromFilename(
-        context, filename, /*excludeFromFilelist=*/true);
-    verbatimOp->setAttr("output_file", fileAttr);
+    auto builder = ImplicitLocOpBuilder::atBlockEnd(UnknownLoc::get(context),
+                                                    circuitOp.getBodyBlock());
+
+    builder.create<emit::FileOp>(filename, [&] {
+      builder.create<emit::VerbatimOp>(StringAttr::get(context, buffer));
+    });
   };
 
   createOutput(testModules, testFilename);
   createOutput(dutModules, dutFilename);
 
-  // Clean up all ScalaClassAnnotations, which are no longer needed.
-  for (auto op : circuitOp.getOps<FModuleLike>())
-    AnnotationSet::removeAnnotations(op, scalaClassAnnoClass);
-
   return success();
 }
 
-void CreateSiFiveMetadataPass::getDependentDialects(
-    mlir::DialectRegistry &registry) const {
-  // We need this for SV verbatim and HW attributes.
-  registry.insert<hw::HWDialect, sv::SVDialect, om::OMDialect>();
-}
-
 void CreateSiFiveMetadataPass::runOnOperation() {
-
-  auto moduleOp = getOperation();
-  auto circuits = moduleOp.getOps<CircuitOp>();
+  auto circuits = getOperation().getOps<CircuitOp>();
   if (circuits.empty())
     return;
-  auto cIter = circuits.begin();
-  circuitOp = *cIter++;
 
-  assert(cIter == circuits.end() &&
-         "cannot handle more than one CircuitOp in a mlir::ModuleOp");
+  circuitOp = *circuits.begin();
 
-  auto *body = circuitOp.getBodyBlock();
-
-  // Find the device under test and create a set of all modules underneath it.
-  auto it = llvm::find_if(*body, [&](Operation &op) -> bool {
-    return AnnotationSet(&op).hasAnnotation(dutAnnoClass);
-  });
-  if (it != body->end()) {
-    dutMod = dyn_cast<FModuleOp>(*it);
-    auto &instanceGraph = getAnalysis<InstanceGraph>();
-    auto *node = instanceGraph.lookup(cast<igraph::ModuleOpInterface>(*it));
-    llvm::for_each(llvm::depth_first(node),
-                   [&](igraph::InstanceGraphNode *node) {
-                     dutModuleSet.insert(node->getModule());
-                   });
+  if (!llvm::hasSingleElement(circuits)) {
+    mlir::emitError(circuitOp.getLoc(),
+                    "cannot process multiple circuit operations")
+            .attachNote((*std::next(circuits.begin())).getLoc())
+        << "second circuit here";
+    return signalPassFailure();
   }
-  ObjectModelIR omir(moduleOp);
+
+  auto &instanceGraph = getAnalysis<InstanceGraph>();
+  instanceInfo = &getAnalysis<InstanceInfo>();
+  ObjectModelIR omir(circuitOp, instanceGraph, *instanceInfo, moduleNamespaces);
 
   if (failed(emitRetimeModulesMetadata(omir)) ||
       failed(emitSitestBlackboxMetadata(omir)) ||
       failed(emitMemoryMetadata(omir)))
     return signalPassFailure();
+  auto *node = instanceGraph.getTopLevelNode();
+  if (FModuleOp topMod = dyn_cast<FModuleOp>(*node->getModule()))
+    if (auto objectOp = omir.instantiateSifiveMetadata(topMod)) {
+      auto portIndex = topMod.getNumPorts();
+      SmallVector<std::pair<unsigned, PortInfo>> ports = {
+          {portIndex,
+           PortInfo(StringAttr::get(objectOp->getContext(), "metadataObj"),
+                    AnyRefType::get(objectOp->getContext()), Direction::Out)}};
+      topMod.insertPorts(ports);
+      auto builderOM = mlir::ImplicitLocOpBuilder::atBlockEnd(
+          topMod->getLoc(), topMod.getBodyBlock());
+      auto objectCast = builderOM.create<ObjectAnyRefCastOp>(objectOp);
+      builderOM.create<PropAssignOp>(topMod.getArgument(portIndex), objectCast);
+    }
 
-  // This pass does not modify the hierarchy.
-  markAnalysesPreserved<InstanceGraph>();
+  // This pass modifies the hierarchy, InstanceGraph is not preserved.
 
   // Clear pass-global state as required by MLIR pass infrastructure.
-  dutMod = {};
   circuitOp = {};
-  dutModuleSet.empty();
+  instanceInfo = {};
 }
 
 std::unique_ptr<mlir::Pass>

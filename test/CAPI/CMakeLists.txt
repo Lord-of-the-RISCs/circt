@@ -13,6 +13,7 @@ target_link_libraries(circt-capi-ir-test
   CIRCTCAPISV
   CIRCTCAPIFSM
   CIRCTCAPIExportFIRRTL
+  CIRCTCAPIExportSMTLIB
   CIRCTCAPIExportVerilog
 )
 
@@ -55,4 +56,73 @@ target_link_libraries(circt-capi-firtool-test
   MLIRCAPIIR
   CIRCTCAPIFIRRTL
   CIRCTCAPIFirtool
+)
+
+add_llvm_executable(circt-capi-arc-test
+  PARTIAL_SOURCES_INTENDED
+  arc.c
+)
+llvm_update_compile_flags(circt-capi-arc-test)
+
+add_llvm_executable(circt-capi-smtlib-test
+  PARTIAL_SOURCES_INTENDED
+  smtlib.c
+)
+llvm_update_compile_flags(circt-capi-smtlib-test)
+
+target_link_libraries(circt-capi-smtlib-test
+  PRIVATE
+
+  MLIRCAPIIR
+  MLIRCAPIFunc
+  CIRCTCAPISMT
+  CIRCTCAPIExportSMTLIB
+)
+
+target_link_libraries(circt-capi-arc-test
+  PRIVATE
+
+  MLIRCAPIIR
+  CIRCTCAPIArc
+)
+
+add_llvm_executable(circt-capi-rtg-pipelines-test
+  PARTIAL_SOURCES_INTENDED
+  rtg-pipelines.c
+)
+llvm_update_compile_flags(circt-capi-rtg-pipelines-test)
+
+target_link_libraries(circt-capi-rtg-pipelines-test
+  PRIVATE
+
+  MLIRCAPIIR
+  CIRCTCAPIRTG
+  CIRCTCAPIRtgTool
+)
+
+add_llvm_executable(circt-capi-rtg-test
+  PARTIAL_SOURCES_INTENDED
+  rtg.c
+)
+llvm_update_compile_flags(circt-capi-rtg-test)
+
+target_link_libraries(circt-capi-rtg-test
+  PRIVATE
+
+  MLIRCAPIIR
+  CIRCTCAPIRTG
+  CIRCTCAPIRTGTest
+)
+
+add_llvm_executable(circt-capi-rtgtest-test
+  PARTIAL_SOURCES_INTENDED
+  rtgtest.c
+)
+llvm_update_compile_flags(circt-capi-rtgtest-test)
+
+target_link_libraries(circt-capi-rtgtest-test
+  PRIVATE
+
+  MLIRCAPIIR
+  CIRCTCAPIRTGTest
 )

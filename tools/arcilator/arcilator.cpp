@@ -11,7 +11,9 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Conversion/ArcToLLVM.h"
 #include "circt/Conversion/CombToArith.h"
+#include "circt/Conversion/ConvertToArcs.h"
 #include "circt/Conversion/SeqToSV.h"
 #include "circt/Dialect/Arc/ArcDialect.h"
 #include "circt/Dialect/Arc/ArcInterfaces.h"
@@ -19,20 +21,34 @@
 #include "circt/Dialect/Arc/ArcPasses.h"
 #include "circt/Dialect/Arc/ModelInfo.h"
 #include "circt/Dialect/Arc/ModelInfoExport.h"
+#include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Emit/EmitDialect.h"
+#include "circt/Dialect/Emit/EmitPasses.h"
+#include "circt/Dialect/HW/HWPasses.h"
+#include "circt/Dialect/LLHD/IR/LLHDDialect.h"
+#include "circt/Dialect/OM/OMDialect.h"
+#include "circt/Dialect/OM/OMPasses.h"
+#include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
-#include "circt/InitAllDialects.h"
-#include "circt/InitAllPasses.h"
+#include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Sim/SimPasses.h"
+#include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
 #include "mlir/Bytecode/BytecodeReader.h"
 #include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
+#include "mlir/Dialect/DLTI/DLTI.h"
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/Index/IR/IndexDialect.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
+#include "mlir/Dialect/LLVMIR/Transforms/InlinerInterfaceImpl.h"
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/ExecutionEngine/ExecutionEngine.h"
+#include "mlir/ExecutionEngine/OptUtils.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/OperationSupport.h"
@@ -47,6 +63,7 @@
 #include "mlir/Target/LLVMIR/Export.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
@@ -54,12 +71,15 @@
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
+#include "llvm/Support/TargetSelect.h"
 #include "llvm/Support/ToolOutputFile.h"
 
-#include <iostream>
+#ifdef ARCILATOR_ENABLE_JIT
+#include "arcilator-jit-env.h"
+#endif
+
 #include <optional>
 
-using namespace llvm;
 using namespace mlir;
 using namespace circt;
 using namespace arc;
@@ -68,89 +88,103 @@ using namespace arc;
 // Command Line Arguments
 //===----------------------------------------------------------------------===//
 
-static cl::OptionCategory mainCategory("arcilator Options");
+static llvm::cl::OptionCategory mainCategory("arcilator Options");
 
-static cl::opt<std::string> inputFilename(cl::Positional,
-                                          cl::desc("<input file>"),
-                                          cl::init("-"), cl::cat(mainCategory));
+static llvm::cl::opt<std::string> inputFilename(llvm::cl::Positional,
+                                                llvm::cl::desc("<input file>"),
+                                                llvm::cl::init("-"),
+                                                llvm::cl::cat(mainCategory));
 
-static cl::opt<std::string> outputFilename("o", cl::desc("Output filename"),
-                                           cl::value_desc("filename"),
-                                           cl::init("-"),
-                                           cl::cat(mainCategory));
+static llvm::cl::opt<std::string>
+    outputFilename("o", llvm::cl::desc("Output filename"),
+                   llvm::cl::value_desc("filename"), llvm::cl::init("-"),
+                   llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> observePorts("observe-ports",
-                                  cl::desc("Make all ports observable"),
-                                  cl::init(false), cl::cat(mainCategory));
+static llvm::cl::opt<bool>
+    observePorts("observe-ports", llvm::cl::desc("Make all ports observable"),
+                 llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> observeWires("observe-wires",
-                                  cl::desc("Make all wires observable"),
-                                  cl::init(false), cl::cat(mainCategory));
+static llvm::cl::opt<bool>
+    observeWires("observe-wires", llvm::cl::desc("Make all wires observable"),
+                 llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool>
-    observeNamedValues("observe-named-values",
-                       cl::desc("Make values with `sv.namehint` observable"),
-                       cl::init(false), cl::cat(mainCategory));
+static llvm::cl::opt<bool> observeNamedValues(
+    "observe-named-values",
+    llvm::cl::desc("Make values with `sv.namehint` observable"),
+    llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> observeRegisters("observe-registers",
-                                      cl::desc("Make all registers observable"),
-                                      cl::init(false), cl::cat(mainCategory));
+static llvm::cl::opt<bool>
+    observeRegisters("observe-registers",
+                     llvm::cl::desc("Make all registers observable"),
+                     llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool>
+static llvm::cl::opt<bool>
     observeMemories("observe-memories",
-                    cl::desc("Make all memory contents observable"),
-                    cl::init(false), cl::cat(mainCategory));
+                    llvm::cl::desc("Make all memory contents observable"),
+                    llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<std::string> stateFile("state-file", cl::desc("State file"),
-                                      cl::value_desc("filename"), cl::init(""),
-                                      cl::cat(mainCategory));
+static llvm::cl::opt<std::string> stateFile("state-file",
+                                            llvm::cl::desc("State file"),
+                                            llvm::cl::value_desc("filename"),
+                                            llvm::cl::init(""),
+                                            llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> shouldInline("inline", cl::desc("Inline arcs"),
-                                  cl::init(true), cl::cat(mainCategory));
+static llvm::cl::opt<bool> shouldInline("inline", llvm::cl::desc("Inline arcs"),
+                                        llvm::cl::init(true),
+                                        llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> shouldDedup("dedup", cl::desc("Deduplicate arcs"),
-                                 cl::init(true), cl::cat(mainCategory));
+static llvm::cl::opt<bool> shouldDedup("dedup",
+                                       llvm::cl::desc("Deduplicate arcs"),
+                                       llvm::cl::init(true),
+                                       llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> shouldDetectEnables(
+static llvm::cl::opt<bool> shouldDetectEnables(
     "detect-enables",
-    cl::desc("Infer enable conditions for states to avoid computation"),
-    cl::init(true), cl::cat(mainCategory));
+    llvm::cl::desc("Infer enable conditions for states to avoid computation"),
+    llvm::cl::init(true), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> shouldDetectResets(
+static llvm::cl::opt<bool> shouldDetectResets(
     "detect-resets",
-    cl::desc("Infer reset conditions for states to avoid computation"),
-    cl::init(false), cl::cat(mainCategory));
+    llvm::cl::desc("Infer reset conditions for states to avoid computation"),
+    llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool>
+static llvm::cl::opt<bool>
     shouldMakeLUTs("lookup-tables",
-                   cl::desc("Optimize arcs into lookup tables"), cl::init(true),
-                   cl::cat(mainCategory));
+                   llvm::cl::desc("Optimize arcs into lookup tables"),
+                   llvm::cl::init(true), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool> printDebugInfo("print-debug-info",
-                                    cl::desc("Print debug information"),
-                                    cl::init(false), cl::cat(mainCategory));
+static llvm::cl::opt<bool>
+    printDebugInfo("print-debug-info",
+                   llvm::cl::desc("Print debug information"),
+                   llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool>
-    verifyPasses("verify-each",
-                 cl::desc("Run the verifier after each transformation pass"),
-                 cl::init(true), cl::cat(mainCategory));
+static llvm::cl::opt<bool> verifyPasses(
+    "verify-each",
+    llvm::cl::desc("Run the verifier after each transformation pass"),
+    llvm::cl::init(true), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool>
-    verifyDiagnostics("verify-diagnostics",
-                      cl::desc("Check that emitted diagnostics match "
-                               "expected-* lines on the corresponding line"),
-                      cl::init(false), cl::Hidden, cl::cat(mainCategory));
+static llvm::cl::opt<bool> verifyDiagnostics(
+    "verify-diagnostics",
+    llvm::cl::desc("Check that emitted diagnostics match "
+                   "expected-* lines on the corresponding line"),
+    llvm::cl::init(false), llvm::cl::Hidden, llvm::cl::cat(mainCategory));
 
-static cl::opt<bool>
-    verbosePassExecutions("verbose-pass-executions",
-                          cl::desc("Log executions of toplevel module passes"),
-                          cl::init(false), cl::cat(mainCategory));
+static llvm::cl::opt<bool> verbosePassExecutions(
+    "verbose-pass-executions",
+    llvm::cl::desc("Log executions of toplevel module passes"),
+    llvm::cl::init(false), llvm::cl::cat(mainCategory));
 
-static cl::opt<bool>
-    splitInputFile("split-input-file",
-                   cl::desc("Split the input file into pieces and process each "
-                            "chunk independently"),
-                   cl::init(false), cl::Hidden, cl::cat(mainCategory));
+static llvm::cl::opt<bool> splitInputFile(
+    "split-input-file",
+    llvm::cl::desc("Split the input file into pieces and process each "
+                   "chunk independently"),
+    llvm::cl::init(false), llvm::cl::Hidden, llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<unsigned> splitFuncsThreshold(
+    "split-funcs-threshold",
+    llvm::cl::desc(
+        "Split large MLIR functions that occur above the given size threshold"),
+    llvm::cl::ValueOptional, llvm::cl::cat(mainCategory));
 
 // Options to control early-out from pipeline.
 enum Until {
@@ -162,7 +196,7 @@ enum Until {
   UntilLLVMLowering,
   UntilEnd
 };
-static auto runUntilValues = cl::values(
+static auto runUntilValues = llvm::cl::values(
     clEnumValN(UntilPreprocessing, "preproc", "Input preprocessing"),
     clEnumValN(UntilArcConversion, "arc-conv", "Conversion of modules to arcs"),
     clEnumValN(UntilArcOpt, "arc-opt", "Arc optimizations"),
@@ -170,24 +204,34 @@ static auto runUntilValues = cl::values(
     clEnumValN(UntilStateAlloc, "state-alloc", "State allocation"),
     clEnumValN(UntilLLVMLowering, "llvm-lowering", "Lowering to LLVM"),
     clEnumValN(UntilEnd, "all", "Run entire pipeline (default)"));
-static cl::opt<Until>
-    runUntilBefore("until-before",
-                   cl::desc("Stop pipeline before a specified point"),
-                   runUntilValues, cl::init(UntilEnd), cl::cat(mainCategory));
-static cl::opt<Until>
-    runUntilAfter("until-after",
-                  cl::desc("Stop pipeline after a specified point"),
-                  runUntilValues, cl::init(UntilEnd), cl::cat(mainCategory));
+static llvm::cl::opt<Until> runUntilBefore(
+    "until-before", llvm::cl::desc("Stop pipeline before a specified point"),
+    runUntilValues, llvm::cl::init(UntilEnd), llvm::cl::cat(mainCategory));
+static llvm::cl::opt<Until> runUntilAfter(
+    "until-after", llvm::cl::desc("Stop pipeline after a specified point"),
+    runUntilValues, llvm::cl::init(UntilEnd), llvm::cl::cat(mainCategory));
 
 // Options to control the output format.
-enum OutputFormat { OutputMLIR, OutputLLVM, OutputDisabled };
-static cl::opt<OutputFormat> outputFormat(
-    cl::desc("Specify output format"),
-    cl::values(clEnumValN(OutputMLIR, "emit-mlir", "Emit MLIR dialects"),
-               clEnumValN(OutputLLVM, "emit-llvm", "Emit LLVM"),
-               clEnumValN(OutputDisabled, "disable-output",
-                          "Do not output anything")),
-    cl::init(OutputLLVM), cl::cat(mainCategory));
+enum OutputFormat { OutputMLIR, OutputLLVM, OutputRunJIT, OutputDisabled };
+static llvm::cl::opt<OutputFormat> outputFormat(
+    llvm::cl::desc("Specify output format"),
+    llvm::cl::values(clEnumValN(OutputMLIR, "emit-mlir", "Emit MLIR dialects"),
+                     clEnumValN(OutputLLVM, "emit-llvm", "Emit LLVM"),
+                     clEnumValN(OutputRunJIT, "run",
+                                "Run the simulation and emit its output"),
+                     clEnumValN(OutputDisabled, "disable-output",
+                                "Do not output anything")),
+    llvm::cl::init(OutputLLVM), llvm::cl::cat(mainCategory));
+
+static llvm::cl::opt<std::string>
+    jitEntryPoint("jit-entry",
+                  llvm::cl::desc("Name of the function containing the "
+                                 "simulation to run when output is set to run"),
+                  llvm::cl::init("entry"), llvm::cl::cat(mainCategory));
+
+static llvm::cl::list<std::string> sharedLibs{
+    "shared-libs", llvm::cl::desc("Libraries to link dynamically"),
+    llvm::cl::MiscFlags::CommaSeparated, llvm::cl::cat(mainCategory)};
 
 //===----------------------------------------------------------------------===//
 // Main Tool Logic
@@ -210,7 +254,10 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // represented as intrinsic ops.
   if (untilReached(UntilPreprocessing))
     return;
+  pm.addPass(om::createStripOMPass());
+  pm.addPass(emit::createStripEmitPass());
   pm.addPass(createLowerFirMemPass());
+  pm.addPass(createLowerVerifSimulationsPass());
   {
     arc::AddTapsOptions opts;
     opts.tapPorts = observePorts;
@@ -225,6 +272,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
     opts.tapMemories = observeMemories;
     pm.addPass(arc::createInferMemoriesPass(opts));
   }
+  pm.addPass(sim::createLowerDPIFunc());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
 
@@ -238,7 +286,7 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   }
   if (shouldDedup)
     pm.addPass(arc::createDedupPass());
-  pm.addPass(arc::createInlineModulesPass());
+  pm.addPass(hw::createFlattenModulesPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
 
@@ -278,8 +326,6 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   if (untilReached(UntilStateLowering))
     return;
   pm.addPass(arc::createLowerStatePass());
-  pm.addPass(createCSEPass());
-  pm.addPass(arc::createArcCanonicalizerPass());
 
   // TODO: LowerClocksToFuncsPass might not properly consider scf.if operations
   // (or nested regions in general) and thus errors out when muxes are also
@@ -287,15 +333,10 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   // TODO: InlineArcs seems to not properly handle scf.if operations, thus the
   // following is commented out
   // pm.addPass(arc::createMuxToControlFlowPass());
-
-  if (shouldInline) {
+  if (shouldInline)
     pm.addPass(arc::createInlineArcsPass());
-    pm.addPass(arc::createArcCanonicalizerPass());
-    pm.addPass(createCSEPass());
-  }
 
-  pm.addPass(arc::createGroupResetsAndEnablesPass());
-  pm.addPass(arc::createLegalizeStateUpdatePass());
+  pm.addPass(arc::createMergeIfsPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
 
@@ -306,6 +347,9 @@ static void populateHwModuleToArcPipeline(PassManager &pm) {
   pm.nest<arc::ModelOp>().addPass(arc::createAllocateStatePass());
   pm.addPass(arc::createLowerClocksToFuncsPass()); // no CSE between state alloc
                                                    // and clock func lowering
+  if (splitFuncsThreshold.getNumOccurrences()) {
+    pm.addPass(arc::createSplitFuncs({splitFuncsThreshold}));
+  }
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
 }
@@ -316,7 +360,6 @@ static void populateArcToLLVMPipeline(PassManager &pm) {
   // Lower the arcs and update functions to LLVM.
   if (untilReached(UntilLLVMLowering))
     return;
-  pm.addPass(createConvertCombToArithPass());
   pm.addPass(createLowerArcToLLVMPass());
   pm.addPass(createCSEPass());
   pm.addPass(arc::createArcCanonicalizerPass());
@@ -367,6 +410,10 @@ static LogicalResult processBuffer(
   pmLlvm.enableTiming(ts);
   if (failed(applyPassManagerCLOptions(pmLlvm)))
     return failure();
+  if (verbosePassExecutions)
+    pmLlvm.addInstrumentation(
+        std::make_unique<VerbosePassInstrumentation<mlir::ModuleOp>>(
+            "arcilator"));
   populateArcToLLVMPipeline(pmLlvm);
 
   if (printDebugInfo && outputFormat == OutputLLVM)
@@ -374,6 +421,78 @@ static LogicalResult processBuffer(
 
   if (failed(pmLlvm.run(module.get())))
     return failure();
+
+#ifdef ARCILATOR_ENABLE_JIT
+  // Handle JIT execution.
+  if (outputFormat == OutputRunJIT) {
+    Operation *toCall = module->lookupSymbol(jitEntryPoint);
+    if (!toCall) {
+      llvm::errs() << "entry point not found: '" << jitEntryPoint << "'\n";
+      return failure();
+    }
+
+    auto toCallFunc = llvm::dyn_cast<LLVM::LLVMFuncOp>(toCall);
+    if (!toCallFunc) {
+      llvm::errs() << "entry point '" << jitEntryPoint
+                   << "' was found but on an operation of type '"
+                   << toCall->getName()
+                   << "' while an LLVM function was expected\n";
+      return failure();
+    }
+
+    if (toCallFunc.getNumArguments() != 0) {
+      llvm::errs() << "entry point '" << jitEntryPoint
+                   << "' must have no arguments\n";
+      return failure();
+    }
+
+    auto envInitResult = arc_jit_runtime_env_init();
+    if (envInitResult != 0) {
+      llvm::errs() << "Initialization of arcilator runtime library failed ("
+                   << envInitResult << ").\n";
+      return failure();
+    }
+
+    auto envDeinit =
+        llvm::make_scope_exit([] { arc_jit_runtime_env_deinit(); });
+
+    SmallVector<StringRef, 4> sharedLibraries(sharedLibs.begin(),
+                                              sharedLibs.end());
+
+    mlir::ExecutionEngineOptions engineOptions;
+    engineOptions.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;
+    engineOptions.transformer = mlir::makeOptimizingTransformer(
+        /*optLevel=*/3, /*sizeLevel=*/0,
+        /*targetMachine=*/nullptr);
+    engineOptions.sharedLibPaths = sharedLibraries;
+
+    auto executionEngine =
+        mlir::ExecutionEngine::create(module.get(), engineOptions);
+    if (!executionEngine) {
+      llvm::handleAllErrors(
+          executionEngine.takeError(), [](const llvm::ErrorInfoBase &info) {
+            llvm::errs() << "failed to create execution engine: "
+                         << info.message() << "\n";
+          });
+      return failure();
+    }
+
+    auto expectedFunc = (*executionEngine)->lookupPacked(jitEntryPoint);
+    if (!expectedFunc) {
+      llvm::handleAllErrors(
+          expectedFunc.takeError(), [](const llvm::ErrorInfoBase &info) {
+            llvm::errs() << "failed to run simulation: " << info.message()
+                         << "\n";
+          });
+      return failure();
+    }
+
+    void (*simulationFunc)(void **) = *expectedFunc;
+    (*simulationFunc)(nullptr);
+
+    return success();
+  }
+#endif // ARCILATOR_ENABLE_JIT
 
   // Handle MLIR output.
   if (runUntilBefore != UntilEnd || runUntilAfter != UntilEnd ||
@@ -433,7 +552,7 @@ processInput(MLIRContext &context, TimingScope &ts,
 
   return splitAndProcessBuffer(
       std::move(input),
-      [&](std::unique_ptr<MemoryBuffer> buffer, raw_ostream &) {
+      [&](std::unique_ptr<llvm::MemoryBuffer> buffer, raw_ostream &) {
         return processInputSplit(context, ts, std::move(buffer), outputFile);
       },
       llvm::outs());
@@ -468,21 +587,28 @@ static LogicalResult executeArcilator(MLIRContext &context) {
   registry.insert<
     arc::ArcDialect,
     comb::CombDialect,
+    emit::EmitDialect,
     hw::HWDialect,
-    mlir::LLVM::LLVMDialect,
+    llhd::LLHDDialect,
     mlir::arith::ArithDialect,
     mlir::cf::ControlFlowDialect,
+    mlir::DLTIDialect,
     mlir::func::FuncDialect,
+    mlir::index::IndexDialect,
+    mlir::LLVM::LLVMDialect,
     mlir::scf::SCFDialect,
     om::OMDialect,
     seq::SeqDialect,
-    sv::SVDialect
+    sim::SimDialect,
+    sv::SVDialect,
+    verif::VerifDialect
   >();
   // clang-format on
 
   arc::initAllExternalInterfaces(registry);
 
   mlir::func::registerInlinerExtension(registry);
+  mlir::LLVM::registerInlinerInterface(registry);
 
   mlir::registerBuiltinDialectTranslation(registry);
   mlir::registerLLVMDialectTranslation(registry);
@@ -504,11 +630,11 @@ static LogicalResult executeArcilator(MLIRContext &context) {
 /// can `exit(0)` at the end of the program to avoid teardown of the MLIRContext
 /// and modules inside of it (reducing compile time).
 int main(int argc, char **argv) {
-  InitLLVM y(argc, argv);
+  llvm::InitLLVM y(argc, argv);
 
   // Hide default LLVM options, other than for this tool.
   // MLIR options are added below.
-  cl::HideUnrelatedOptions(mainCategory);
+  llvm::cl::HideUnrelatedOptions(mainCategory);
 
   // Register passes before parsing command-line options, so that they are
   // available for use with options like `--mlir-print-ir-before`.
@@ -528,11 +654,26 @@ int main(int argc, char **argv) {
   registerPassManagerCLOptions();
   registerDefaultTimingManagerCLOptions();
   registerAsmPrinterCLOptions();
-  cl::AddExtraVersionPrinter(
+  llvm::cl::AddExtraVersionPrinter(
       [](raw_ostream &os) { os << getCirctVersion() << '\n'; });
 
   // Parse pass names in main to ensure static initialization completed.
-  cl::ParseCommandLineOptions(argc, argv, "MLIR-based circuit simulator\n");
+  llvm::cl::ParseCommandLineOptions(argc, argv,
+                                    "MLIR-based circuit simulator\n");
+
+  if (outputFormat == OutputRunJIT) {
+#ifdef ARCILATOR_ENABLE_JIT
+    llvm::InitializeNativeTarget();
+    llvm::InitializeNativeTargetAsmPrinter();
+#else
+    llvm::errs() << "This arcilator binary was not built with JIT support.\n";
+    llvm::errs() << "To enable JIT features, build arcilator with MLIR's "
+                    "execution engine.\n";
+    llvm::errs() << "This can be achieved by building arcilator with the "
+                    "host's LLVM target enabled.\n";
+    exit(1);
+#endif // ARCILATOR_ENABLE_JIT
+  }
 
   MLIRContext context;
   auto result = executeArcilator(context);

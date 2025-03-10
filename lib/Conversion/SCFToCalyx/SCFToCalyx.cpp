@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/SCFToCalyx.h"
-#include "../PassDetail.h"
 #include "circt/Dialect/Calyx/CalyxHelpers.h"
 #include "circt/Dialect/Calyx/CalyxLoweringUtils.h"
 #include "circt/Dialect/Calyx/CalyxOps.h"
@@ -26,21 +25,36 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/AsmState.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/Pass/Pass.h"
 #include "mlir/Support/LogicalResult.h"
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "llvm/ADT/TypeSwitch.h"
+#include "llvm/Support/LogicalResult.h"
+#include "llvm/Support/raw_os_ostream.h"
+#include "llvm/Support/raw_ostream.h"
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
 
+#include <locale>
+#include <numeric>
 #include <variant>
+
+namespace circt {
+#define GEN_PASS_DEF_SCFTOCALYX
+#include "circt/Conversion/Passes.h.inc"
+} // namespace circt
 
 using namespace llvm;
 using namespace mlir;
 using namespace mlir::arith;
 using namespace mlir::cf;
 using namespace mlir::func;
-
 namespace circt {
 class ComponentLoweringStateInterface;
 namespace scftocalyx {
+
+static constexpr std::string_view unrolledParallelAttr = "calyx.unroll";
 
 //===----------------------------------------------------------------------===//
 // Utility types
@@ -91,6 +105,10 @@ public:
 // Lowering state classes
 //===----------------------------------------------------------------------===//
 
+struct IfScheduleable {
+  scf::IfOp ifOp;
+};
+
 struct WhileScheduleable {
   /// While operation to schedule.
   ScfWhileOp whileOp;
@@ -110,9 +128,69 @@ struct CallScheduleable {
   func::CallOp callOp;
 };
 
+struct ParScheduleable {
+  /// Parallel operation to schedule.
+  scf::ParallelOp parOp;
+};
+
 /// A variant of types representing scheduleable operations.
-using Scheduleable = std::variant<calyx::GroupOp, WhileScheduleable,
-                                  ForScheduleable, CallScheduleable>;
+using Scheduleable =
+    std::variant<calyx::GroupOp, WhileScheduleable, ForScheduleable,
+                 IfScheduleable, CallScheduleable, ParScheduleable>;
+
+class IfLoweringStateInterface {
+public:
+  void setThenGroup(scf::IfOp op, calyx::GroupOp group) {
+    Operation *operation = op.getOperation();
+    assert(thenGroup.count(operation) == 0 &&
+           "A then group was already set for this scf::IfOp!\n");
+    thenGroup[operation] = group;
+  }
+
+  calyx::GroupOp getThenGroup(scf::IfOp op) {
+    auto it = thenGroup.find(op.getOperation());
+    assert(it != thenGroup.end() &&
+           "No then group was set for this scf::IfOp!\n");
+    return it->second;
+  }
+
+  void setElseGroup(scf::IfOp op, calyx::GroupOp group) {
+    Operation *operation = op.getOperation();
+    assert(elseGroup.count(operation) == 0 &&
+           "An else group was already set for this scf::IfOp!\n");
+    elseGroup[operation] = group;
+  }
+
+  calyx::GroupOp getElseGroup(scf::IfOp op) {
+    auto it = elseGroup.find(op.getOperation());
+    assert(it != elseGroup.end() &&
+           "No else group was set for this scf::IfOp!\n");
+    return it->second;
+  }
+
+  void setResultRegs(scf::IfOp op, calyx::RegisterOp reg, unsigned idx) {
+    assert(resultRegs[op.getOperation()].count(idx) == 0 &&
+           "A register was already registered for the given yield result.\n");
+    assert(idx < op->getNumOperands());
+    resultRegs[op.getOperation()][idx] = reg;
+  }
+
+  const DenseMap<unsigned, calyx::RegisterOp> &getResultRegs(scf::IfOp op) {
+    return resultRegs[op.getOperation()];
+  }
+
+  calyx::RegisterOp getResultRegs(scf::IfOp op, unsigned idx) {
+    auto regs = getResultRegs(op);
+    auto it = regs.find(idx);
+    assert(it != regs.end() && "resultReg not found");
+    return it->second;
+  }
+
+private:
+  DenseMap<Operation *, calyx::GroupOp> thenGroup;
+  DenseMap<Operation *, calyx::GroupOp> elseGroup;
+  DenseMap<Operation *, DenseMap<unsigned, calyx::RegisterOp>> resultRegs;
+};
 
 class WhileLoopLoweringStateInterface
     : calyx::LoopLoweringStateInterface<ScfWhileOp> {
@@ -183,6 +261,7 @@ public:
 class ComponentLoweringState : public calyx::ComponentLoweringStateInterface,
                                public WhileLoopLoweringStateInterface,
                                public ForLoopLoweringStateInterface,
+                               public IfLoweringStateInterface,
                                public calyx::SchedulerInterface<Scheduleable> {
 public:
   ComponentLoweringState(calyx::ComponentOp component)
@@ -196,6 +275,14 @@ public:
 /// Iterate through the operations of a source function and instantiate
 /// components or primitives based on the type of the operations.
 class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
+public:
+  BuildOpGroups(MLIRContext *context, LogicalResult &resRef,
+                calyx::PatternApplicationState &patternState,
+                DenseMap<mlir::func::FuncOp, calyx::ComponentOp> &map,
+                calyx::CalyxLoweringState &state,
+                mlir::Pass::Option<std::string> &writeJsonOpt)
+      : FuncOpPartialLoweringPattern(context, resRef, patternState, map, state),
+        writeJson(writeJsonOpt) {}
   using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
 
   LogicalResult
@@ -207,17 +294,22 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
     funcOp.walk([&](Operation *_op) {
       opBuiltSuccessfully &=
           TypeSwitch<mlir::Operation *, bool>(_op)
-              .template Case<arith::ConstantOp, ReturnOp, BranchOpInterface,
-                             /// SCF
-                             scf::YieldOp, scf::WhileOp, scf::ForOp,
-                             /// memref
-                             memref::AllocOp, memref::AllocaOp, memref::LoadOp,
-                             memref::StoreOp,
-                             /// standard arithmetic
-                             AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp,
-                             AndIOp, XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp,
-                             MulIOp, DivUIOp, DivSIOp, RemUIOp, RemSIOp,
-                             SelectOp, IndexCastOp, CallOp>(
+              .template Case<
+                  arith::ConstantOp, ReturnOp, BranchOpInterface,
+                  /// SCF
+                  scf::YieldOp, scf::WhileOp, scf::ForOp, scf::IfOp,
+                  scf::ParallelOp, scf::ReduceOp, scf::ExecuteRegionOp,
+                  /// memref
+                  memref::AllocOp, memref::AllocaOp, memref::LoadOp,
+                  memref::StoreOp, memref::GetGlobalOp,
+                  /// standard arithmetic
+                  AddIOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp, ShRSIOp, AndIOp,
+                  XOrIOp, OrIOp, ExtUIOp, ExtSIOp, TruncIOp, MulIOp, DivUIOp,
+                  DivSIOp, RemUIOp, RemSIOp,
+                  /// floating point
+                  AddFOp, SubFOp, MulFOp, CmpFOp, FPToSIOp, SIToFPOp, DivFOp,
+                  /// others
+                  SelectOp, IndexCastOp, BitcastOp, CallOp>(
                   [&](auto op) { return buildOp(rewriter, op).succeeded(); })
               .template Case<FuncOp, scf::ConditionOp>([&](auto) {
                 /// Skip: these special cases will be handled separately.
@@ -232,10 +324,32 @@ class BuildOpGroups : public calyx::FuncOpPartialLoweringPattern {
                                  : WalkResult::interrupt();
     });
 
+    if (!writeJson.empty()) {
+      if (auto fileLoc = dyn_cast<mlir::FileLineColLoc>(funcOp->getLoc())) {
+        std::string filename = fileLoc.getFilename().str();
+        std::filesystem::path path(filename);
+        std::string jsonFileName = writeJson.getValue() + ".json";
+        auto outFileName = path.parent_path().append(jsonFileName);
+        std::ofstream outFile(outFileName);
+
+        if (!outFile.is_open()) {
+          llvm::errs() << "Unable to open file: " << outFileName.string()
+                       << " for writing\n";
+          return failure();
+        }
+        llvm::raw_os_ostream llvmOut(outFile);
+        llvm::json::OStream jsonOS(llvmOut, /*IndentSize=*/2);
+        jsonOS.value(getState<ComponentLoweringState>().getExtMemData());
+        jsonOS.flush();
+        outFile.close();
+      }
+    }
+
     return success(opBuiltSuccessfully);
   }
 
 private:
+  mlir::Pass::Option<std::string> &writeJson;
   /// Op builder specializations.
   LogicalResult buildOp(PatternRewriter &rewriter, scf::YieldOp yieldOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter,
@@ -250,6 +364,13 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, DivSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, RemUIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, RemSIOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, AddFOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, SubFOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, MulFOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, CmpFOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, FPToSIOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, SIToFPOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, DivFOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ShRUIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ShRSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ShLIOp op) const;
@@ -262,12 +383,22 @@ private:
   LogicalResult buildOp(PatternRewriter &rewriter, ExtSIOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, ReturnOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, IndexCastOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, BitcastOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::AllocaOp op) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        memref::GetGlobalOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::LoadOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, memref::StoreOp op) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::WhileOp whileOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, scf::ForOp forOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter, scf::IfOp ifOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ReduceOp reduceOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ParallelOp parallelOp) const;
+  LogicalResult buildOp(PatternRewriter &rewriter,
+                        scf::ExecuteRegionOp executeRegionOp) const;
   LogicalResult buildOp(PatternRewriter &rewriter, CallOp callOp) const;
 
   /// buildLibraryOp will build a TCalyxLibOp inside a TGroupOp based on the
@@ -276,8 +407,10 @@ private:
   LogicalResult buildLibraryOp(PatternRewriter &rewriter, TSrcOp op,
                                TypeRange srcTypes, TypeRange dstTypes) const {
     SmallVector<Type> types;
-    llvm::append_range(types, srcTypes);
-    llvm::append_range(types, dstTypes);
+    for (Type srcType : srcTypes)
+      types.push_back(calyx::toBitVector(srcType));
+    for (Type dstType : dstTypes)
+      types.push_back(calyx::toBitVector(dstType));
 
     auto calyxOp =
         getState<ComponentLoweringState>().getNewLibraryOpInstance<TCalyxLibOp>(
@@ -341,8 +474,6 @@ private:
     StringRef opName = TSrcOp::getOperationName().split(".").second;
     Location loc = op.getLoc();
     Type width = op.getResult().getType();
-    // Pass the result from the Operation to the Calyx primitive.
-    op.getResult().replaceAllUsesWith(out);
     auto reg = createRegister(
         op.getLoc(), rewriter, getComponent(), width.getIntOrFloatBitWidth(),
         getState<ComponentLoweringState>().getUniqueName(opName));
@@ -369,12 +500,77 @@ private:
     // The group is done when the register write is complete.
     rewriter.create<calyx::GroupDoneOp>(loc, reg.getDone());
 
+    // Pass the result from the source operation to register holding the resullt
+    // from the Calyx primitive.
+    op.getResult().replaceAllUsesWith(reg.getOut());
+
+    if (isa<calyx::AddFOpIEEE754>(opPipe)) {
+      auto opFOp = cast<calyx::AddFOpIEEE754>(opPipe);
+      hw::ConstantOp subOp;
+      if (isa<arith::AddFOp>(op)) {
+        subOp = createConstant(loc, rewriter, getComponent(), /*width=*/1,
+                               /*subtract=*/0);
+      } else {
+        subOp = createConstant(loc, rewriter, getComponent(), /*width=*/1,
+                               /*subtract=*/1);
+      }
+      rewriter.create<calyx::AssignOp>(loc, opFOp.getSubOp(), subOp);
+    } else if (auto opFOp =
+                   dyn_cast<calyx::DivSqrtOpIEEE754>(opPipe.getOperation())) {
+      bool isSqrt = !isa<arith::DivFOp>(op);
+      hw::ConstantOp sqrtOp =
+          createConstant(loc, rewriter, getComponent(), /*width=*/1, isSqrt);
+      rewriter.create<calyx::AssignOp>(loc, opFOp.getSqrtOp(), sqrtOp);
+    }
+
     // Register the values for the pipeline.
     getState<ComponentLoweringState>().registerEvaluatingGroup(out, group);
     getState<ComponentLoweringState>().registerEvaluatingGroup(opPipe.getLeft(),
                                                                group);
     getState<ComponentLoweringState>().registerEvaluatingGroup(
         opPipe.getRight(), group);
+
+    return success();
+  }
+
+  template <typename TCalyxLibOp, typename TSrcOp>
+  LogicalResult buildFpIntTypeCastOp(PatternRewriter &rewriter, TSrcOp op,
+                                     unsigned inputWidth, unsigned outputWidth,
+                                     StringRef signedPort) const {
+    Location loc = op.getLoc();
+    IntegerType one = rewriter.getI1Type(),
+                inWidth = rewriter.getIntegerType(inputWidth),
+                outWidth = rewriter.getIntegerType(outputWidth);
+    auto calyxOp =
+        getState<ComponentLoweringState>().getNewLibraryOpInstance<TCalyxLibOp>(
+            rewriter, loc, {one, one, one, inWidth, one, outWidth, one});
+    hw::ConstantOp c1 = createConstant(loc, rewriter, getComponent(), 1, 1);
+    StringRef opName = op.getOperationName().split(".").second;
+    rewriter.setInsertionPointToStart(getComponent().getBodyBlock());
+    auto reg = createRegister(
+        loc, rewriter, getComponent(), outWidth.getIntOrFloatBitWidth(),
+        getState<ComponentLoweringState>().getUniqueName(opName));
+
+    auto group = createGroupForOp<calyx::GroupOp>(rewriter, op);
+    OpBuilder builder(group->getRegion(0));
+    getState<ComponentLoweringState>().addBlockScheduleable(op->getBlock(),
+                                                            group);
+
+    rewriter.setInsertionPointToEnd(group.getBodyBlock());
+    rewriter.create<calyx::AssignOp>(loc, calyxOp.getIn(), op.getIn());
+    if (isa<calyx::FpToIntOpIEEE754>(calyxOp)) {
+      rewriter.create<calyx::AssignOp>(
+          loc, cast<calyx::FpToIntOpIEEE754>(calyxOp).getSignedOut(), c1);
+    } else if (isa<calyx::IntToFpOpIEEE754>(calyxOp)) {
+      rewriter.create<calyx::AssignOp>(
+          loc, cast<calyx::IntToFpOpIEEE754>(calyxOp).getSignedIn(), c1);
+    }
+    op.getResult().replaceAllUsesWith(reg.getOut());
+
+    rewriter.create<calyx::AssignOp>(
+        loc, calyxOp.getGo(), c1,
+        comb::createOrFoldNot(loc, calyxOp.getDone(), builder));
+    rewriter.create<calyx::GroupDoneOp>(loc, reg.getDone());
 
     return success();
   }
@@ -406,6 +602,33 @@ private:
                                          address.value());
     }
   }
+
+  calyx::RegisterOp createSignalRegister(PatternRewriter &rewriter,
+                                         Value signal, bool invert,
+                                         StringRef nameSuffix,
+                                         calyx::CompareFOpIEEE754 calyxCmpFOp,
+                                         calyx::GroupOp group) const {
+    Location loc = calyxCmpFOp.getLoc();
+    IntegerType one = rewriter.getI1Type();
+    auto component = getComponent();
+    OpBuilder builder(group->getRegion(0));
+    auto reg = createRegister(
+        loc, rewriter, component, 1,
+        getState<ComponentLoweringState>().getUniqueName(nameSuffix));
+    rewriter.create<calyx::AssignOp>(loc, reg.getWriteEn(),
+                                     calyxCmpFOp.getDone());
+    if (invert) {
+      auto notLibOp = getState<ComponentLoweringState>()
+                          .getNewLibraryOpInstance<calyx::NotLibOp>(
+                              rewriter, loc, {one, one});
+      rewriter.create<calyx::AssignOp>(loc, notLibOp.getIn(), signal);
+      rewriter.create<calyx::AssignOp>(loc, reg.getIn(), notLibOp.getOut());
+      getState<ComponentLoweringState>().registerEvaluatingGroup(
+          notLibOp.getOut(), group);
+    } else
+      rewriter.create<calyx::AssignOp>(loc, reg.getIn(), signal);
+    return reg;
+  };
 };
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
@@ -428,7 +651,7 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
         calyx::createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 1);
     rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.readEn(),
                                      oneI1);
-    regWriteEn = memoryInterface.readDone();
+    regWriteEn = memoryInterface.done();
     if (calyx::noStoresToMemory(memref) &&
         calyx::singleLoadFromMemory(memref)) {
       // Single load from memory; we do not need to write the output to a
@@ -436,7 +659,36 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       // again
       needReg = false;
       rewriter.create<calyx::GroupDoneOp>(loadOp.getLoc(),
-                                          memoryInterface.readDone());
+                                          memoryInterface.done());
+      // We refrain from replacing the loadOp result with
+      // memoryInterface.readData, since multiple loadOp's need to be converted
+      // to a single memory's ReadData. If this replacement is done now, we lose
+      // the link between which SSA memref::LoadOp values map to which groups
+      // for loading a value from the Calyx memory. At this point of lowering,
+      // we keep the memref::LoadOp SSA value, and do value replacement _after_
+      // control has been generated (see LateSSAReplacement). This is *vital*
+      // for things such as calyx::InlineCombGroups to be able to properly track
+      // which memory assignment groups belong to which accesses.
+      res = loadOp.getResult();
+    }
+  } else if (memoryInterface.contentEnOpt().has_value()) {
+    auto oneI1 =
+        calyx::createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 1);
+    auto zeroI1 =
+        calyx::createConstant(loadOp.getLoc(), rewriter, getComponent(), 1, 0);
+    rewriter.create<calyx::AssignOp>(loadOp.getLoc(),
+                                     memoryInterface.contentEn(), oneI1);
+    rewriter.create<calyx::AssignOp>(loadOp.getLoc(), memoryInterface.writeEn(),
+                                     zeroI1);
+    regWriteEn = memoryInterface.done();
+    if (calyx::noStoresToMemory(memref) &&
+        calyx::singleLoadFromMemory(memref)) {
+      // Single load from memory; we do not need to write the output to a
+      // register. The readData value will be held until contentEn is asserted
+      // again
+      needReg = false;
+      rewriter.create<calyx::GroupDoneOp>(loadOp.getLoc(),
+                                          memoryInterface.done());
       // We refrain from replacing the loadOp result with
       // memoryInterface.readData, since multiple loadOp's need to be converted
       // to a single memory's ReadData. If this replacement is done now, we lose
@@ -496,8 +748,13 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   rewriter.create<calyx::AssignOp>(
       storeOp.getLoc(), memoryInterface.writeEn(),
       createConstant(storeOp.getLoc(), rewriter, getComponent(), 1, 1));
-  rewriter.create<calyx::GroupDoneOp>(storeOp.getLoc(),
-                                      memoryInterface.writeDone());
+  if (memoryInterface.contentEnOpt().has_value()) {
+    // If memory has content enable, it must be asserted when writing
+    rewriter.create<calyx::AssignOp>(
+        storeOp.getLoc(), memoryInterface.contentEn(),
+        createConstant(storeOp.getLoc(), rewriter, getComponent(), 1, 1));
+  }
+  rewriter.create<calyx::GroupDoneOp>(storeOp.getLoc(), memoryInterface.done());
 
   return success();
 }
@@ -567,6 +824,263 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
       /*out=*/remPipe.getOut());
 }
 
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     AddFOp addf) const {
+  Location loc = addf.getLoc();
+  IntegerType one = rewriter.getI1Type(), three = rewriter.getIntegerType(3),
+              five = rewriter.getIntegerType(5),
+              width = rewriter.getIntegerType(
+                  addf.getType().getIntOrFloatBitWidth());
+  auto addFOp =
+      getState<ComponentLoweringState>()
+          .getNewLibraryOpInstance<calyx::AddFOpIEEE754>(
+              rewriter, loc,
+              {one, one, one, one, one, width, width, three, width, five, one});
+  return buildLibraryBinaryPipeOp<calyx::AddFOpIEEE754>(rewriter, addf, addFOp,
+                                                        addFOp.getOut());
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     SubFOp subf) const {
+  Location loc = subf.getLoc();
+  IntegerType one = rewriter.getI1Type(), three = rewriter.getIntegerType(3),
+              five = rewriter.getIntegerType(5),
+              width = rewriter.getIntegerType(
+                  subf.getType().getIntOrFloatBitWidth());
+  auto subFOp =
+      getState<ComponentLoweringState>()
+          .getNewLibraryOpInstance<calyx::AddFOpIEEE754>(
+              rewriter, loc,
+              {one, one, one, one, one, width, width, three, width, five, one});
+  return buildLibraryBinaryPipeOp<calyx::AddFOpIEEE754>(rewriter, subf, subFOp,
+                                                        subFOp.getOut());
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     MulFOp mulf) const {
+  Location loc = mulf.getLoc();
+  IntegerType one = rewriter.getI1Type(), three = rewriter.getIntegerType(3),
+              five = rewriter.getIntegerType(5),
+              width = rewriter.getIntegerType(
+                  mulf.getType().getIntOrFloatBitWidth());
+  auto mulFOp =
+      getState<ComponentLoweringState>()
+          .getNewLibraryOpInstance<calyx::MulFOpIEEE754>(
+              rewriter, loc,
+              {one, one, one, one, width, width, three, width, five, one});
+  return buildLibraryBinaryPipeOp<calyx::MulFOpIEEE754>(rewriter, mulf, mulFOp,
+                                                        mulFOp.getOut());
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     CmpFOp cmpf) const {
+  Location loc = cmpf.getLoc();
+  IntegerType one = rewriter.getI1Type(), five = rewriter.getIntegerType(5),
+              width = rewriter.getIntegerType(
+                  cmpf.getLhs().getType().getIntOrFloatBitWidth());
+  auto calyxCmpFOp = getState<ComponentLoweringState>()
+                         .getNewLibraryOpInstance<calyx::CompareFOpIEEE754>(
+                             rewriter, loc,
+                             {one, one, one, width, width, one, one, one, one,
+                              one, five, one});
+  hw::ConstantOp c0 = createConstant(loc, rewriter, getComponent(), 1, 0);
+  hw::ConstantOp c1 = createConstant(loc, rewriter, getComponent(), 1, 1);
+  rewriter.setInsertionPointToStart(getComponent().getBodyBlock());
+
+  using calyx::PredicateInfo;
+  using CombLogic = PredicateInfo::CombLogic;
+  using Port = PredicateInfo::InputPorts::Port;
+  PredicateInfo info = calyx::getPredicateInfo(cmpf.getPredicate());
+  if (info.logic == CombLogic::None) {
+    if (cmpf.getPredicate() == CmpFPredicate::AlwaysTrue) {
+      cmpf.getResult().replaceAllUsesWith(c1);
+      return success();
+    }
+
+    if (cmpf.getPredicate() == CmpFPredicate::AlwaysFalse) {
+      cmpf.getResult().replaceAllUsesWith(c0);
+      return success();
+    }
+  }
+
+  // General case
+  StringRef opName = cmpf.getOperationName().split(".").second;
+  auto reg =
+      createRegister(loc, rewriter, getComponent(), 1,
+                     getState<ComponentLoweringState>().getUniqueName(opName));
+
+  // Operation pipelines are not combinational, so a GroupOp is required.
+  auto group = createGroupForOp<calyx::GroupOp>(rewriter, cmpf);
+  OpBuilder builder(group->getRegion(0));
+  getState<ComponentLoweringState>().addBlockScheduleable(cmpf->getBlock(),
+                                                          group);
+
+  rewriter.setInsertionPointToEnd(group.getBodyBlock());
+  rewriter.create<calyx::AssignOp>(loc, calyxCmpFOp.getLeft(), cmpf.getLhs());
+  rewriter.create<calyx::AssignOp>(loc, calyxCmpFOp.getRight(), cmpf.getRhs());
+
+  bool signalingFlag = false;
+  switch (cmpf.getPredicate()) {
+  case CmpFPredicate::UGT:
+  case CmpFPredicate::UGE:
+  case CmpFPredicate::ULT:
+  case CmpFPredicate::ULE:
+  case CmpFPredicate::OGT:
+  case CmpFPredicate::OGE:
+  case CmpFPredicate::OLT:
+  case CmpFPredicate::OLE:
+    signalingFlag = true;
+    break;
+  case CmpFPredicate::UEQ:
+  case CmpFPredicate::UNE:
+  case CmpFPredicate::OEQ:
+  case CmpFPredicate::ONE:
+  case CmpFPredicate::UNO:
+  case CmpFPredicate::ORD:
+  case CmpFPredicate::AlwaysTrue:
+  case CmpFPredicate::AlwaysFalse:
+    signalingFlag = false;
+    break;
+  }
+
+  // The IEEE Standard mandates that equality comparisons ordinarily are quiet,
+  // while inequality comparisons ordinarily are signaling.
+  rewriter.create<calyx::AssignOp>(loc, calyxCmpFOp.getSignaling(),
+                                   signalingFlag ? c1 : c0);
+
+  // Prepare signals and create registers
+  SmallVector<calyx::RegisterOp> inputRegs;
+  for (const auto &input : info.inputPorts) {
+    Value signal;
+    switch (input.port) {
+    case Port::Eq: {
+      signal = calyxCmpFOp.getEq();
+      break;
+    }
+    case Port::Gt: {
+      signal = calyxCmpFOp.getGt();
+      break;
+    }
+    case Port::Lt: {
+      signal = calyxCmpFOp.getLt();
+      break;
+    }
+    case Port::Unordered: {
+      signal = calyxCmpFOp.getUnordered();
+      break;
+    }
+    }
+    std::string nameSuffix =
+        (input.port == PredicateInfo::InputPorts::Port::Unordered)
+            ? "unordered_port"
+            : "compare_port";
+    auto signalReg = createSignalRegister(rewriter, signal, input.invert,
+                                          nameSuffix, calyxCmpFOp, group);
+    inputRegs.push_back(signalReg);
+  }
+
+  // Create the output logical operation
+  Value outputValue, doneValue;
+  switch (info.logic) {
+  case CombLogic::None: {
+    // it's guaranteed to be either ORD or UNO
+    outputValue = inputRegs[0].getOut();
+    doneValue = inputRegs[0].getDone();
+    break;
+  }
+  case CombLogic::And: {
+    auto outputLibOp = getState<ComponentLoweringState>()
+                           .getNewLibraryOpInstance<calyx::AndLibOp>(
+                               rewriter, loc, {one, one, one});
+    rewriter.create<calyx::AssignOp>(loc, outputLibOp.getLeft(),
+                                     inputRegs[0].getOut());
+    rewriter.create<calyx::AssignOp>(loc, outputLibOp.getRight(),
+                                     inputRegs[1].getOut());
+
+    outputValue = outputLibOp.getOut();
+    break;
+  }
+  case CombLogic::Or: {
+    auto outputLibOp = getState<ComponentLoweringState>()
+                           .getNewLibraryOpInstance<calyx::OrLibOp>(
+                               rewriter, loc, {one, one, one});
+    rewriter.create<calyx::AssignOp>(loc, outputLibOp.getLeft(),
+                                     inputRegs[0].getOut());
+    rewriter.create<calyx::AssignOp>(loc, outputLibOp.getRight(),
+                                     inputRegs[1].getOut());
+
+    outputValue = outputLibOp.getOut();
+    break;
+  }
+  }
+
+  if (info.logic != CombLogic::None) {
+    auto doneLibOp = getState<ComponentLoweringState>()
+                         .getNewLibraryOpInstance<calyx::AndLibOp>(
+                             rewriter, loc, {one, one, one});
+    rewriter.create<calyx::AssignOp>(loc, doneLibOp.getLeft(),
+                                     inputRegs[0].getDone());
+    rewriter.create<calyx::AssignOp>(loc, doneLibOp.getRight(),
+                                     inputRegs[1].getDone());
+    doneValue = doneLibOp.getOut();
+  }
+
+  // Write to the output register
+  rewriter.create<calyx::AssignOp>(loc, reg.getIn(), outputValue);
+  rewriter.create<calyx::AssignOp>(loc, reg.getWriteEn(), doneValue);
+
+  // Set the go and done signal
+  rewriter.create<calyx::AssignOp>(
+      loc, calyxCmpFOp.getGo(), c1,
+      comb::createOrFoldNot(loc, calyxCmpFOp.getDone(), builder));
+  rewriter.create<calyx::GroupDoneOp>(loc, reg.getDone());
+
+  cmpf.getResult().replaceAllUsesWith(reg.getOut());
+
+  // Register evaluating groups
+  getState<ComponentLoweringState>().registerEvaluatingGroup(outputValue,
+                                                             group);
+  getState<ComponentLoweringState>().registerEvaluatingGroup(doneValue, group);
+  getState<ComponentLoweringState>().registerEvaluatingGroup(
+      calyxCmpFOp.getLeft(), group);
+  getState<ComponentLoweringState>().registerEvaluatingGroup(
+      calyxCmpFOp.getRight(), group);
+
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     FPToSIOp fptosi) const {
+  return buildFpIntTypeCastOp<calyx::FpToIntOpIEEE754>(
+      rewriter, fptosi, fptosi.getIn().getType().getIntOrFloatBitWidth(),
+      fptosi.getOut().getType().getIntOrFloatBitWidth(), "signedOut");
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     SIToFPOp sitofp) const {
+  return buildFpIntTypeCastOp<calyx::IntToFpOpIEEE754>(
+      rewriter, sitofp, sitofp.getIn().getType().getIntOrFloatBitWidth(),
+      sitofp.getOut().getType().getIntOrFloatBitWidth(), "signedIn");
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     DivFOp divf) const {
+  Location loc = divf.getLoc();
+  IntegerType one = rewriter.getI1Type(), three = rewriter.getIntegerType(3),
+              five = rewriter.getIntegerType(5),
+              width = rewriter.getIntegerType(
+                  divf.getType().getIntOrFloatBitWidth());
+  auto divFOp = getState<ComponentLoweringState>()
+                    .getNewLibraryOpInstance<calyx::DivSqrtOpIEEE754>(
+                        rewriter, loc,
+                        {/*clk=*/one, /*reset=*/one, /*go=*/one,
+                         /*control=*/one, /*sqrtOp=*/one, /*left=*/width,
+                         /*right=*/width, /*roundingMode=*/three, /*out=*/width,
+                         /*exceptionalFlags=*/five, /*done=*/one});
+  return buildLibraryBinaryPipeOp<calyx::DivSqrtOpIEEE754>(
+      rewriter, divf, divFOp, divFOp.getOut());
+}
+
 template <typename TAllocOp>
 static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
                                   PatternRewriter &rewriter, TAllocOp allocOp) {
@@ -588,12 +1102,90 @@ static LogicalResult buildAllocOp(ComponentLoweringState &componentState,
   auto memoryOp = rewriter.create<calyx::SeqMemoryOp>(
       allocOp.getLoc(), componentState.getUniqueName("mem"),
       memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
-  // Externalize memories by default. This makes it easier for the native
-  // compiler to provide initialized memories.
+
+  // Externalize memories conditionally (only in the top-level component because
+  // Calyx compiler requires it as a well-formness check).
   memoryOp->setAttr("external",
                     IntegerAttr::get(rewriter.getI1Type(), llvm::APInt(1, 1)));
   componentState.registerMemoryInterface(allocOp.getResult(),
                                          calyx::MemoryInterface(memoryOp));
+
+  unsigned elmTyBitWidth = memtype.getElementTypeBitWidth();
+  assert(elmTyBitWidth <= 64 && "element bitwidth should not exceed 64");
+  bool isFloat = !memtype.getElementType().isInteger();
+
+  auto shape = allocOp.getType().getShape();
+  int totalSize =
+      std::reduce(shape.begin(), shape.end(), 1, std::multiplies<int>());
+  // The `totalSize <= 1` check is a hack to:
+  // https://github.com/llvm/circt/pull/2661, where a multi-dimensional memory
+  // whose size in some dimension equals 1, e.g. memref<1x1x1x1xi32>, will be
+  // collapsed to `memref<1xi32>` with `totalSize == 1`. While the above case is
+  // a trivial fix, Calyx expects 1-dimensional memories in general:
+  // https://github.com/calyxir/calyx/issues/907
+  if (!(shape.size() <= 1 || totalSize <= 1)) {
+    allocOp.emitError("input memory dimension must be empty or one.");
+    return failure();
+  }
+
+  std::vector<uint64_t> flattenedVals(totalSize, 0);
+  if (isa<memref::GetGlobalOp>(allocOp)) {
+    auto getGlobalOp = cast<memref::GetGlobalOp>(allocOp);
+    auto *symbolTableOp =
+        getGlobalOp->template getParentWithTrait<mlir::OpTrait::SymbolTable>();
+    auto globalOp = dyn_cast_or_null<memref::GlobalOp>(
+        SymbolTable::lookupSymbolIn(symbolTableOp, getGlobalOp.getNameAttr()));
+    // Flatten the values in the attribute
+    auto cstAttr = llvm::dyn_cast_or_null<DenseElementsAttr>(
+        globalOp.getConstantInitValue());
+    int sizeCount = 0;
+    for (auto attr : cstAttr.template getValues<Attribute>()) {
+      assert((isa<mlir::FloatAttr, mlir::IntegerAttr>(attr)) &&
+             "memory attributes must be float or int");
+      if (auto fltAttr = dyn_cast<mlir::FloatAttr>(attr)) {
+        flattenedVals[sizeCount++] =
+            bit_cast<uint64_t>(fltAttr.getValueAsDouble());
+      } else {
+        auto intAttr = dyn_cast<mlir::IntegerAttr>(attr);
+        APInt value = intAttr.getValue();
+        flattenedVals[sizeCount++] = *value.getRawData();
+      }
+    }
+
+    rewriter.eraseOp(globalOp);
+  }
+
+  llvm::json::Array result;
+  result.reserve(std::max(static_cast<int>(shape.size()), 1));
+
+  Type elemType = memtype.getElementType();
+  bool isSigned =
+      !elemType.isSignlessInteger() && !elemType.isUnsignedInteger();
+  for (uint64_t bitValue : flattenedVals) {
+    llvm::json::Value value = 0;
+    if (isFloat) {
+      // We cast to `double` and let downstream calyx to deal with the actual
+      // value's precision handling.
+      value = bit_cast<double>(bitValue);
+    } else {
+      APInt apInt(/*numBits=*/elmTyBitWidth, bitValue, isSigned,
+                  /*implicitTrunc=*/true);
+      // The conditional ternary operation will cause the `value` to interpret
+      // the underlying data as unsigned regardless `isSigned` or not.
+      if (isSigned)
+        value = static_cast<int64_t>(apInt.getSExtValue());
+      else
+        value = apInt.getZExtValue();
+    }
+    result.push_back(std::move(value));
+  }
+
+  componentState.setDataField(memoryOp.getName(), result);
+  std::string numType =
+      memtype.getElementType().isInteger() ? "bitnum" : "ieee754_float";
+  componentState.setFormat(memoryOp.getName(), numType, isSigned,
+                           elmTyBitWidth);
+
   return success();
 }
 
@@ -608,72 +1200,86 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     memref::GetGlobalOp getGlobalOp) const {
+  return buildAllocOp(getState<ComponentLoweringState>(), rewriter,
+                      getGlobalOp);
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      scf::YieldOp yieldOp) const {
   if (yieldOp.getOperands().empty()) {
-    // If yield operands are empty, we assume we have a for loop.
-    auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp());
-    assert(forOp && "Empty yieldOps should only be located within ForOps");
-    ScfForOp forOpInterface(forOp);
+    if (auto forOp = dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
+      ScfForOp forOpInterface(forOp);
 
-    // Get the ForLoop's Induction Register.
-    auto inductionReg =
-        getState<ComponentLoweringState>().getForLoopIterReg(forOpInterface, 0);
+      // Get the ForLoop's Induction Register.
+      auto inductionReg = getState<ComponentLoweringState>().getForLoopIterReg(
+          forOpInterface, 0);
 
-    Type regWidth = inductionReg.getOut().getType();
-    // Adder should have same width as the inductionReg.
-    SmallVector<Type> types(3, regWidth);
-    auto addOp = getState<ComponentLoweringState>()
-                     .getNewLibraryOpInstance<calyx::AddLibOp>(
-                         rewriter, forOp.getLoc(), types);
+      Type regWidth = inductionReg.getOut().getType();
+      // Adder should have same width as the inductionReg.
+      SmallVector<Type> types(3, regWidth);
+      auto addOp = getState<ComponentLoweringState>()
+                       .getNewLibraryOpInstance<calyx::AddLibOp>(
+                           rewriter, forOp.getLoc(), types);
 
-    auto directions = addOp.portDirections();
-    // For an add operation, we expect two input ports and one output port
-    SmallVector<Value, 2> opInputPorts;
-    Value opOutputPort;
-    for (auto dir : enumerate(directions)) {
-      switch (dir.value()) {
-      case calyx::Direction::Input: {
-        opInputPorts.push_back(addOp.getResult(dir.index()));
-        break;
+      auto directions = addOp.portDirections();
+      // For an add operation, we expect two input ports and one output port.
+      SmallVector<Value, 2> opInputPorts;
+      Value opOutputPort;
+      for (auto dir : enumerate(directions)) {
+        switch (dir.value()) {
+        case calyx::Direction::Input: {
+          opInputPorts.push_back(addOp.getResult(dir.index()));
+          break;
+        }
+        case calyx::Direction::Output: {
+          opOutputPort = addOp.getResult(dir.index());
+          break;
+        }
+        }
       }
-      case calyx::Direction::Output: {
-        opOutputPort = addOp.getResult(dir.index());
-        break;
-      }
-      }
+
+      // "Latch Group" increments inductionReg by forLoop's step value.
+      calyx::ComponentOp componentOp =
+          getState<ComponentLoweringState>().getComponentOp();
+      SmallVector<StringRef, 4> groupIdentifier = {
+          "incr", getState<ComponentLoweringState>().getUniqueName(forOp),
+          "induction", "var"};
+      auto groupOp = calyx::createGroup<calyx::GroupOp>(
+          rewriter, componentOp, forOp.getLoc(),
+          llvm::join(groupIdentifier, "_"));
+      rewriter.setInsertionPointToEnd(groupOp.getBodyBlock());
+
+      // Assign inductionReg.out to the left port of the adder.
+      Value leftOp = opInputPorts.front();
+      rewriter.create<calyx::AssignOp>(forOp.getLoc(), leftOp,
+                                       inductionReg.getOut());
+      // Assign forOp.getConstantStep to the right port of the adder.
+      Value rightOp = opInputPorts.back();
+      rewriter.create<calyx::AssignOp>(
+          forOp.getLoc(), rightOp,
+          createConstant(forOp->getLoc(), rewriter, componentOp,
+                         regWidth.getIntOrFloatBitWidth(),
+                         forOp.getConstantStep().value().getSExtValue()));
+      // Assign adder's output port to inductionReg.
+      buildAssignmentsForRegisterWrite(rewriter, groupOp, componentOp,
+                                       inductionReg, opOutputPort);
+      // Set group as For Loop's "latch" group.
+      getState<ComponentLoweringState>().setForLoopLatchGroup(forOpInterface,
+                                                              groupOp);
+      getState<ComponentLoweringState>().registerEvaluatingGroup(opOutputPort,
+                                                                 groupOp);
+      return success();
     }
-
-    // "Latch Group" increments inductionReg by forLoop's step value.
-    calyx::ComponentOp componentOp =
-        getState<ComponentLoweringState>().getComponentOp();
-    SmallVector<StringRef, 4> groupIdentifier = {
-        "incr", getState<ComponentLoweringState>().getUniqueName(forOp),
-        "induction", "var"};
-    auto groupOp = calyx::createGroup<calyx::GroupOp>(
-        rewriter, componentOp, forOp.getLoc(),
-        llvm::join(groupIdentifier, "_"));
-    rewriter.setInsertionPointToEnd(groupOp.getBodyBlock());
-
-    // Assign inductionReg.out to the left port of the adder.
-    Value leftOp = opInputPorts.front();
-    rewriter.create<calyx::AssignOp>(forOp.getLoc(), leftOp,
-                                     inductionReg.getOut());
-    // Assign forOp.getConstantStep to the right port of the adder.
-    Value rightOp = opInputPorts.back();
-    rewriter.create<calyx::AssignOp>(
-        forOp.getLoc(), rightOp,
-        createConstant(forOp->getLoc(), rewriter, componentOp,
-                       regWidth.getIntOrFloatBitWidth(),
-                       forOp.getConstantStep().value().getSExtValue()));
-    // Assign adder's output port to inductionReg.
-    buildAssignmentsForRegisterWrite(rewriter, groupOp, componentOp,
-                                     inductionReg, opOutputPort);
-    // Set group as For Loop's "latch" group.
-    getState<ComponentLoweringState>().setForLoopLatchGroup(forOpInterface,
-                                                            groupOp);
-    getState<ComponentLoweringState>().registerEvaluatingGroup(opOutputPort,
-                                                               groupOp);
-    return success();
+    if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp()))
+      // Empty yield inside ifOp, essentially a no-op.
+      return success();
+    if (auto executeRegionOp =
+            dyn_cast<scf::ExecuteRegionOp>(yieldOp->getParentOp()))
+      // Empty yield inside an `ExecuteRegionOp` acts as the terminator op.
+      return success();
+    return yieldOp.getOperation()->emitError()
+           << "Unsupported empty yieldOp outside ForOp or IfOp.";
   }
   // If yieldOp for a for loop is not empty, then we do not transform for loop.
   if (dyn_cast<scf::ForOp>(yieldOp->getParentOp())) {
@@ -682,22 +1288,53 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
               "loops. Run --scf-for-to-while before running --scf-to-calyx.";
   }
 
-  auto whileOp = dyn_cast<scf::WhileOp>(yieldOp->getParentOp());
-  if (!whileOp) {
-    return yieldOp.getOperation()->emitError()
-           << "Currently only support yield operations inside for and while "
-              "loops.";
-  }
-  ScfWhileOp whileOpInterface(whileOp);
+  if (auto whileOp = dyn_cast<scf::WhileOp>(yieldOp->getParentOp())) {
+    ScfWhileOp whileOpInterface(whileOp);
 
-  auto assignGroup =
-      getState<ComponentLoweringState>().buildWhileLoopIterArgAssignments(
-          rewriter, whileOpInterface,
-          getState<ComponentLoweringState>().getComponentOp(),
-          getState<ComponentLoweringState>().getUniqueName(whileOp) + "_latch",
-          yieldOp->getOpOperands());
-  getState<ComponentLoweringState>().setWhileLoopLatchGroup(whileOpInterface,
-                                                            assignGroup);
+    auto assignGroup =
+        getState<ComponentLoweringState>().buildWhileLoopIterArgAssignments(
+            rewriter, whileOpInterface,
+            getState<ComponentLoweringState>().getComponentOp(),
+            getState<ComponentLoweringState>().getUniqueName(whileOp) +
+                "_latch",
+            yieldOp->getOpOperands());
+    getState<ComponentLoweringState>().setWhileLoopLatchGroup(whileOpInterface,
+                                                              assignGroup);
+    return success();
+  }
+
+  if (auto ifOp = dyn_cast<scf::IfOp>(yieldOp->getParentOp())) {
+    auto resultRegs = getState<ComponentLoweringState>().getResultRegs(ifOp);
+
+    if (yieldOp->getParentRegion() == &ifOp.getThenRegion()) {
+      auto thenGroup = getState<ComponentLoweringState>().getThenGroup(ifOp);
+      for (auto op : enumerate(yieldOp.getOperands())) {
+        auto resultReg =
+            getState<ComponentLoweringState>().getResultRegs(ifOp, op.index());
+        buildAssignmentsForRegisterWrite(
+            rewriter, thenGroup,
+            getState<ComponentLoweringState>().getComponentOp(), resultReg,
+            op.value());
+        getState<ComponentLoweringState>().registerEvaluatingGroup(
+            ifOp.getResult(op.index()), thenGroup);
+      }
+    }
+
+    if (!ifOp.getElseRegion().empty() &&
+        (yieldOp->getParentRegion() == &ifOp.getElseRegion())) {
+      auto elseGroup = getState<ComponentLoweringState>().getElseGroup(ifOp);
+      for (auto op : enumerate(yieldOp.getOperands())) {
+        auto resultReg =
+            getState<ComponentLoweringState>().getResultRegs(ifOp, op.index());
+        buildAssignmentsForRegisterWrite(
+            rewriter, elseGroup,
+            getState<ComponentLoweringState>().getComponentOp(), resultReg,
+            op.value());
+        getState<ComponentLoweringState>().registerEvaluatingGroup(
+            ifOp.getResult(op.index()), elseGroup);
+      }
+    }
+  }
   return success();
 }
 
@@ -761,12 +1398,26 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      arith::ConstantOp constOp) const {
-  /// Move constant operations to the compOp body as hw::ConstantOp's.
-  APInt value;
-  calyx::matchConstantOp(constOp, value);
-  auto hwConstOp = rewriter.replaceOpWithNewOp<hw::ConstantOp>(constOp, value);
-  hwConstOp->moveAfter(getComponent().getBodyBlock(),
-                       getComponent().getBodyBlock()->begin());
+  if (isa<IntegerType>(constOp.getType())) {
+    /// Move constant operations to the compOp body as hw::ConstantOp's.
+    APInt value;
+    calyx::matchConstantOp(constOp, value);
+    auto hwConstOp =
+        rewriter.replaceOpWithNewOp<hw::ConstantOp>(constOp, value);
+    hwConstOp->moveAfter(getComponent().getBodyBlock(),
+                         getComponent().getBodyBlock()->begin());
+  } else {
+    std::string name = getState<ComponentLoweringState>().getUniqueName("cst");
+    auto floatAttr = cast<FloatAttr>(constOp.getValueAttr());
+    auto intType =
+        rewriter.getIntegerType(floatAttr.getType().getIntOrFloatBitWidth());
+    auto calyxConstOp = rewriter.create<calyx::ConstantOp>(
+        constOp.getLoc(), name, floatAttr, intType);
+    calyxConstOp->moveAfter(getComponent().getBodyBlock(),
+                            getComponent().getBodyBlock()->begin());
+    rewriter.replaceAllUsesWith(constOp, calyxConstOp.getOut());
+  }
+
   return success();
 }
 
@@ -852,8 +1503,8 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                      IndexCastOp op) const {
-  Type sourceType = calyx::convIndexType(rewriter, op.getOperand().getType());
-  Type targetType = calyx::convIndexType(rewriter, op.getResult().getType());
+  Type sourceType = calyx::normalizeType(rewriter, op.getOperand().getType());
+  Type targetType = calyx::normalizeType(rewriter, op.getResult().getType());
   unsigned targetBits = targetType.getIntOrFloatBitWidth();
   unsigned sourceBits = sourceType.getIntOrFloatBitWidth();
   LogicalResult res = success();
@@ -873,6 +1524,14 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
   }
   rewriter.eraseOp(op);
   return res;
+}
+
+// The Calyx language treats values as bit vectors, i.e., there is no type
+// system, so this is essentially a no-op.
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     BitcastOp op) const {
+  rewriter.replaceAllUsesWith(op.getOut(), op.getIn());
+  return success();
 }
 
 LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
@@ -904,6 +1563,42 @@ LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
                                             scfForOp,
                                             bound.value(),
                                         });
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::IfOp ifOp) const {
+  getState<ComponentLoweringState>().addBlockScheduleable(
+      ifOp.getOperation()->getBlock(), IfScheduleable{ifOp});
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ReduceOp reduceOp) const {
+  // we don't handle reduce operation and simply return success for now since
+  // BuildParGroups would have already emitted an error and exited early
+  // if a reduce operation was encountered.
+  return success();
+}
+
+LogicalResult BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                                     scf::ParallelOp parOp) const {
+  if (!parOp->hasAttr(unrolledParallelAttr)) {
+    parOp.emitError(
+        "AffineParallelUnroll must be run in order to lower scf.parallel");
+    return failure();
+  }
+  getState<ComponentLoweringState>().addBlockScheduleable(
+      parOp.getOperation()->getBlock(), ParScheduleable{parOp});
+  return success();
+}
+
+LogicalResult
+BuildOpGroups::buildOp(PatternRewriter &rewriter,
+                       scf::ExecuteRegionOp executeRegionOp) const {
+  // Simply return success because the only remaining `scf.execute_region` op
+  // are generated by the `BuildParGroups` pass - the rest of them are inlined
+  // by the `InlineExecuteRegionOpPattern`.
   return success();
 }
 
@@ -943,6 +1638,14 @@ class InlineExecuteRegionOpPattern
 
   LogicalResult matchAndRewrite(scf::ExecuteRegionOp execOp,
                                 PatternRewriter &rewriter) const override {
+    if (auto parOp = dyn_cast_or_null<scf::ParallelOp>(execOp->getParentOp())) {
+      if (auto boolAttr = dyn_cast_or_null<mlir::BoolAttr>(
+              parOp->getAttr(unrolledParallelAttr)))
+        // If the `ExecuteRegionOp` was inserted when running the
+        // `AffineParallelUnrollPass` (indicated by having `calyx.unroll`
+        // attribute), we should skip inline.
+        return success();
+    }
     /// Determine type of "yield" operations inside the ERO.
     TypeRange yieldTypes = execOp.getResultTypes();
 
@@ -1008,17 +1711,8 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     /// which port index each function argument will eventually map to.
     SmallVector<calyx::PortInfo> inPorts, outPorts;
     FunctionType funcType = funcOp.getFunctionType();
-    unsigned extMemCounter = 0;
     for (auto arg : enumerate(funcOp.getArguments())) {
-      if (arg.value().getType().isa<MemRefType>()) {
-        /// External memories
-        auto memName =
-            "ext_mem" + std::to_string(extMemoryCompPortIndices.size());
-        extMemoryCompPortIndices[arg.value()] = {inPorts.size(),
-                                                 outPorts.size()};
-        calyx::appendPortsForExternalMemref(rewriter, memName, arg.value(),
-                                            extMemCounter++, inPorts, outPorts);
-      } else {
+      if (!isa<MemRefType>(arg.value().getType())) {
         /// Single-port arguments
         std::string inName;
         if (auto portNameAttr = funcOp.getArgAttrOfType<StringAttr>(
@@ -1029,7 +1723,7 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
         funcOpArgRewrites[arg.value()] = inPorts.size();
         inPorts.push_back(calyx::PortInfo{
             rewriter.getStringAttr(inName),
-            calyx::convIndexType(rewriter, arg.value().getType()),
+            calyx::normalizeType(rewriter, arg.value().getType()),
             calyx::Direction::Input,
             DictionaryAttr::get(rewriter.getContext(), {})});
       }
@@ -1042,9 +1736,10 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
       else
         resName = "out" + std::to_string(res.index());
       funcOpResultMapping[res.index()] = outPorts.size();
+
       outPorts.push_back(calyx::PortInfo{
           rewriter.getStringAttr(resName),
-          calyx::convIndexType(rewriter, res.value()), calyx::Direction::Output,
+          calyx::normalizeType(rewriter, res.value()), calyx::Direction::Output,
           DictionaryAttr::get(rewriter.getContext(), {})});
     }
 
@@ -1061,44 +1756,48 @@ struct FuncOpConversion : public calyx::FuncOpPartialLoweringPattern {
     std::string funcName = "func_" + funcOp.getSymName().str();
     rewriter.modifyOpInPlace(funcOp, [&]() { funcOp.setSymName(funcName); });
 
-    /// Mark this component as the toplevel.
-    compOp->setAttr("toplevel", rewriter.getUnitAttr());
+    /// Mark this component as the toplevel if it's the top-level function of
+    /// the module.
+    if (compOp.getName() == loweringState().getTopLevelFunction())
+      compOp->setAttr("toplevel", rewriter.getUnitAttr());
 
     /// Store the function-to-component mapping.
     functionMapping[funcOp] = compOp;
     auto *compState = loweringState().getState<ComponentLoweringState>(compOp);
     compState->setFuncOpResultMapping(funcOpResultMapping);
 
+    unsigned extMemCounter = 0;
+    for (auto arg : enumerate(funcOp.getArguments())) {
+      if (isa<MemRefType>(arg.value().getType())) {
+        std::string memName =
+            llvm::join_items("_", "arg_mem", std::to_string(extMemCounter++));
+
+        rewriter.setInsertionPointToStart(compOp.getBodyBlock());
+        MemRefType memtype = cast<MemRefType>(arg.value().getType());
+        SmallVector<int64_t> addrSizes;
+        SmallVector<int64_t> sizes;
+        for (int64_t dim : memtype.getShape()) {
+          sizes.push_back(dim);
+          addrSizes.push_back(calyx::handleZeroWidth(dim));
+        }
+        if (sizes.empty() && addrSizes.empty()) {
+          sizes.push_back(1);
+          addrSizes.push_back(1);
+        }
+        auto memOp = rewriter.create<calyx::SeqMemoryOp>(
+            funcOp.getLoc(), memName,
+            memtype.getElementType().getIntOrFloatBitWidth(), sizes, addrSizes);
+        // we don't set the memory to "external", which implies it's a reference
+
+        compState->registerMemoryInterface(arg.value(),
+                                           calyx::MemoryInterface(memOp));
+      }
+    }
+
     /// Rewrite funcOp SSA argument values to the CompOp arguments.
     for (auto &mapping : funcOpArgRewrites)
       mapping.getFirst().replaceAllUsesWith(
           compOp.getArgument(mapping.getSecond()));
-
-    /// Register external memories
-    for (auto extMemPortIndices : extMemoryCompPortIndices) {
-      /// Create a mapping for the in- and output ports using the Calyx memory
-      /// port structure.
-      calyx::MemoryPortsImpl extMemPorts;
-      unsigned inPortsIt = extMemPortIndices.getSecond().first;
-      unsigned outPortsIt = extMemPortIndices.getSecond().second +
-                            compOp.getInputPortInfo().size();
-      extMemPorts.readData = compOp.getArgument(inPortsIt++);
-      extMemPorts.writeDone = compOp.getArgument(inPortsIt);
-      extMemPorts.writeData = compOp.getArgument(outPortsIt++);
-      unsigned nAddresses = extMemPortIndices.getFirst()
-                                .getType()
-                                .cast<MemRefType>()
-                                .getShape()
-                                .size();
-      for (unsigned j = 0; j < nAddresses; ++j)
-        extMemPorts.addrPorts.push_back(compOp.getArgument(outPortsIt++));
-      extMemPorts.writeEn = compOp.getArgument(outPortsIt);
-
-      /// Register the external memory ports as a memory interface within the
-      /// component.
-      compState->registerMemoryInterface(extMemPortIndices.getFirst(),
-                                         calyx::MemoryInterface(extMemPorts));
-    }
 
     return success();
   }
@@ -1254,6 +1953,57 @@ class BuildForGroups : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
+class BuildIfGroups : public calyx::FuncOpPartialLoweringPattern {
+  using FuncOpPartialLoweringPattern::FuncOpPartialLoweringPattern;
+
+  LogicalResult
+  partiallyLowerFuncToComp(FuncOp funcOp,
+                           PatternRewriter &rewriter) const override {
+    LogicalResult res = success();
+    funcOp.walk([&](Operation *op) {
+      if (!isa<scf::IfOp>(op))
+        return WalkResult::advance();
+
+      auto scfIfOp = cast<scf::IfOp>(op);
+
+      // There is no need to build `thenGroup` and `elseGroup` if `scfIfOp`
+      // doesn't yield any result since these groups are created for managing
+      // the result values.
+      if (scfIfOp.getResults().empty())
+        return WalkResult::advance();
+
+      calyx::ComponentOp componentOp =
+          getState<ComponentLoweringState>().getComponentOp();
+
+      std::string thenGroupName =
+          getState<ComponentLoweringState>().getUniqueName("then_br");
+      auto thenGroupOp = calyx::createGroup<calyx::GroupOp>(
+          rewriter, componentOp, scfIfOp.getLoc(), thenGroupName);
+      getState<ComponentLoweringState>().setThenGroup(scfIfOp, thenGroupOp);
+
+      if (!scfIfOp.getElseRegion().empty()) {
+        std::string elseGroupName =
+            getState<ComponentLoweringState>().getUniqueName("else_br");
+        auto elseGroupOp = calyx::createGroup<calyx::GroupOp>(
+            rewriter, componentOp, scfIfOp.getLoc(), elseGroupName);
+        getState<ComponentLoweringState>().setElseGroup(scfIfOp, elseGroupOp);
+      }
+
+      for (auto ifOpRes : scfIfOp.getResults()) {
+        auto reg = createRegister(
+            scfIfOp.getLoc(), rewriter, getComponent(),
+            ifOpRes.getType().getIntOrFloatBitWidth(),
+            getState<ComponentLoweringState>().getUniqueName("if_res"));
+        getState<ComponentLoweringState>().setResultRegs(
+            scfIfOp, reg, ifOpRes.getResultNumber());
+      }
+
+      return WalkResult::advance();
+    });
+    return res;
+  }
+};
+
 /// Builds a control schedule by traversing the CFG of the function and
 /// associating this with the previously created groups.
 /// For simplicity, the generated control flow is expanded for all possible
@@ -1285,7 +2035,8 @@ private:
         getState<ComponentLoweringState>().getBlockScheduleables(block);
     auto loc = block->front().getLoc();
 
-    if (compBlockScheduleables.size() > 1) {
+    if (compBlockScheduleables.size() > 1 &&
+        !isa<scf::ParallelOp>(block->getParentOp())) {
       auto seqOp = rewriter.create<calyx::SeqOp>(loc);
       parentCtrlBlock = seqOp.getBodyBlock();
     }
@@ -1310,8 +2061,11 @@ private:
 
         /// Only schedule the 'after' block. The 'before' block is
         /// implicitly scheduled when evaluating the while condition.
-        LogicalResult res = buildCFGControl(path, rewriter, whileBodyOpBlock,
-                                            block, whileOp.getBodyBlock());
+        if (LogicalResult result =
+                buildCFGControl(path, rewriter, whileBodyOpBlock, block,
+                                whileOp.getBodyBlock());
+            result.failed())
+          return result;
 
         // Insert loop-latch at the end of the while group
         rewriter.setInsertionPointToEnd(whileBodyOpBlock);
@@ -1319,9 +2073,28 @@ private:
             getState<ComponentLoweringState>().getWhileLoopLatchGroup(whileOp);
         rewriter.create<calyx::EnableOp>(whileLatchGroup.getLoc(),
                                          whileLatchGroup.getName());
+      } else if (auto *parSchedPtr = std::get_if<ParScheduleable>(&group)) {
+        auto parOp = parSchedPtr->parOp;
+        auto calyxParOp = rewriter.create<calyx::ParOp>(parOp.getLoc());
 
-        if (res.failed())
-          return res;
+        WalkResult walkResult =
+            parOp.walk([&](scf::ExecuteRegionOp execRegion) {
+              rewriter.setInsertionPointToEnd(calyxParOp.getBodyBlock());
+              auto seqOp = rewriter.create<calyx::SeqOp>(execRegion.getLoc());
+              rewriter.setInsertionPointToEnd(seqOp.getBodyBlock());
+
+              for (auto &execBlock : execRegion.getRegion().getBlocks()) {
+                if (LogicalResult res = scheduleBasicBlock(
+                        rewriter, path, seqOp.getBodyBlock(), &execBlock);
+                    res.failed()) {
+                  return WalkResult::interrupt();
+                }
+              }
+              return WalkResult::advance();
+            });
+
+        if (walkResult.wasInterrupted())
+          return failure();
       } else if (auto *forSchedPtr = std::get_if<ForScheduleable>(&group);
                  forSchedPtr) {
         auto forOp = forSchedPtr->forOp;
@@ -1336,8 +2109,10 @@ private:
         auto *forBodyOpBlock = forBodyOp.getBodyBlock();
 
         // Schedule the body of the for loop.
-        LogicalResult res = buildCFGControl(path, rewriter, forBodyOpBlock,
-                                            block, forOp.getBodyBlock());
+        if (LogicalResult res = buildCFGControl(path, rewriter, forBodyOpBlock,
+                                                block, forOp.getBodyBlock());
+            res.failed())
+          return res;
 
         // Insert loop-latch at the end of the while group.
         rewriter.setInsertionPointToEnd(forBodyOpBlock);
@@ -1345,22 +2120,120 @@ private:
             getState<ComponentLoweringState>().getForLoopLatchGroup(forOp);
         rewriter.create<calyx::EnableOp>(forLatchGroup.getLoc(),
                                          forLatchGroup.getName());
+      } else if (auto *ifSchedPtr = std::get_if<IfScheduleable>(&group);
+                 ifSchedPtr) {
+        auto ifOp = ifSchedPtr->ifOp;
+
+        Location loc = ifOp->getLoc();
+
+        auto cond = ifOp.getCondition();
+        auto condGroup = getState<ComponentLoweringState>()
+                             .getEvaluatingGroup<calyx::CombGroupOp>(cond);
+
+        auto symbolAttr = FlatSymbolRefAttr::get(
+            StringAttr::get(getContext(), condGroup.getSymName()));
+
+        bool initElse = !ifOp.getElseRegion().empty();
+        auto ifCtrlOp = rewriter.create<calyx::IfOp>(
+            loc, cond, symbolAttr, /*initializeElseBody=*/initElse);
+
+        rewriter.setInsertionPointToEnd(ifCtrlOp.getBodyBlock());
+
+        auto thenSeqOp =
+            rewriter.create<calyx::SeqOp>(ifOp.getThenRegion().getLoc());
+        auto *thenSeqOpBlock = thenSeqOp.getBodyBlock();
+
+        auto *thenBlock = &ifOp.getThenRegion().front();
+        LogicalResult res = buildCFGControl(path, rewriter, thenSeqOpBlock,
+                                            /*preBlock=*/block, thenBlock);
         if (res.failed())
           return res;
+
+        // `thenGroup`s won't be created in the first place if there's no
+        // yielded results for this `ifOp`.
+        if (!ifOp.getResults().empty()) {
+          rewriter.setInsertionPointToEnd(thenSeqOpBlock);
+          calyx::GroupOp thenGroup =
+              getState<ComponentLoweringState>().getThenGroup(ifOp);
+          rewriter.create<calyx::EnableOp>(thenGroup.getLoc(),
+                                           thenGroup.getName());
+        }
+
+        if (!ifOp.getElseRegion().empty()) {
+          rewriter.setInsertionPointToEnd(ifCtrlOp.getElseBody());
+
+          auto elseSeqOp =
+              rewriter.create<calyx::SeqOp>(ifOp.getElseRegion().getLoc());
+          auto *elseSeqOpBlock = elseSeqOp.getBodyBlock();
+
+          auto *elseBlock = &ifOp.getElseRegion().front();
+          res = buildCFGControl(path, rewriter, elseSeqOpBlock,
+                                /*preBlock=*/block, elseBlock);
+          if (res.failed())
+            return res;
+
+          if (!ifOp.getResults().empty()) {
+            rewriter.setInsertionPointToEnd(elseSeqOpBlock);
+            calyx::GroupOp elseGroup =
+                getState<ComponentLoweringState>().getElseGroup(ifOp);
+            rewriter.create<calyx::EnableOp>(elseGroup.getLoc(),
+                                             elseGroup.getName());
+          }
+        }
       } else if (auto *callSchedPtr = std::get_if<CallScheduleable>(&group)) {
         auto instanceOp = callSchedPtr->instanceOp;
         OpBuilder::InsertionGuard g(rewriter);
         auto callBody = rewriter.create<calyx::SeqOp>(instanceOp.getLoc());
         rewriter.setInsertionPointToStart(callBody.getBodyBlock());
-        std::string initGroupName = "init_" + instanceOp.getSymName().str();
-        rewriter.create<calyx::EnableOp>(instanceOp.getLoc(), initGroupName);
+
+        auto callee = callSchedPtr->callOp.getCallee();
+        auto *calleeOp = SymbolTable::lookupNearestSymbolFrom(
+            callSchedPtr->callOp.getOperation()->getParentOp(),
+            StringAttr::get(rewriter.getContext(), "func_" + callee.str()));
+        FuncOp calleeFunc = dyn_cast_or_null<FuncOp>(calleeOp);
+
+        auto instanceOpComp =
+            llvm::cast<calyx::ComponentOp>(instanceOp.getReferencedComponent());
+        auto *instanceOpLoweringState =
+            loweringState().getState(instanceOpComp);
+
         SmallVector<Value, 4> instancePorts;
-        auto inputPorts = callSchedPtr->callOp.getOperands();
+        SmallVector<Value, 4> inputPorts;
+        SmallVector<Attribute, 4> refCells;
+        for (auto operandEnum : enumerate(callSchedPtr->callOp.getOperands())) {
+          auto operand = operandEnum.value();
+          auto index = operandEnum.index();
+          if (!isa<MemRefType>(operand.getType())) {
+            inputPorts.push_back(operand);
+            continue;
+          }
+
+          auto memOpName = getState<ComponentLoweringState>()
+                               .getMemoryInterface(operand)
+                               .memName();
+          auto memOpNameAttr =
+              SymbolRefAttr::get(rewriter.getContext(), memOpName);
+          Value argI = calleeFunc.getArgument(index);
+          if (isa<MemRefType>(argI.getType())) {
+            NamedAttrList namedAttrList;
+            namedAttrList.append(
+                rewriter.getStringAttr(
+                    instanceOpLoweringState->getMemoryInterface(argI)
+                        .memName()),
+                memOpNameAttr);
+            refCells.push_back(
+                DictionaryAttr::get(rewriter.getContext(), namedAttrList));
+          }
+        }
         llvm::copy(instanceOp.getResults().take_front(inputPorts.size()),
                    std::back_inserter(instancePorts));
+
+        ArrayAttr refCellsAttr =
+            ArrayAttr::get(rewriter.getContext(), refCells);
+
         rewriter.create<calyx::InvokeOp>(
             instanceOp.getLoc(), instanceOp.getSymName(), instancePorts,
-            inputPorts, ArrayAttr::get(rewriter.getContext(), {}),
+            inputPorts, refCellsAttr, ArrayAttr::get(rewriter.getContext(), {}),
             ArrayAttr::get(rewriter.getContext(), {}));
       } else
         llvm_unreachable("Unknown scheduleable");
@@ -1503,6 +2376,12 @@ class LateSSAReplacement : public calyx::FuncOpPartialLoweringPattern {
 
   LogicalResult partiallyLowerFuncToComp(FuncOp funcOp,
                                          PatternRewriter &) const override {
+    funcOp.walk([&](scf::IfOp op) {
+      for (auto res : getState<ComponentLoweringState>().getResultRegs(op))
+        op.getOperation()->getResults()[res.first].replaceAllUsesWith(
+            res.second.getOut());
+    });
+
     funcOp.walk([&](scf::WhileOp op) {
       /// The yielded values returned from the while op will be present in the
       /// iterargs registers post execution of the loop.
@@ -1551,10 +2430,16 @@ class CleanupFuncOps : public calyx::FuncOpPartialLoweringPattern {
   }
 };
 
+} // namespace scftocalyx
+
+namespace {
+
+using namespace circt::scftocalyx;
+
 //===----------------------------------------------------------------------===//
 // Pass driver
 //===----------------------------------------------------------------------===//
-class SCFToCalyxPass : public SCFToCalyxBase<SCFToCalyxPass> {
+class SCFToCalyxPass : public circt::impl::SCFToCalyxBase<SCFToCalyxPass> {
 public:
   SCFToCalyxPass()
       : SCFToCalyxBase<SCFToCalyxPass>(), partialPatternRes(success()) {}
@@ -1583,7 +2468,8 @@ public:
         return failure();
       }
     }
-    return success();
+
+    return createOptNewTopLevelFn(moduleOp, topLevelFunction);
   }
 
   struct LoweringPattern {
@@ -1619,8 +2505,9 @@ public:
     target.addLegalOp<AddIOp, SelectOp, SubIOp, CmpIOp, ShLIOp, ShRUIOp,
                       ShRSIOp, AndIOp, XOrIOp, OrIOp, ExtUIOp, TruncIOp,
                       CondBranchOp, BranchOp, MulIOp, DivUIOp, DivSIOp, RemUIOp,
-                      RemSIOp, ReturnOp, arith::ConstantOp, IndexCastOp, FuncOp,
-                      ExtSIOp, CallOp>();
+                      RemSIOp, ReturnOp, arith::ConstantOp, IndexCastOp,
+                      BitcastOp, FuncOp, ExtSIOp, CallOp, AddFOp, SubFOp,
+                      MulFOp, CmpFOp, FPToSIOp, SIToFPOp, DivFOp>();
 
     RewritePatternSet legalizePatterns(&getContext());
     legalizePatterns.add<DummyPattern>(&getContext());
@@ -1664,21 +2551,207 @@ public:
     // will only be established later in the conversion process, so ensure
     // that rewriter optimizations (especially DCE) are disabled.
     GreedyRewriteConfig config;
-    config.enableRegionSimplification = false;
+    config.enableRegionSimplification =
+        mlir::GreedySimplifyRegionLevel::Disabled;
     if (runOnce)
       config.maxIterations = 1;
 
-    /// Can't return applyPatternsAndFoldGreedily. Root isn't
+    /// Can't return applyPatternsGreedily. Root isn't
     /// necessarily erased so it will always return failed(). Instead,
     /// forward the 'succeeded' value from PartialLoweringPatternBase.
-    (void)applyPatternsAndFoldGreedily(getOperation(), std::move(pattern),
-                                       config);
+    (void)applyPatternsGreedily(getOperation(), std::move(pattern), config);
     return partialPatternRes;
   }
 
 private:
   LogicalResult partialPatternRes;
   std::shared_ptr<calyx::CalyxLoweringState> loweringState = nullptr;
+
+  /// Creates a new new top-level function based on `baseName`.
+  FuncOp createNewTopLevelFn(ModuleOp moduleOp, std::string &baseName) {
+    std::string newName = "main";
+
+    if (auto *existingMainOp = SymbolTable::lookupSymbolIn(moduleOp, newName)) {
+      auto existingMainFunc = dyn_cast<FuncOp>(existingMainOp);
+      if (existingMainFunc == nullptr) {
+        moduleOp.emitError() << "Symbol 'main' exists but is not a function";
+        return nullptr;
+      }
+      unsigned counter = 0;
+      std::string newOldName = baseName;
+      while (SymbolTable::lookupSymbolIn(moduleOp, newOldName))
+        newOldName = llvm::join_items("_", baseName, std::to_string(++counter));
+      existingMainFunc.setName(newOldName);
+      if (baseName == "main")
+        baseName = newOldName;
+    }
+
+    // Create the new "main" function
+    OpBuilder builder(moduleOp.getContext());
+    builder.setInsertionPointToStart(moduleOp.getBody());
+
+    FunctionType funcType = builder.getFunctionType({}, {});
+
+    if (auto newFunc =
+            builder.create<FuncOp>(moduleOp.getLoc(), newName, funcType))
+      return newFunc;
+
+    return nullptr;
+  }
+
+  /// Insert a call from the newly created top-level function/`caller` to the
+  /// old top-level function/`callee`; and create `memref.alloc`s inside the new
+  /// top-level function for arguments with `memref` types and for the
+  /// `memref.alloc`s inside `callee`.
+  void insertCallFromNewTopLevel(OpBuilder &builder, FuncOp caller,
+                                 FuncOp callee) {
+    if (caller.getBody().empty()) {
+      caller.addEntryBlock();
+    }
+
+    Block *callerEntryBlock = &caller.getBody().front();
+    builder.setInsertionPointToStart(callerEntryBlock);
+
+    // For those non-memref arguments passing to the original top-level
+    // function, we need to copy them to the new top-level function.
+    SmallVector<Type, 4> nonMemRefCalleeArgTypes;
+    for (auto arg : callee.getArguments()) {
+      if (!isa<MemRefType>(arg.getType())) {
+        nonMemRefCalleeArgTypes.push_back(arg.getType());
+      }
+    }
+
+    for (Type type : nonMemRefCalleeArgTypes) {
+      callerEntryBlock->addArgument(type, caller.getLoc());
+    }
+
+    FunctionType callerFnType = caller.getFunctionType();
+    SmallVector<Type, 4> updatedCallerArgTypes(
+        caller.getFunctionType().getInputs());
+    updatedCallerArgTypes.append(nonMemRefCalleeArgTypes.begin(),
+                                 nonMemRefCalleeArgTypes.end());
+    caller.setType(FunctionType::get(caller.getContext(), updatedCallerArgTypes,
+                                     callerFnType.getResults()));
+
+    Block *calleeFnBody = &callee.getBody().front();
+    unsigned originalCalleeArgNum = callee.getArguments().size();
+
+    SmallVector<Value, 4> extraMemRefArgs;
+    SmallVector<Type, 4> extraMemRefArgTypes;
+    SmallVector<Value, 4> extraMemRefOperands;
+    SmallVector<Operation *, 4> opsToModify;
+    for (auto &op : callee.getBody().getOps()) {
+      if (isa<memref::AllocaOp, memref::AllocOp, memref::GetGlobalOp>(op))
+        opsToModify.push_back(&op);
+    }
+
+    // Replace `alloc`/`getGlobal` in the original top-level with new
+    // corresponding operations in the new top-level.
+    builder.setInsertionPointToEnd(callerEntryBlock);
+    for (auto *op : opsToModify) {
+      // TODO (https://github.com/llvm/circt/issues/7764)
+      Value newOpRes;
+      TypeSwitch<Operation *>(op)
+          .Case<memref::AllocaOp>([&](memref::AllocaOp allocaOp) {
+            newOpRes = builder.create<memref::AllocaOp>(callee.getLoc(),
+                                                        allocaOp.getType());
+          })
+          .Case<memref::AllocOp>([&](memref::AllocOp allocOp) {
+            newOpRes = builder.create<memref::AllocOp>(callee.getLoc(),
+                                                       allocOp.getType());
+          })
+          .Case<memref::GetGlobalOp>([&](memref::GetGlobalOp getGlobalOp) {
+            newOpRes = builder.create<memref::GetGlobalOp>(
+                caller.getLoc(), getGlobalOp.getType(), getGlobalOp.getName());
+          })
+          .Default([&](Operation *defaultOp) {
+            llvm::report_fatal_error("Unsupported operation in TypeSwitch");
+          });
+      extraMemRefOperands.push_back(newOpRes);
+
+      calleeFnBody->addArgument(newOpRes.getType(), callee.getLoc());
+      BlockArgument newBodyArg = calleeFnBody->getArguments().back();
+      op->getResult(0).replaceAllUsesWith(newBodyArg);
+      op->erase();
+      extraMemRefArgs.push_back(newBodyArg);
+      extraMemRefArgTypes.push_back(newBodyArg.getType());
+    }
+
+    SmallVector<Type, 4> updatedCalleeArgTypes(
+        callee.getFunctionType().getInputs());
+    updatedCalleeArgTypes.append(extraMemRefArgTypes.begin(),
+                                 extraMemRefArgTypes.end());
+    callee.setType(FunctionType::get(callee.getContext(), updatedCalleeArgTypes,
+                                     callee.getFunctionType().getResults()));
+
+    unsigned otherArgsCount = 0;
+    SmallVector<Value, 4> calleeArgFnOperands;
+    builder.setInsertionPointToStart(callerEntryBlock);
+    for (auto arg : callee.getArguments().take_front(originalCalleeArgNum)) {
+      if (isa<MemRefType>(arg.getType())) {
+        auto memrefType = cast<MemRefType>(arg.getType());
+        auto allocOp =
+            builder.create<memref::AllocOp>(callee.getLoc(), memrefType);
+        calleeArgFnOperands.push_back(allocOp);
+      } else {
+        auto callerArg = callerEntryBlock->getArgument(otherArgsCount++);
+        calleeArgFnOperands.push_back(callerArg);
+      }
+    }
+
+    SmallVector<Value, 4> fnOperands;
+    fnOperands.append(calleeArgFnOperands.begin(), calleeArgFnOperands.end());
+    fnOperands.append(extraMemRefOperands.begin(), extraMemRefOperands.end());
+    auto calleeName =
+        SymbolRefAttr::get(builder.getContext(), callee.getSymName());
+    auto resultTypes = callee.getResultTypes();
+
+    builder.setInsertionPointToEnd(callerEntryBlock);
+    builder.create<CallOp>(caller.getLoc(), calleeName, resultTypes,
+                           fnOperands);
+    builder.create<ReturnOp>(caller.getLoc());
+  }
+
+  /// Conditionally creates an optional new top-level function; and inserts a
+  /// call from the new top-level function to the old top-level function if we
+  /// did create one
+  LogicalResult createOptNewTopLevelFn(ModuleOp moduleOp,
+                                       std::string &topLevelFunction) {
+    auto hasMemrefArguments = [](FuncOp func) {
+      return std::any_of(
+          func.getArguments().begin(), func.getArguments().end(),
+          [](BlockArgument arg) { return isa<MemRefType>(arg.getType()); });
+    };
+
+    /// We only create a new top-level function and call the original top-level
+    /// function from the new one if the original top-level has `memref` in its
+    /// argument
+    auto funcOps = moduleOp.getOps<FuncOp>();
+    bool hasMemrefArgsInTopLevel =
+        std::any_of(funcOps.begin(), funcOps.end(), [&](auto funcOp) {
+          return funcOp.getName() == topLevelFunction &&
+                 hasMemrefArguments(funcOp);
+        });
+
+    if (hasMemrefArgsInTopLevel) {
+      auto newTopLevelFunc = createNewTopLevelFn(moduleOp, topLevelFunction);
+      if (!newTopLevelFunc)
+        return failure();
+
+      OpBuilder builder(moduleOp.getContext());
+      Operation *oldTopLevelFuncOp =
+          SymbolTable::lookupSymbolIn(moduleOp, topLevelFunction);
+      if (auto oldTopLevelFunc = dyn_cast<FuncOp>(oldTopLevelFuncOp))
+        insertCallFromNewTopLevel(builder, newTopLevelFunc, oldTopLevelFunc);
+      else {
+        moduleOp.emitOpError("Original top-level function not found!");
+        return failure();
+      }
+      topLevelFunction = "main";
+    }
+
+    return success();
+  }
 };
 
 void SCFToCalyxPass::runOnOperation() {
@@ -1746,6 +2819,9 @@ void SCFToCalyxPass::runOnOperation() {
   addOncePattern<BuildForGroups>(loweringPatterns, patternState, funcMap,
                                  *loweringState);
 
+  addOncePattern<BuildIfGroups>(loweringPatterns, patternState, funcMap,
+                                *loweringState);
+
   /// This pattern converts operations within basic blocks to Calyx library
   /// operators. Combinational operations are assigned inside a
   /// calyx::CombGroupOp, and sequential inside calyx::GroupOps.
@@ -1754,7 +2830,7 @@ void SCFToCalyxPass::runOnOperation() {
   /// having a distinct group for each operation, groups are analogous to SSA
   /// values in the source program.
   addOncePattern<BuildOpGroups>(loweringPatterns, patternState, funcMap,
-                                *loweringState);
+                                *loweringState, writeJsonOpt);
 
   /// This pattern traverses the CFG of the program and generates a control
   /// schedule based on the calyx::GroupOp's which were registered for each
@@ -1798,14 +2874,14 @@ void SCFToCalyxPass::runOnOperation() {
     return;
   }
 
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   // Cleanup patterns
-  //===----------------------------------------------------------------------===//
+  //===--------------------------------------------------------------------===//
   RewritePatternSet cleanupPatterns(&getContext());
   cleanupPatterns.add<calyx::MultipleGroupDonePattern,
                       calyx::NonTerminatingGroupDonePattern>(&getContext());
-  if (failed(applyPatternsAndFoldGreedily(getOperation(),
-                                          std::move(cleanupPatterns)))) {
+  if (failed(
+          applyPatternsGreedily(getOperation(), std::move(cleanupPatterns)))) {
     signalPassFailure();
     return;
   }
@@ -1823,15 +2899,14 @@ void SCFToCalyxPass::runOnOperation() {
                             ArrayAttr::get(context, sourceLocations));
   }
 }
-
-} // namespace scftocalyx
+} // namespace
 
 //===----------------------------------------------------------------------===//
 // Pass initialization
 //===----------------------------------------------------------------------===//
 
 std::unique_ptr<OperationPass<ModuleOp>> createSCFToCalyxPass() {
-  return std::make_unique<scftocalyx::SCFToCalyxPass>();
+  return std::make_unique<SCFToCalyxPass>();
 }
 
 } // namespace circt

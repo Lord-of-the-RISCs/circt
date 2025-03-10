@@ -13,14 +13,35 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/ImportVerilog.h"
+#include "circt/Conversion/MooreToCore.h"
+#include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Debug/DebugDialect.h"
+#include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/LLHD/IR/LLHDDialect.h"
+#include "circt/Dialect/LLHD/Transforms/LLHDPasses.h"
+#include "circt/Dialect/Moore/MooreDialect.h"
+#include "circt/Dialect/Moore/MoorePasses.h"
+#include "circt/Dialect/Seq/SeqDialect.h"
+#include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Verif/VerifDialect.h"
+#include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
+#include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
+#include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/IR/AsmState.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/Parser/Parser.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Support/FileUtilities.h"
+#include "mlir/Transforms/Passes.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/ToolOutputFile.h"
+#include "llvm/Support/WithColor.h"
 
 using namespace llvm;
 using namespace mlir;
@@ -31,10 +52,30 @@ using namespace circt;
 //===----------------------------------------------------------------------===//
 
 namespace {
-enum class LoweringMode { OnlyPreprocess, OnlyLint, OnlyParse, Full };
+enum class Format {
+  SV,
+  MLIR,
+};
+
+enum class LoweringMode {
+  OnlyPreprocess,
+  OnlyLint,
+  OnlyParse,
+  OutputIRMoore,
+  OutputIRLLHD,
+  OutputIRHW,
+  Full
+};
 
 struct CLOptions {
   cl::OptionCategory cat{"Verilog Frontend Options"};
+
+  cl::opt<Format> format{
+      "format", cl::desc("Input file format (auto-detected by default)"),
+      cl::values(
+          clEnumValN(Format::SV, "sv", "Parse as SystemVerilog files"),
+          clEnumValN(Format::MLIR, "mlir", "Parse as MLIR or MLIRBC file")),
+      cl::cat(cat)};
 
   cl::list<std::string> inputFilenames{cl::Positional,
                                        cl::desc("<input files>"), cl::cat(cat)};
@@ -60,8 +101,26 @@ struct CLOptions {
                      "CIRCT IR"),
           clEnumValN(LoweringMode::OnlyParse, "parse-only",
                      "Only parse and elaborate the input, without mapping to "
-                     "CIRCT IR")),
+                     "CIRCT IR"),
+          clEnumValN(LoweringMode::OutputIRMoore, "ir-moore",
+                     "Run the entire pass manager to just before MooreToCore "
+                     "conversion, and emit the resulting Moore dialect IR"),
+          clEnumValN(
+              LoweringMode::OutputIRLLHD, "ir-llhd",
+              "Run the entire pass manager to just before the LLHD pipeline "
+              ", and emit the resulting LLHD+Core dialect IR"),
+          clEnumValN(LoweringMode::OutputIRHW, "ir-hw",
+                     "Run the MooreToCore conversion and emit the resulting "
+                     "core dialect IR")),
       cl::init(LoweringMode::Full), cl::cat(cat)};
+
+  cl::opt<bool> debugInfo{"g", cl::desc("Generate debug information"),
+                          cl::cat(cat)};
+
+  cl::opt<bool> lowerAlwaysAtStarAsComb{
+      "always-at-star-as-comb",
+      cl::desc("Interpret `always @(*)` as `always_comb`"), cl::init(true),
+      cl::cat(cat)};
 
   //===--------------------------------------------------------------------===//
   // Include paths
@@ -201,6 +260,91 @@ struct CLOptions {
 static CLOptions opts;
 
 //===----------------------------------------------------------------------===//
+// Pass Pipeline
+//===----------------------------------------------------------------------===//
+
+/// Optimize and simplify the Moore dialect IR.
+static void populateMooreTransforms(PassManager &pm) {
+  {
+    // Perform an initial cleanup and preprocessing across all
+    // modules/functions.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+
+  {
+    // Perform module-specific transformations.
+    auto &modulePM = pm.nest<moore::SVModuleOp>();
+    modulePM.addPass(moore::createLowerConcatRefPass());
+    // TODO: Enable the following once it not longer interferes with @(...)
+    // event control checks. The introduced dummy variables make the event
+    // control observe a static local variable that never changes, instead of
+    // observing a module-wide signal.
+    // modulePM.addPass(moore::createSimplifyProceduresPass());
+  }
+
+  {
+    // Perform a final cleanup across all modules/functions.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createSROA());
+    anyPM.addPass(mlir::createMem2Reg());
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+}
+
+/// Convert Moore dialect IR into core dialect IR
+static void populateMooreToCoreLowering(PassManager &pm) {
+  // Perform the conversion.
+  pm.addPass(createConvertMooreToCorePass());
+
+  {
+    // Conversion to the core dialects likely uncovers new canonicalization
+    // opportunities.
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+}
+
+/// Convert LLHD dialect IR into core dialect IR
+static void populateLLHDLowering(PassManager &pm) {
+  pm.addPass(createInlinerPass());
+  {
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createSROA());
+  }
+  pm.addNestedPass<hw::HWModuleOp>(llhd::createEarlyCodeMotion());
+  pm.addNestedPass<hw::HWModuleOp>(llhd::createTemporalCodeMotion());
+  {
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+  pm.addNestedPass<hw::HWModuleOp>(llhd::createDesequentialization());
+  pm.addPass(llhd::createProcessLowering());
+  pm.addNestedPass<hw::HWModuleOp>(llhd::createSig2Reg());
+  {
+    auto &anyPM = pm.nestAny();
+    anyPM.addPass(mlir::createCSEPass());
+    anyPM.addPass(mlir::createCanonicalizerPass());
+  }
+}
+
+/// Populate the given pass manager with transformations as configured by the
+/// command line options.
+static void populatePasses(PassManager &pm) {
+  populateMooreTransforms(pm);
+  if (opts.loweringMode == LoweringMode::OutputIRMoore)
+    return;
+  populateMooreToCoreLowering(pm);
+  if (opts.loweringMode == LoweringMode::OutputIRLLHD)
+    return;
+  populateLLHDLowering(pm);
+}
+
+//===----------------------------------------------------------------------===//
 // Implementation
 //===----------------------------------------------------------------------===//
 
@@ -217,6 +361,8 @@ static LogicalResult executeWithSources(MLIRContext *context,
     options.mode = ImportVerilogOptions::Mode::OnlyLint;
   else if (opts.loweringMode == LoweringMode::OnlyParse)
     options.mode = ImportVerilogOptions::Mode::OnlyParse;
+  options.debugInfo = opts.debugInfo;
+  options.lowerAlwaysAtStarAsComb = opts.lowerAlwaysAtStarAsComb;
 
   options.includeDirs = opts.includeDirs;
   options.includeSystemDirs = opts.includeSystemDirs;
@@ -250,39 +396,101 @@ static LogicalResult executeWithSources(MLIRContext *context,
   std::string errorMessage;
   auto outputFile = openOutputFile(opts.outputFilename, &errorMessage);
   if (!outputFile) {
-    llvm::errs() << errorMessage << "\n";
+    WithColor::error() << errorMessage << "\n";
     return failure();
   }
 
-  // If the user requested for the files to be only preprocessed, do so and
-  // print the results to the configured output file.
-  if (opts.loweringMode == LoweringMode::OnlyPreprocess) {
-    auto result =
-        preprocessVerilog(sourceMgr, context, ts, outputFile->os(), &options);
-    if (succeeded(result))
-      outputFile->keep();
-    return result;
-  }
+  // Parse the input as SystemVerilog or MLIR file.
+  OwningOpRef<ModuleOp> module;
+  switch (opts.format) {
+  case Format::SV: {
+    // If the user requested for the files to be only preprocessed, do so and
+    // print the results to the configured output file.
+    if (opts.loweringMode == LoweringMode::OnlyPreprocess) {
+      auto result =
+          preprocessVerilog(sourceMgr, context, ts, outputFile->os(), &options);
+      if (succeeded(result))
+        outputFile->keep();
+      return result;
+    }
 
-  // Parse the Verilog input into an MLIR module.
-  OwningOpRef<ModuleOp> module(ModuleOp::create(UnknownLoc::get(context)));
-  if (failed(importVerilog(sourceMgr, context, ts, module.get(), &options)))
+    // Parse the Verilog input into an MLIR module.
+    module = ModuleOp::create(UnknownLoc::get(context));
+    if (failed(importVerilog(sourceMgr, context, ts, module.get(), &options)))
+      return failure();
+
+    // If the user requested for the files to be only linted, the module remains
+    // empty and there is nothing left to do.
+    if (opts.loweringMode == LoweringMode::OnlyLint)
+      return success();
+  } break;
+
+  case Format::MLIR: {
+    auto parserTimer = ts.nest("MLIR Parser");
+    module = parseSourceFile<ModuleOp>(sourceMgr, context);
+  } break;
+  }
+  if (!module)
     return failure();
+
+  // If the user requested anything besides simply parsing the input, run the
+  // appropriate transformation passes according to the command line options.
+  if (opts.loweringMode != LoweringMode::OnlyParse) {
+    PassManager pm(context);
+    pm.enableVerifier(true);
+    pm.enableTiming(ts);
+    if (failed(applyPassManagerCLOptions(pm)))
+      return failure();
+    populatePasses(pm);
+    if (failed(pm.run(module.get())))
+      return failure();
+  }
 
   // Print the final MLIR.
+  auto outputTimer = ts.nest("MLIR Printer");
   module->print(outputFile->os());
   outputFile->keep();
   return success();
 }
 
 static LogicalResult execute(MLIRContext *context) {
+  // Default to reading from stdin if no files were provided.
+  if (opts.inputFilenames.empty())
+    opts.inputFilenames.push_back("-");
+
+  // Auto-detect the input format if it was not explicitly specified.
+  if (opts.format.getNumOccurrences() == 0) {
+    std::optional<Format> detectedFormat = std::nullopt;
+    for (const auto &inputFilename : opts.inputFilenames) {
+      std::optional<Format> format = std::nullopt;
+      auto name = StringRef(inputFilename);
+      if (name.ends_with(".v") || name.ends_with(".sv") ||
+          name.ends_with(".vh") || name.ends_with(".svh"))
+        format = Format::SV;
+      else if (name.ends_with(".mlir") || name.ends_with(".mlirbc"))
+        format = Format::MLIR;
+      if (!format)
+        continue;
+      if (detectedFormat && format != detectedFormat) {
+        detectedFormat = std::nullopt;
+        break;
+      }
+      detectedFormat = format;
+    }
+    if (!detectedFormat) {
+      WithColor::error() << "cannot auto-detect input format; use --format\n";
+      return failure();
+    }
+    opts.format = *detectedFormat;
+  }
+
   // Open the input files.
   llvm::SourceMgr sourceMgr;
   for (const auto &inputFilename : opts.inputFilenames) {
     std::string errorMessage;
     auto buffer = openInputFile(inputFilename, &errorMessage);
     if (!buffer) {
-      llvm::errs() << errorMessage << "\n";
+      WithColor::error() << errorMessage << "\n";
       return failure();
     }
     sourceMgr.AddNewSourceBuffer(std::move(buffer), llvm::SMLoc());
@@ -323,7 +531,26 @@ int main(int argc, char **argv) {
   cl::ParseCommandLineOptions(argc, argv,
                               "Verilog and SystemVerilog frontend\n");
 
+  // Register the dialects.
+  // clang-format off
+  DialectRegistry registry;
+  registry.insert<
+    cf::ControlFlowDialect,
+    comb::CombDialect,
+    debug::DebugDialect,
+    func::FuncDialect,
+    hw::HWDialect,
+    llhd::LLHDDialect,
+    moore::MooreDialect,
+    scf::SCFDialect,
+    seq::SeqDialect,
+    sim::SimDialect,
+    verif::VerifDialect
+  >();
+  // clang-format on
+
   // Perform the actual work and use "exit" to avoid slow context teardown.
-  MLIRContext context;
+  mlir::func::registerInlinerExtension(registry);
+  MLIRContext context(registry);
   exit(failed(execute(&context)));
 }

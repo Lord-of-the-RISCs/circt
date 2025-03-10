@@ -19,7 +19,7 @@ using namespace dc;
 using namespace mlir;
 
 bool circt::dc::isI1ValueType(Type t) {
-  auto vt = t.dyn_cast<ValueType>();
+  auto vt = dyn_cast<ValueType>(t);
   if (!vt)
     return false;
   auto innerWidth = vt.getInnerType().getIntOrFloatBitWidth();
@@ -38,46 +38,125 @@ OpFoldResult JoinOp::fold(FoldAdaptor adaptor) {
   if (auto tokens = getTokens(); tokens.size() == 1)
     return tokens.front();
 
-  // These folders are disabled to work around MLIR bugs when changing
-  // the number of operands.  https://github.com/llvm/llvm-project/issues/64280
   return {};
+}
 
-  // Remove operands which originate from a dc.source op (redundant).
-  auto *op = getOperation();
-  for (OpOperand &operand : llvm::make_early_inc_range(op->getOpOperands())) {
-    if (auto source = operand.get().getDefiningOp<dc::SourceOp>()) {
-      op->eraseOperand(operand.getOperandNumber());
-      return getOutput();
+struct JoinOnBranchPattern : public OpRewritePattern<JoinOp> {
+  using OpRewritePattern<JoinOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(JoinOp op,
+                                PatternRewriter &rewriter) const override {
+
+    struct BranchOperandInfo {
+      // Unique operands from the branch op, in case we have the same operand
+      // from the branch op multiple times.
+      SetVector<Value> uniqueOperands;
+      // Indices which the operands are at in the join op.
+      BitVector indices;
+    };
+
+    DenseMap<BranchOp, BranchOperandInfo> branchOperands;
+    for (auto &opOperand : op->getOpOperands()) {
+      auto branch = opOperand.get().getDefiningOp<BranchOp>();
+      if (!branch)
+        continue;
+
+      BranchOperandInfo &info = branchOperands[branch];
+      info.uniqueOperands.insert(opOperand.get());
+      info.indices.resize(op->getNumOperands());
+      info.indices.set(opOperand.getOperandNumber());
     }
-  }
 
-  // Remove duplicate operands.
-  llvm::DenseSet<Value> uniqueOperands;
-  for (OpOperand &operand : llvm::make_early_inc_range(op->getOpOperands())) {
-    if (!uniqueOperands.insert(operand.get()).second) {
-      op->eraseOperand(operand.getOperandNumber());
-      return getOutput();
+    if (branchOperands.empty())
+      return failure();
+
+    // Do we have both operands from any given branch op?
+    for (auto &it : branchOperands) {
+      auto branch = it.first;
+      auto &operandInfo = it.second;
+      if (operandInfo.uniqueOperands.size() != 2) {
+        // We don't have both operands from the branch op.
+        continue;
+      }
+
+      // We have both operands from the branch op. Replace the join op with the
+      // branch op's data operand.
+
+      // Unpack the !dc.value<i1> input to the branch op
+      auto unpacked =
+          rewriter.create<UnpackOp>(op.getLoc(), branch.getCondition());
+      rewriter.modifyOpInPlace(op, [&]() {
+        op->eraseOperands(operandInfo.indices);
+        op.getTokensMutable().append({unpacked.getToken()});
+      });
+
+      // Only attempt a single branch at a time - else we'd have to maintain
+      // OpOperand indices during the loop... too complicated, let recursive
+      // pattern application handle this.
+      return success();
     }
-  }
 
-  // Canonicalization staggered joins where the sink join contains inputs also
-  // found in the source join.
-  for (OpOperand &operand : llvm::make_early_inc_range(op->getOpOperands())) {
-    auto otherJoin = operand.get().getDefiningOp<dc::JoinOp>();
-    if (!otherJoin) {
-      // Operand does not originate from a join so it's a valid join input.
-      continue;
+    return failure();
+  }
+};
+struct StaggeredJoinCanonicalization : public OpRewritePattern<JoinOp> {
+  using OpRewritePattern<JoinOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(JoinOp op,
+                                PatternRewriter &rewriter) const override {
+    for (OpOperand &operand : llvm::make_early_inc_range(op->getOpOperands())) {
+      auto otherJoin = operand.get().getDefiningOp<dc::JoinOp>();
+      if (!otherJoin) {
+        // Operand does not originate from a join so it's a valid join input.
+        continue;
+      }
+
+      // Operand originates from a join. Erase the current join operand and
+      // add all of the otherJoin op's inputs to this join.
+      // DCE will take care of otherJoin in case it's no longer used.
+      rewriter.modifyOpInPlace(op, [&]() {
+        op.getTokensMutable().erase(operand.getOperandNumber());
+        op.getTokensMutable().append(otherJoin.getTokens());
+      });
+      return success();
     }
-
-    // Operand originates from a join. Erase the current join operand and add
-    // all of the otherJoin op's inputs to this join.
-    // DCE will take care of otherJoin in case it's no longer used.
-    op->eraseOperand(operand.getOperandNumber());
-    op->insertOperands(getNumOperands(), otherJoin.getTokens());
-    return getOutput();
+    return failure();
   }
+};
 
-  return {};
+struct RemoveJoinOnSourcePattern : public OpRewritePattern<JoinOp> {
+  using OpRewritePattern<JoinOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(JoinOp op,
+                                PatternRewriter &rewriter) const override {
+    for (OpOperand &operand : llvm::make_early_inc_range(op->getOpOperands())) {
+      if (auto source = operand.get().getDefiningOp<dc::SourceOp>()) {
+        rewriter.modifyOpInPlace(
+            op, [&]() { op->eraseOperand(operand.getOperandNumber()); });
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
+struct RemoveDuplicateJoinOperandsPattern : public OpRewritePattern<JoinOp> {
+  using OpRewritePattern<JoinOp>::OpRewritePattern;
+  LogicalResult matchAndRewrite(JoinOp op,
+                                PatternRewriter &rewriter) const override {
+    llvm::DenseSet<Value> uniqueOperands;
+    for (OpOperand &operand : llvm::make_early_inc_range(op->getOpOperands())) {
+      if (!uniqueOperands.insert(operand.get()).second) {
+        rewriter.modifyOpInPlace(
+            op, [&]() { op->eraseOperand(operand.getOperandNumber()); });
+        return success();
+      }
+    }
+    return failure();
+  }
+};
+
+void JoinOp::getCanonicalizationPatterns(RewritePatternSet &results,
+                                         MLIRContext *context) {
+  results.insert<RemoveDuplicateJoinOperandsPattern, RemoveJoinOnSourcePattern,
+                 StaggeredJoinCanonicalization, JoinOnBranchPattern>(context);
 }
 
 // =============================================================================
@@ -138,7 +217,7 @@ public:
 
         // We have a fork feeding into another fork. Replace the output fork by
         // adding more outputs to the current fork.
-        size_t totalForks = fork.getNumResults() + userFork.getNumResults() - 1;
+        size_t totalForks = fork.getNumResults() + userFork.getNumResults();
 
         auto newFork = rewriter.create<dc::ForkOp>(fork.getLoc(),
                                                    fork.getToken(), totalForks);
@@ -180,10 +259,38 @@ public:
   }
 };
 
+struct EliminateUnusedForkResultsPattern : mlir::OpRewritePattern<ForkOp> {
+  using mlir::OpRewritePattern<ForkOp>::OpRewritePattern;
+
+  LogicalResult matchAndRewrite(ForkOp op,
+                                PatternRewriter &rewriter) const override {
+    std::set<unsigned> unusedIndexes;
+
+    for (auto res : llvm::enumerate(op.getResults()))
+      if (res.value().use_empty())
+        unusedIndexes.insert(res.index());
+
+    if (unusedIndexes.empty())
+      return failure();
+
+    // Create a new fork op, dropping the unused results.
+    rewriter.setInsertionPoint(op);
+    auto operand = op.getOperand();
+    auto newFork = rewriter.create<ForkOp>(
+        op.getLoc(), operand, op.getNumResults() - unusedIndexes.size());
+    unsigned i = 0;
+    for (auto oldRes : llvm::enumerate(op.getResults()))
+      if (unusedIndexes.count(oldRes.index()) == 0)
+        rewriter.replaceAllUsesWith(oldRes.value(), newFork.getResults()[i++]);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
 void ForkOp::getCanonicalizationPatterns(RewritePatternSet &results,
                                          MLIRContext *context) {
-  results.insert<EliminateForkToForkPattern, EliminateForkOfSourcePattern>(
-      context);
+  results.insert<EliminateForkToForkPattern, EliminateForkOfSourcePattern,
+                 EliminateUnusedForkResultsPattern>(context);
 }
 
 LogicalResult ForkOp::fold(FoldAdaptor adaptor,
@@ -242,7 +349,7 @@ LogicalResult UnpackOp::inferReturnTypes(
     MLIRContext *context, std::optional<Location> loc, ValueRange operands,
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
-  auto inputType = operands.front().getType().cast<ValueType>();
+  auto inputType = cast<ValueType>(operands.front().getType());
   results.push_back(TokenType::get(context));
   results.push_back(inputType.getInnerType());
   return success();
@@ -331,7 +438,7 @@ FailureOr<SmallVector<int64_t>> BufferOp::getInitValueArray() {
   assert(getInitValues() && "initValues attribute not set");
   SmallVector<int64_t> values;
   for (auto value : getInitValuesAttr()) {
-    if (auto iValue = value.dyn_cast<IntegerAttr>()) {
+    if (auto iValue = dyn_cast<IntegerAttr>(value)) {
       values.push_back(iValue.getValue().getSExtValue());
     } else {
       return emitError() << "initValues attribute must be an array of integers";
@@ -362,7 +469,7 @@ LogicalResult ToESIOp::inferReturnTypes(
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
   Type channelEltType;
-  if (auto valueType = operands.front().getType().dyn_cast<ValueType>())
+  if (auto valueType = dyn_cast<ValueType>(operands.front().getType()))
     channelEltType = valueType.getInnerType();
   else {
     // dc.token => esi.channel<i0>
@@ -382,8 +489,8 @@ LogicalResult FromESIOp::inferReturnTypes(
     DictionaryAttr attrs, mlir::OpaqueProperties properties,
     mlir::RegionRange regions, SmallVectorImpl<Type> &results) {
   auto innerType =
-      operands.front().getType().cast<esi::ChannelType>().getInner();
-  if (auto intType = innerType.dyn_cast<IntegerType>(); intType.getWidth() == 0)
+      cast<esi::ChannelType>(operands.front().getType()).getInner();
+  if (auto intType = dyn_cast<IntegerType>(innerType); intType.getWidth() == 0)
     results.push_back(dc::TokenType::get(context));
   else
     results.push_back(dc::ValueType::get(context, innerType));
