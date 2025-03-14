@@ -22,6 +22,7 @@ set(LLVM_OPTIONAL_SOURCES
   SV.cpp
   Seq.cpp
   SMT.cpp
+  SSP.cpp
   Verif.cpp
 )
 
@@ -157,6 +158,15 @@ add_circt_public_c_api_library(CIRCTCAPISeq
   MLIRCAPIIR
   CIRCTSeq
   CIRCTSeqTransforms
+)
+
+add_circt_public_c_api_library(CIRCTCAPISSP
+  SSP.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTSSP
+  CIRCTSSPTransforms
 )
 
 add_circt_public_c_api_library(CIRCTCAPISV
