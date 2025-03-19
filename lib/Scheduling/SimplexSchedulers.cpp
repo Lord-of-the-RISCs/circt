@@ -1379,7 +1379,7 @@ void SimplexSchedulerBase::computeCriticalPath() {
 
 void SimplexSchedulerBase::exportCriticalPath() {
   getProblem().getContainingOp()->setAttr(
-      "SpecHLS.II",
+      "spechls.ii",
       mlir::FloatAttr::get(
           mlir::Float32Type::get(getProblem().getContainingOp()->getContext()),
           doubleII));
@@ -1394,7 +1394,7 @@ void SimplexSchedulerBase::exportCriticalPath() {
       }
     }
     if (isInCriticalPath) {
-      dep.getSource()->setAttr("SpecHLS.criticalPath",
+      dep.getSource()->setAttr("spechls.critical_path",
                                dep.getDestination()->getAttr("sym_name"));
     }
   }
