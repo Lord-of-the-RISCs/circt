@@ -21,6 +21,11 @@ if(CIRCT_LINK_CIRCT_DYLIB)
   set(INSTALL_WITH_TOOLCHAIN INSTALL_WITH_TOOLCHAIN)
 endif()
 
+set(ORTOOL_LIB "")
+if(ortools_FOUND)
+set(ORTOOLS_LIB ortools::ortools)
+endif()
+
 add_circt_library(
   CIRCT
   SHARED
@@ -31,6 +36,7 @@ add_circt_library(
   ${_DEPS}
   MLIR
   ${Z3_LIBRARIES}
+  ${ORTOOLS_LIB}
 )
 target_link_libraries(CIRCT PRIVATE ${LLVM_PTHREAD_LIB})
 
