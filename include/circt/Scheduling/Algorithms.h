@@ -86,6 +86,7 @@ LogicalResult scheduleLP(Problem &prob, Operation *lastOp);
 /// least one edge with a non-zero distance, or \p prob does not include
 /// \p lastOp.
 LogicalResult scheduleLP(CyclicProblem &prob, Operation *lastOp);
+LogicalResult scheduleLP(ChainingCyclicProblem &prob, Operation *lastOp, float cycleTime);
 
 /// Solve the acyclic problem with shared operators using constraint programming
 /// and an external SAT solver. The objective is to minimize the start time of

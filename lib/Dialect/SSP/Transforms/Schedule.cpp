@@ -181,6 +181,15 @@ static InstanceOp scheduleProblemTWithLP(InstanceOp instOp, Operation *lastOp,
   return saveProblem(prob, builder);
 }
 
+static InstanceOp scheduleChainingCyclicProblemWithLP(InstanceOp instOp, Operation *lastOp, float cycleTime,
+                                         OpBuilder &builder) {
+  auto prob = loadProblem<ChainingCyclicProblem>(instOp);
+  if (failed(prob.check()) || failed(scheduling::scheduleLP(prob, lastOp, cycleTime)) ||
+      failed(prob.verify()))
+    return {};
+  return saveProblem(prob, builder);
+}
+
 static InstanceOp scheduleWithLP(InstanceOp instOp, StringRef options,
                                  OpBuilder &builder) {
   auto lastOp = getLastOp(instOp, options);
@@ -197,7 +206,14 @@ static InstanceOp scheduleWithLP(InstanceOp instOp, StringRef options,
     return scheduleProblemTWithLP<Problem>(instOp, lastOp, builder);
   if (problemName == "CyclicProblem")
     return scheduleProblemTWithLP<CyclicProblem>(instOp, lastOp, builder);
-
+  if (problemName == "ChainingCyclicProblem") {
+    if (auto cycleTime = getCycleTime(options))
+      return scheduleChainingCyclicProblemWithLP(
+          instOp, lastOp, cycleTime.value(), builder);
+    llvm::errs() << "ssp-schedule: Missing option 'cycle-time' for "
+                    "ChainingCyclicProblem LP scheduler\n";
+    return {};
+  }
   llvm::errs() << "ssp-schedule: Unsupported problem '" << problemName
                << "' for LP scheduler\n";
   return {};
