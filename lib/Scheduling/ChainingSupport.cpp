@@ -35,7 +35,7 @@ LogicalResult scheduling::computeChainBreakingDependences(
 
   // chains[v][u] denotes the accumulated delay incoming at `v`, of the longest
   // combinational chain originating from `u`.
-  DenseMap<Operation *, SmallDenseMap<Operation *, float>> chains;
+  DenseMap<Operation *, SmallDenseMap<Operation *, double>> chains;
 
   // Do a simple DFA-style pass over the dependence graph to determine
   // combinational chains and their respective accumulated delays.
@@ -65,7 +65,7 @@ LogicalResult scheduling::computeChainBreakingDependences(
       // chains, extended by `pred`, are incoming chains for `op`.
       for (auto incomingChain : chains[pred]) {
         Operation *origin = incomingChain.first;
-        float delay = incomingChain.second;
+        double delay = incomingChain.second;
         chains[op][origin] = std::max(delay + *prob.getOutgoingDelay(predOpr),
                                       chains[op][origin]);
       }
@@ -75,7 +75,7 @@ LogicalResult scheduling::computeChainBreakingDependences(
     auto opr = *prob.getLinkedOperatorType(op);
     for (auto incomingChain : chains[op]) {
       Operation *origin = incomingChain.first;
-      float delay = incomingChain.second;
+      double delay = incomingChain.second;
       // Check whether `op` could be appended to the incoming chain without
       // violating the cycle time constraint.
       if (delay + *prob.getIncomingDelay(opr) > cycleTime) {
@@ -96,7 +96,7 @@ LogicalResult scheduling::computeStartTimesInCycle(ChainingProblem &prob) {
     // `op` will start within its abstract time step as soon as all operand
     // values have reached it.
     unsigned startTime = *prob.getStartTime(op);
-    float startTimeInCycle = 0.0f;
+    double startTimeInCycle = 0.0f;
 
     for (auto dep : prob.getDependences(op)) {
       // Skip auxiliary deps, as these don't carry values.
@@ -120,7 +120,7 @@ LogicalResult scheduling::computeStartTimesInCycle(ChainingProblem &prob) {
       // So, `pred` ends in the same cycle as `op` starts.
       assert(predEndTime == startTime);
       // If `pred` uses a multi-cycle operator, only its outgoing delay counts.
-      float predEndTimeInCycle =
+      double predEndTimeInCycle =
           (predStartTime == predEndTime ? *predStartTimeInCycle : 0.0f) +
           *prob.getOutgoingDelay(predOpr);
       startTimeInCycle = std::max(predEndTimeInCycle, startTimeInCycle);

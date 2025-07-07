@@ -345,36 +345,36 @@ protected:
   ChainingProblem() = default;
 
 private:
-  OperatorTypeProperty<float> incomingDelay, outgoingDelay;
-  OperationProperty<float> startTimeInCycle;
+  OperatorTypeProperty<double> incomingDelay, outgoingDelay;
+  OperationProperty<double> startTimeInCycle;
 
 public:
   /// The incoming delay denotes the propagation time from the operand inputs to
   /// either the result outputs (combinational operators) or the first internal
   /// register stage.
-  std::optional<float> getIncomingDelay(OperatorType opr) {
+  std::optional<double> getIncomingDelay(OperatorType opr) {
     return incomingDelay.lookup(opr);
   }
-  void setIncomingDelay(OperatorType opr, float delay) {
+  void setIncomingDelay(OperatorType opr, double delay) {
     incomingDelay[opr] = delay;
   }
 
   /// The outgoing delay denotes the propagation time from either the operand
   /// inputs (combinational operators) or the last internal register stage to
   /// the result outputs.
-  std::optional<float> getOutgoingDelay(OperatorType opr) {
+  std::optional<double> getOutgoingDelay(OperatorType opr) {
     return outgoingDelay.lookup(opr);
   }
-  void setOutgoingDelay(OperatorType opr, float delay) {
+  void setOutgoingDelay(OperatorType opr, double delay) {
     outgoingDelay[opr] = delay;
   }
 
   /// Computed by the scheduler, this start time is relative to the beginning of
   /// the cycle that \p op starts in.
-  std::optional<float> getStartTimeInCycle(Operation *op) {
+  std::optional<double> getStartTimeInCycle(Operation *op) {
     return startTimeInCycle.lookup(op);
   }
-  void setStartTimeInCycle(Operation *op, float time) {
+  void setStartTimeInCycle(Operation *op, double time) {
     startTimeInCycle[op] = time;
   }
   void clearStartTimeInCycle() { startTimeInCycle.clear(); }

@@ -14,6 +14,7 @@
 #include "circt/Scheduling/DependenceIterator.h"
 
 #include "mlir/IR/Operation.h"
+#include <limits>
 
 using namespace circt;
 using namespace circt::scheduling;
@@ -229,8 +230,8 @@ LogicalResult ChainingProblem::checkDelays(OperatorType opr) {
     return getContainingOp()->emitError()
            << "Missing delays for operator type '" << opr << "'";
 
-  float iDel = *incomingDelay;
-  float oDel = *outgoingDelay;
+  double iDel = *incomingDelay;
+  double oDel = *outgoingDelay;
 
   if (iDel < 0.0f || oDel < 0.0f)
     return getContainingOp()->emitError()
@@ -274,9 +275,11 @@ LogicalResult ChainingProblem::verifyPrecedenceInCycle(Dependence dep) {
   // include `i`'s start time in that cycle in the path delay. Otherwise, `i`
   // started in an earlier cycle and just contributes its outgoing delay to the
   // path.
-  float sticI = latI == 0 ? *getStartTimeInCycle(i) : 0.0f;
-  float oDelI = *getOutgoingDelay(*getLinkedOperatorType(i));
-  float sticJ = *getStartTimeInCycle(j);
+  double sticI = latI == 0 ? *getStartTimeInCycle(i) : 0.0f;
+  double oDelI = *getOutgoingDelay(*getLinkedOperatorType(i));
+  // Use of epsilon due to the rounding of or-tools for floating point variables
+  double sticJ =
+      *getStartTimeInCycle(j) + std::numeric_limits<float>::epsilon();
 
   if (!(sticI + oDelI <= sticJ))
     return getContainingOp()->emitError()
