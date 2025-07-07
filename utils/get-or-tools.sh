@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 ##===- utils/get-or-tools.sh - Install OR-Tools --------------*- Script -*-===##
-# 
+#
 # Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 # See https://llvm.org/LICENSE.txt for license information.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
-# 
+#
 ##===----------------------------------------------------------------------===##
 #
 # This script downloads, compiles, and installs OR-Tools into $/ext.
@@ -28,8 +28,8 @@ cd or-tools-$OR_TOOLS_VER
 # By default, configure a lean build including only free solvers.
 # To enable support for additional solvers you have licensed, see:
 #   https://github.com/google/or-tools/blob/v9.5/cmake/README.md
-cmake -S . -B build -DBUILD_DEPS=ON -DBUILD_SAMPLES=OFF -DBUILD_EXAMPLES=OFF \
-      -DBUILD_FLATZINC=OFF -DUSE_SCIP=OFF
+cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -S . -B build -DBUILD_DEPS=ON -DBUILD_SAMPLES=OFF -DBUILD_EXAMPLES=OFF \
+  -DBUILD_FLATZINC=OFF -DUSE_SCIP=OFF
 cmake --build build --parallel $(nproc || sysctl -n hw.ncpu)
 cmake --install build --prefix $EXT_DIR
 
