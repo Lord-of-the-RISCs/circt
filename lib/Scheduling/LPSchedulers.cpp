@@ -221,7 +221,6 @@ LogicalResult scheduling::scheduleLP(ChainingCyclicProblem &prob,
       // <=> 1 * t_src + -1 * t_dst + -e.distance * II <= -latency - offset
       unsigned offset =
           ((distance > 0) && ((outgoingDelay > 0) || (latency == 0))) ? 1 : 0;
-      llvm::outs() << "offset is " << offset << "\n";
       MPConstraint *constraint =
           solver.MakeRowConstraint(-infinity, -((double)(latency + offset)));
       if (src != dst) { // Handle self-arcs.
