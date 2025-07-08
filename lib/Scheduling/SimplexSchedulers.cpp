@@ -14,10 +14,13 @@
 #include "circt/Scheduling/Algorithms.h"
 #include "circt/Scheduling/Utilities.h"
 
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Operation.h"
 
+#include "circt/Dialect/SSP/SSPOps.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/Format.h"
 
@@ -1378,24 +1381,27 @@ void SimplexSchedulerBase::computeCriticalPath() {
 }
 
 void SimplexSchedulerBase::exportCriticalPath() {
-  getProblem().getContainingOp()->setAttr(
-      "spechls.ii",
-      mlir::FloatAttr::get(
-          mlir::Float32Type::get(getProblem().getContainingOp()->getContext()),
-          doubleII));
-  for (auto pair : dependencesMap) {
-    auto dep = pair.first;
-    auto var = pair.second;
-    bool isInCriticalPath = false;
-    for (unsigned int variable : criticalPath) {
-      if (variable == var) {
-        isInCriticalPath = true;
-        break;
+  auto *op = getProblem().getContainingOp();
+  if (op->hasAttrOfType<mlir::BoolAttr>("spechls.exportCriticalPath") &&
+      op->getAttrOfType<mlir::BoolAttr>("spechls.exportCrtiticalPath")
+          .getValue()) {
+    op->setAttr("spechls.ii",
+                mlir::FloatAttr::get(mlir::Float32Type::get(op->getContext()),
+                                     doubleII));
+    for (auto pair : dependencesMap) {
+      auto dep = pair.first;
+      auto var = pair.second;
+      bool isInCriticalPath = false;
+      for (unsigned int variable : criticalPath) {
+        if (variable == var) {
+          isInCriticalPath = true;
+          break;
+        }
       }
-    }
-    if (isInCriticalPath) {
-      dep.getSource()->setAttr("spechls.critical_path",
-                               dep.getDestination()->getAttr("sym_name"));
+      if (isInCriticalPath) {
+        dep.getSource()->setAttr("spechls.critical_path",
+                                 dep.getDestination()->getAttr("sym_name"));
+      }
     }
   }
 }
