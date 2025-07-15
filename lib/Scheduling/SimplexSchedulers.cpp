@@ -1383,7 +1383,7 @@ void SimplexSchedulerBase::computeCriticalPath() {
 void SimplexSchedulerBase::exportCriticalPath() {
   auto *op = getProblem().getContainingOp();
   if (op->hasAttrOfType<mlir::BoolAttr>("spechls.exportCriticalPath") &&
-      op->getAttrOfType<mlir::BoolAttr>("spechls.exportCrtiticalPath")
+      op->getAttrOfType<mlir::BoolAttr>("spechls.exportCriticalPath")
           .getValue()) {
     op->setAttr("spechls.ii",
                 mlir::FloatAttr::get(mlir::Float32Type::get(op->getContext()),
