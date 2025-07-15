@@ -150,7 +150,7 @@ LogicalResult scheduling::scheduleLP(CyclicProblem &prob, Operation *lastOp) {
 
 LogicalResult scheduling::scheduleLP(ChainingCyclicProblem &prob,
                                      Operation *lastOp, float cycleTime) {
-  static constexpr int bigM = 100000;
+  static constexpr double bigM = 10000000;
 
   Operation *containingOp = prob.getContainingOp();
   if (!prob.hasOperation(lastOp))
@@ -184,14 +184,16 @@ LogicalResult scheduling::scheduleLP(ChainingCyclicProblem &prob,
       return mlir::failure();
     }
 
-    t[op] = solver.MakeIntVar(0, infinity, (Twine("t_") + Twine(i)).str());
+    t[op] = solver.MakeIntVar(0, 1000, (Twine("t_") + Twine(i)).str());
     upperBound += *prob.getLatency(opr);
     if (*prob.getOutgoingDelay(opr) > 0)
       ++upperBound;
-    z[op] = solver.MakeVar(0, cycleTime - *prob.getIncomingDelay(opr), false,
-                           (Twine("z_") + Twine(i)).str());
+    z[op] = solver.MakeNumVar(0, cycleTime - *prob.getIncomingDelay(opr),
+                              (Twine("z_") + Twine(i)).str());
     ++i;
   }
+
+  unsigned int bIndex = 0;
 
   // The objective is to minimize the II.
   MPObjective *objective = solver.MutableObjective();
@@ -206,54 +208,57 @@ LogicalResult scheduling::scheduleLP(ChainingCyclicProblem &prob,
       Operation *dst = dep.getDestination();
 
       unsigned distance = prob.getDistance(dep).value_or(0);
-      unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
       double outgoingDelay =
           prob.getOutgoingDelay(*prob.getLinkedOperatorType(src)).value_or(0.0);
 
-      // Contrary to the cyclic problem, it is necessary to add an constant
-      // offset in the constraint that represent the fact that if e.distance >
-      // 0, then dst should start in the next cycle after the end of src. But,
-      // if src contains an outgoingDelay > 0 or a latency==0, then it necessary
-      // to add + 1 to `t_src + t_src.linkedOperatorType.latency` to compute the
-      // start of the next cycle.
-      //     t_src + t_src.linkedOperatorType.latency + offset <= t_dst +
-      //     e.distance * II
-      // <=> 1 * t_src + -1 * t_dst + -e.distance * II <= -latency - offset
-      unsigned offset =
-          ((distance > 0) && ((outgoingDelay > 0) || (latency == 0))) ? 1 : 0;
+      //     t_src + t_src.linkedOperatorType.latency <= t_dst + e.distance * II
+      // <=> 1 * t_src + -1 * t_dst + -e.distance * II <= -latency
+      unsigned latency = *prob.getLatency(*prob.getLinkedOperatorType(src));
       MPConstraint *constraint =
-          solver.MakeRowConstraint(-infinity, -((double)(latency + offset)));
+          solver.MakeRowConstraint(-infinity, -((double)latency));
       if (src != dst) { // Handle self-arcs.
         constraint->SetCoefficient(t[src], 1);
         constraint->SetCoefficient(t[dst], -1);
       }
-      if (distance != 0)
+      if (distance != 0) {
         constraint->SetCoefficient(ii, -((double)distance));
-
-      // For combinatorial operation dependence, in the same iteration (i.e.
-      // e.distance == 0), we need a constraint that means "if the operations
-      // are in the same cycle, then the destination operation start after the
-      // end of the source operation." this can be represented as:
-      // z_src - z_dst + BIG_M * t_src - BIG_M *
-      // t_dst <= - t_src.linkedOperatorType.outgoingDelay - BIG_M *
-      // t_src.linkedOperatorType.latency
-      if (distance == 0) {
-        constraint = solver.MakeRowConstraint(-infinity,
-                                              -outgoingDelay - bigM * latency);
-        constraint->SetCoefficient(z[src], 1);
-        constraint->SetCoefficient(z[dst], -1);
-        constraint->SetCoefficient(t[src], bigM);
-        constraint->SetCoefficient(t[dst], -bigM);
       }
+
+      auto *b = solver.MakeBoolVar((Twine("b_") + Twine(bIndex++)).str());
+
+      constraint = solver.MakeRowConstraint(-infinity, -((double)latency + 1) + bigM);
+      if (src != dst) { // Handle self-arcs.
+        constraint->SetCoefficient(t[src], 1);
+        constraint->SetCoefficient(t[dst], -1);
+      }
+      if (distance != 0) {
+        constraint->SetCoefficient(ii, -((double)distance));
+      }
+      constraint->SetCoefficient(b, bigM);
+
+      constraint =
+          solver.MakeRowConstraint(-infinity, -((double)outgoingDelay));
+      if (latency == 0) {
+        if (src != dst) {
+          constraint->SetCoefficient(z[src], 1);
+          constraint->SetCoefficient(z[dst], -1);
+        }
+      } else {
+        constraint->SetCoefficient(z[dst], -1);
+      }
+      constraint->SetCoefficient(b, -bigM);
+
     }
   }
 
   // Invoke solver. The ILP is infeasible if the scheduling problem contained
-  // dependence graph contains cycles that do not include at least one edge with
-  // a non-zero distance. Otherwise, we expect the result to be optimal.
+  // dependence graph contains cycles that do not include at least one edge
+  // with a non-zero distance. Otherwise, we expect the result to be optimal.
   MPSolver::ResultStatus result = solver.Solve();
-  if (result == MPSolver::INFEASIBLE)
+
+  if (result == MPSolver::INFEASIBLE) {
     return containingOp->emitError() << "dependence cycle detected";
+  }
   assert(result == MPSolver::OPTIMAL);
 
   // Retrieve II and start times.
