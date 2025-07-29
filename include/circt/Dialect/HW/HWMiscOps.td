@@ -34,7 +34,7 @@ def ConstantOp
     }];
 
   let arguments = (ins APIntAttr:$value);
-  let results = (outs HWIntegerType:$result);
+  let results = (outs AnyType:$result);
   let hasCustomAssemblyFormat = 1;
 
   let builders = [

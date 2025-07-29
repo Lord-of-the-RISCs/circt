@@ -19,6 +19,7 @@
 #include "circt/Dialect/HW/HWVisitors.h"
 #include "circt/Dialect/HW/ModuleImplementation.h"
 #include "circt/Support/CustomDirectiveImpl.h"
+#include "circt/Support/LLVM.h"
 #include "circt/Support/Namespace.h"
 #include "circt/Support/Naming.h"
 #include "mlir/IR/Builders.h"
@@ -27,6 +28,8 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/raw_ostream.h"
 
 using namespace circt;
 using namespace hw;
@@ -2960,12 +2963,19 @@ Type TypedeclOp::getAliasType() {
 // BitcastOp
 //===----------------------------------------------------------------------===//
 
-OpFoldResult BitcastOp::fold(FoldAdaptor) {
+OpFoldResult BitcastOp::fold(FoldAdaptor adaptor) {
   // Identity.
   // bitcast(%a) : A -> A ==> %a
   if (getOperand().getType() == getType())
     return getOperand();
-
+  // if (getOperand().getType().getIntOrFloatBitWidth() ==
+  //     getType().getIntOrFloatBitWidth()) {
+  //   llvm::errs() << "here gpt\n";
+  //   return getOperand();
+  // }
+ // if (auto a = dyn_cast_or_null<ConstantOp>(getOperand().getDefiningOp())) {
+ //   return IntegerAttr::get(getType(), a.getValue().getSExtValue());
+ // }
   return {};
 }
 
