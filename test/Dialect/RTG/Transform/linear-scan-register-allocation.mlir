@@ -1,4 +1,4 @@
-// RUN: circt-opt --rtg-linear-scan-register-allocation --split-input-file --verify-diagnostics %s | FileCheck %s
+// RUN: circt-opt --pass-pipeline="builtin.module(rtg.test(rtg-linear-scan-register-allocation))" --split-input-file --verify-diagnostics %s | FileCheck %s
 
 // CHECK-LABEL: @test0
 rtg.test @test0() {
@@ -14,7 +14,7 @@ rtg.test @test0() {
   %1 = rtg.virtual_reg [#rtgtest.ra, #rtgtest.s0, #rtgtest.s1]
   %2 = rtg.virtual_reg [#rtgtest.ra, #rtgtest.s0, #rtgtest.s1]
   %3 = rtg.virtual_reg [#rtgtest.ra, #rtgtest.s0, #rtgtest.s1]
-  %imm = rtgtest.immediate #rtgtest.imm12<0>
+  %imm = rtg.constant #rtg.isa.immediate<12, 0>
   rtgtest.rv32i.jalr %0, %2, %imm
   rtgtest.rv32i.jalr %1, %0, %imm
   rtgtest.rv32i.jalr %3, %1, %imm
@@ -35,11 +35,20 @@ rtg.test @withFixedRegs() {
   %1 = rtg.virtual_reg [#rtgtest.ra, #rtgtest.s0, #rtgtest.s1]
   %2 = rtg.fixed_reg #rtgtest.s0
   %3 = rtg.virtual_reg [#rtgtest.ra, #rtgtest.s0, #rtgtest.s1]
-  %imm = rtgtest.immediate #rtgtest.imm12<0>
+  %imm = rtg.constant #rtg.isa.immediate<12, 0>
   rtgtest.rv32i.jalr %0, %2, %imm
   rtgtest.rv32i.jalr %1, %0, %imm
   rtgtest.rv32i.jalr %3, %1, %imm
   rtgtest.rv32i.jalr %2, %3, %imm
+}
+
+// CHECK-LABEL: @validation
+rtg.test @validation() {
+  %reg = rtg.virtual_reg [#rtgtest.ra, #rtgtest.s0, #rtgtest.s1]
+  %default = rtg.constant #rtg.isa.immediate<32, 0>
+  // CHECK: rtg.validate
+  %0 = rtg.validate %reg, %default, "some_id" : !rtgtest.ireg -> !rtg.isa.immediate<32>
+  rtgtest.rv32i.lui %reg, %0 : !rtg.isa.immediate<32>
 }
 
 // -----
@@ -48,7 +57,7 @@ rtg.test @spilling() {
   %0 = rtg.virtual_reg [#rtgtest.ra]
   // expected-error @below {{need to spill this register, but not supported yet}}
   %1 = rtg.virtual_reg [#rtgtest.ra]
-  %imm = rtgtest.immediate #rtgtest.imm12<0>
+  %imm = rtg.constant #rtg.isa.immediate<12, 0>
   rtgtest.rv32i.jalr %0, %1, %imm
 }
 
@@ -56,6 +65,6 @@ rtg.test @spilling() {
 
 rtg.test @unsupportedUser() {
   %0 = rtg.virtual_reg [#rtgtest.ra]
-  // expected-error @below {{only operations implementing 'InstructionOpInterface are allowed to use registers}}
+  // expected-error @below {{only operations implementing 'InstructionOpInterface' and 'rtg.validate' are allowed to use registers}}
   rtg.set_create %0 : !rtgtest.ireg
 }

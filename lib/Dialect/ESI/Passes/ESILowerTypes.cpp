@@ -48,7 +48,6 @@ public:
     addConversion([](Type t) { return t; });
     addConversion([](WindowType window) { return window.getLoweredType(); });
     addSourceMaterialization(wrapMaterialization);
-    addArgumentMaterialization(wrapMaterialization);
     addTargetMaterialization(unwrapMaterialization);
   }
 
@@ -57,7 +56,7 @@ private:
                                          ValueRange inputs, Location loc) {
     if (inputs.size() != 1)
       return mlir::Value();
-    auto wrap = b.create<WrapWindow>(loc, resultType, inputs[0]);
+    auto wrap = WrapWindow::create(b, loc, resultType, inputs[0]);
     return wrap.getWindow();
   }
 
@@ -66,7 +65,7 @@ private:
                                            ValueRange inputs, Location loc) {
     if (inputs.size() != 1 || !isa<WindowType>(inputs[0].getType()))
       return mlir::Value();
-    auto unwrap = b.create<UnwrapWindow>(loc, resultType, inputs[0]);
+    auto unwrap = UnwrapWindow::create(b, loc, resultType, inputs[0]);
     return unwrap.getFrame();
   }
 };

@@ -18,6 +18,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/MemRef/IR/MemRef.h"
+#include "mlir/Dialect/Utils/ReshapeOpsUtils.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -73,7 +74,7 @@ static Value flattenIndices(ConversionPatternRewriter &rewriter, Operation *op,
 
   if (indices.empty()) {
     // Singleton memref (e.g. memref<i32>) - return 0.
-    return rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0))
+    return arith::ConstantOp::create(rewriter, loc, rewriter.getIndexAttr(0))
         .getResult();
   }
 
@@ -91,24 +92,22 @@ static Value flattenIndices(ConversionPatternRewriter &rewriter, Operation *op,
 
     // Multiply product by the current index operand.
     if (llvm::isPowerOf2_64(indexMulFactor)) {
-      auto constant =
-          rewriter
-              .create<arith::ConstantOp>(
-                  loc, rewriter.getIndexAttr(llvm::Log2_64(indexMulFactor)))
-              .getResult();
-      finalIdx =
-          rewriter.create<arith::ShLIOp>(loc, finalIdx, constant).getResult();
-    } else {
-      auto constant = rewriter
-                          .create<arith::ConstantOp>(
-                              loc, rewriter.getIndexAttr(indexMulFactor))
+      auto constant = arith::ConstantOp::create(
+                          rewriter, loc,
+                          rewriter.getIndexAttr(llvm::Log2_64(indexMulFactor)))
                           .getResult();
       finalIdx =
-          rewriter.create<arith::MulIOp>(loc, finalIdx, constant).getResult();
+          arith::ShLIOp::create(rewriter, loc, finalIdx, constant).getResult();
+    } else {
+      auto constant = arith::ConstantOp::create(
+                          rewriter, loc, rewriter.getIndexAttr(indexMulFactor))
+                          .getResult();
+      finalIdx =
+          arith::MulIOp::create(rewriter, loc, finalIdx, constant).getResult();
     }
 
     // Sum up with the prior lower dimension accessors.
-    auto sumOp = rewriter.create<arith::AddIOp>(loc, finalIdx, partialIdx);
+    auto sumOp = arith::AddIOp::create(rewriter, loc, finalIdx, partialIdx);
     finalIdx = sumOp.getResult();
   }
   return finalIdx;
@@ -174,6 +173,21 @@ struct AllocOpConversion : public OpConversionPattern<memref::AllocOp> {
       return failure();
     MemRefType newType = getFlattenedMemRefType(type);
     rewriter.replaceOpWithNewOp<memref::AllocOp>(op, newType);
+    return success();
+  }
+};
+
+struct AllocaOpConversion : public OpConversionPattern<memref::AllocaOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(memref::AllocaOp op, OpAdaptor /*adaptor*/,
+                  ConversionPatternRewriter &rewriter) const override {
+    MemRefType type = op.getType();
+    if (isUniDimensional(type) || !type.hasStaticShape())
+      return failure();
+    MemRefType newType = getFlattenedMemRefType(type);
+    rewriter.replaceOpWithNewOp<memref::AllocaOp>(op, newType);
     return success();
   }
 };
@@ -287,7 +301,8 @@ struct CondBranchOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     rewriter.replaceOpWithNewOp<mlir::cf::CondBranchOp>(
         op, adaptor.getCondition(), adaptor.getTrueDestOperands(),
-        adaptor.getFalseDestOperands(), op.getTrueDest(), op.getFalseDest());
+        adaptor.getFalseDestOperands(), /*branch_weights=*/nullptr,
+        op.getTrueDest(), op.getFalseDest());
     return success();
   }
 };
@@ -307,8 +322,9 @@ struct CallOpConversion : public OpConversionPattern<func::CallOp> {
     llvm::SmallVector<Type> convResTypes;
     if (typeConverter->convertTypes(op.getResultTypes(), convResTypes).failed())
       return failure();
-    auto newCallOp = rewriter.create<func::CallOp>(
-        op.getLoc(), adaptor.getCallee(), convResTypes, adaptor.getOperands());
+    auto newCallOp =
+        func::CallOp::create(rewriter, op.getLoc(), adaptor.getCallee(),
+                             convResTypes, adaptor.getOperands());
 
     if (!rewriteFunctions) {
       rewriter.replaceOp(op, newCallOp);
@@ -328,7 +344,7 @@ struct CallOpConversion : public OpConversionPattern<func::CallOp> {
           calledFunction, op.getCallee(), funcType);
     else
       newFuncOp =
-          rewriter.create<func::FuncOp>(op.getLoc(), op.getCallee(), funcType);
+          func::FuncOp::create(rewriter, op.getLoc(), op.getCallee(), funcType);
     newFuncOp.setVisibility(SymbolTable::Visibility::Private);
     rewriter.replaceOp(op, newCallOp);
 
@@ -352,6 +368,8 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
   target.addLegalDialect<arith::ArithDialect>();
   target.addDynamicallyLegalOp<memref::AllocOp>(
       [](memref::AllocOp op) { return isUniDimensional(op.getType()); });
+  target.addDynamicallyLegalOp<memref::AllocaOp>(
+      [](memref::AllocaOp op) { return isUniDimensional(op.getType()); });
   target.addDynamicallyLegalOp<memref::StoreOp>(
       [](memref::StoreOp op) { return op.getIndices().size() == 1; });
   target.addDynamicallyLegalOp<memref::LoadOp>(
@@ -380,26 +398,26 @@ static void populateFlattenMemRefsLegality(ConversionTarget &target) {
 }
 
 // Materializes a multidimensional memory to unidimensional memory by using a
-// memref.subview operation.
+// memref.collapse_shape operation.
 // TODO: This is also possible for dynamically shaped memories.
-static Value materializeSubViewFlattening(OpBuilder &builder, MemRefType type,
-                                          ValueRange inputs, Location loc) {
+static Value materializeCollapseShapeFlattening(OpBuilder &builder,
+                                                MemRefType type,
+                                                ValueRange inputs,
+                                                Location loc) {
   assert(type.hasStaticShape() &&
          "Can only subview flatten memref's with static shape (for now...).");
   MemRefType sourceType = cast<MemRefType>(inputs[0].getType());
   int64_t memSize = sourceType.getNumElements();
-  unsigned dims = sourceType.getShape().size();
+  ArrayRef<int64_t> sourceShape = sourceType.getShape();
+  ArrayRef<int64_t> targetShape = ArrayRef<int64_t>(memSize);
 
-  // Build offset, sizes and strides
-  SmallVector<OpFoldResult> sizes(dims, builder.getIndexAttr(0));
-  SmallVector<OpFoldResult> offsets(dims, builder.getIndexAttr(1));
-  offsets[offsets.size() - 1] = builder.getIndexAttr(memSize);
-  SmallVector<OpFoldResult> strides(dims, builder.getIndexAttr(1));
+  // Build ReassociationIndices to collapse completely to 1D MemRef.
+  auto indices = getReassociationIndicesForCollapse(sourceShape, targetShape);
+  assert(indices.has_value() && "expected a valid collapse");
 
   // Generate the appropriate return type:
-  MemRefType outType = MemRefType::get({memSize}, type.getElementType());
-  return builder.create<memref::SubViewOp>(loc, outType, inputs[0], sizes,
-                                           offsets, strides);
+  return memref::CollapseShapeOp::create(builder, loc, inputs[0],
+                                         indices.value());
 }
 
 static void populateTypeConversionPatterns(TypeConverter &typeConverter) {
@@ -426,8 +444,8 @@ public:
     RewritePatternSet patterns(ctx);
     SetVector<StringRef> rewrittenCallees;
     patterns.add<LoadOpConversion, StoreOpConversion, AllocOpConversion,
-                 GlobalOpConversion, GetGlobalOpConversion, ReshapeOpConversion,
-                 OperandConversionPattern<func::ReturnOp>,
+                 AllocaOpConversion, GlobalOpConversion, GetGlobalOpConversion,
+                 ReshapeOpConversion, OperandConversionPattern<func::ReturnOp>,
                  OperandConversionPattern<memref::DeallocOp>,
                  CondBranchOpConversion,
                  OperandConversionPattern<memref::DeallocOp>,
@@ -472,7 +490,7 @@ public:
 
     // Add a target materializer to handle memory flattening through
     // memref.subview operations.
-    typeConverter.addTargetMaterialization(materializeSubViewFlattening);
+    typeConverter.addTargetMaterialization(materializeCollapseShapeFlattening);
 
     if (applyPartialConversion(getOperation(), target, std::move(patterns))
             .failed()) {

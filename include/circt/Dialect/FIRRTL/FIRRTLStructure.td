@@ -144,7 +144,8 @@ def FModuleOp : FIRRTLModuleLike<"module", [SingleBlock, NoTerminator]> {
            ArrayRefAttr:$portNames,
            ArrayRefAttr:$portTypes,
            DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
-           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers
+           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
+           DefaultValuedAttr<ArrayRefAttr, "{}">:$domainInfo
       );
 
   let results = (outs);
@@ -197,35 +198,27 @@ def FExtModuleOp : FIRRTLModuleLike<"extmodule"> {
     into the external module, to be used for generating XMRs. Each RefType
     port must be removed by LowerXMR pass.
   }];
-  let arguments = 
-      (ins SymbolNameAttr:$sym_name,
-           OptionalAttr<StrAttr>:$defname,
-           ParamDeclArrayAttr:$parameters,
-           ConventionAttr:$convention,
-           DenseBoolArrayAttr:$portDirections,
-           ArrayRefAttr:$portLocations,
-           ArrayRefAttr:$portAnnotations,
-           ArrayRefAttr:$portSymbols,
-           ArrayRefAttr:$portNames,
-           ArrayRefAttr:$portTypes,
-           DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
-           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
-           OptionalAttr<InternalPathArrayAttr>:$internalPaths
-      );
+  let arguments = (ins SymbolNameAttr:$sym_name, OptionalAttr<StrAttr>:$defname,
+      ParamDeclArrayAttr:$parameters, ConventionAttr:$convention,
+      DenseBoolArrayAttr:$portDirections, ArrayRefAttr:$portLocations,
+      ArrayRefAttr:$portAnnotations, ArrayRefAttr:$portSymbols,
+      ArrayRefAttr:$portNames, ArrayRefAttr:$portTypes,
+      LayerArrayAttr:$knownLayers,
+      DefaultValuedAttr<AnnotationArrayAttr, "{}">:$annotations,
+      DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
+      OptionalAttr<InternalPathArrayAttr>:$internalPaths,
+      DefaultValuedAttr<ArrayRefAttr, "{}">:$domainInfo);
   let results = (outs);
   let regions = (region AnyRegion:$body);
 
   let skipDefaultBuilders = 1;
-  let builders = [
-    OpBuilder<(ins "StringAttr":$name,
-                      "ConventionAttr":$convention,
-                      "ArrayRef<PortInfo>":$ports,
-                      CArg<"StringRef", "StringRef()">:$defnamAttr,
-                      CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
-                      CArg<"ArrayAttr", "ArrayAttr()">:$parameters,
-                      CArg<"ArrayAttr", "ArrayAttr()">:$internalPaths,
-                      CArg<"ArrayAttr", "ArrayAttr()">:$layers)>
-  ];
+  let builders = [OpBuilder<(ins "StringAttr":$name,
+      "ConventionAttr":$convention, "ArrayRef<PortInfo>":$ports,
+      "ArrayAttr":$knownLayers, CArg<"StringRef", "StringRef()">:$defnamAttr,
+      CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
+      CArg<"ArrayAttr", "ArrayAttr()">:$parameters,
+      CArg<"ArrayAttr", "ArrayAttr()">:$internalPaths,
+      CArg<"ArrayAttr", "ArrayAttr()">:$layers)>];
 
   let extraModuleClassDeclaration = [{
     void getAsmBlockArgumentNames(mlir::Region &region,
@@ -241,7 +234,7 @@ def FIntModuleOp : FIRRTLModuleLike<"intmodule"> {
   let description = [{
     The "firrtl.intmodule" operation represents a compiler intrinsic.
   }];
-  let arguments = 
+  let arguments =
       (ins SymbolNameAttr:$sym_name,
            StrAttr:$intrinsic,
            ParamDeclArrayAttr:$parameters,
@@ -253,7 +246,8 @@ def FIntModuleOp : FIRRTLModuleLike<"intmodule"> {
            ArrayRefAttr:$portTypes,
            DefaultValuedAttr<AnnotationArrayAttr, "ArrayAttr()">:$annotations,
            DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
-           OptionalAttr<InternalPathArrayAttr>:$internalPaths
+           OptionalAttr<InternalPathArrayAttr>:$internalPaths,
+           DefaultValuedAttr<ArrayRefAttr, "{}">:$domainInfo
       );
   let results = (outs);
   let regions = (region AnyRegion:$body);
@@ -300,10 +294,13 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
            ArrayRefAttr:$portSymbols,
            ArrayRefAttr:$portNames,
            ArrayRefAttr:$portTypes,
+           DefaultValuedAttr<RUWBehaviorAttr,
+             "firrtl::RUWBehavior::Undefined">:$ruw,
            AnnotationArrayAttr:$annotations,
-           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers
+           DefaultValuedAttr<LayerArrayAttr, "{}">:$layers,
+           DefaultValuedAttr<ArrayRefAttr, "{}">:$domainInfo
       );
-      
+
   let results = (outs);
   let regions = (region AnyRegion:$body);
 
@@ -314,6 +311,8 @@ def FMemModuleOp : FIRRTLModuleLike<"memmodule"> {
                    "uint32_t":$numReadWritePorts, "uint32_t":$dataWidth,
                    "uint32_t":$maskBits, "uint32_t":$readLatency,
                    "uint32_t":$writeLatency, "uint64_t":$depth,
+                   CArg<"firrtl::RUWBehavior",
+                    "firrtl::RUWBehavior::Undefined">:$ruw,
                    CArg<"ArrayAttr", "ArrayAttr()">:$annotations,
                    CArg<"ArrayAttr", "ArrayAttr()">:$layers)>
   ];
@@ -349,7 +348,8 @@ def ClassOp : FIRRTLModuleLike<"class", [
   let arguments = (ins SymbolNameAttr:$sym_name,
                        DenseBoolArrayAttr:$portDirections,
                        ArrayRefAttr:$portNames, ArrayRefAttr:$portTypes,
-                       ArrayRefAttr:$portSymbols, ArrayRefAttr:$portLocations);
+                       ArrayRefAttr:$portSymbols, ArrayRefAttr:$portLocations,
+                       DefaultValuedAttr<ArrayRefAttr, "{}">:$domainInfo);
   let results = (outs);
   let regions = (region SizedRegion<1>:$body);
 
@@ -418,10 +418,11 @@ def ExtClassOp : FIRRTLModuleLike<"extclass", [
     firrtl.extclass @MyImportedClass(in in_str: !firrtl.string, out out_str: !firrtl.string)
     ```
   }];
-  let arguments = (ins SymbolNameAttr:$sym_name, 
+  let arguments = (ins SymbolNameAttr:$sym_name,
                        DenseBoolArrayAttr:$portDirections,
                        ArrayRefAttr:$portNames, ArrayRefAttr:$portTypes,
-                       ArrayRefAttr:$portSymbols, ArrayRefAttr:$portLocations);
+                       ArrayRefAttr:$portSymbols, ArrayRefAttr:$portLocations,
+                       DefaultValuedAttr<ArrayRefAttr, "{}">:$domainInfo);
   let results = (outs);
   let regions = (region AnyRegion:$body);
   let skipDefaultBuilders = 1;
@@ -460,7 +461,6 @@ def LayerOp : FIRRTLOp<
   let assemblyFormat = [{
     $sym_name `` $convention attr-dict-with-keyword $body
   }];
-  let hasVerifier = 1;
 }
 
 def OptionOp : FIRRTLOp<"option", [
@@ -523,8 +523,8 @@ def FormalOp : FIRRTLOp<"formal", [
   let summary = "Define a formal unit test";
   let description = [{
     The `firrtl.formal` operation defines a formal verification unit test. The
-    defines a unique symbol name that can be used to refer to it. The design to
-    be tested and any necessary test harness is defined by the separate
+    op defines a unique symbol name that can be used to refer to it. The design
+    to be tested and any necessary test harness is defined by the separate
     `firrtl.module` op referenced by `moduleName`. Additional parameters may be
     specified for the unit test. Input ports of the target module are considered
     to be symbolic values during the test; output ports are ignored.
@@ -548,6 +548,77 @@ def FormalOp : FIRRTLOp<"formal", [
   );
   let assemblyFormat = [{
     $sym_name `,` $moduleName $parameters attr-dict-with-keyword
+  }];
+}
+
+def SimulationOp : FIRRTLOp<"simulation", [
+  HasParent<"firrtl::CircuitOp">,
+  DeclareOpInterfaceMethods<Symbol>,
+  DeclareOpInterfaceMethods<SymbolUserOpInterface>
+]> {
+  let summary = "Define a simulation unit test";
+  let description = [{
+    The `firrtl.simulation` operation defines a simulation unit test. The op
+    defines a unique symbol name that can be used to refer to it. The design to
+    be tested and any necessary test harness is defined by the separate
+    `firrtl.module` op referenced by `moduleName`. Additional parameters may be
+    specified for the unit test. The target module must have the following port
+    signature:
+
+    ```mlir
+    (
+      in %clock: !firrtl.clock,
+      in %init: !firrtl.uint<1>,
+      out %done: !firrtl.uint<1>,
+      out %success: !firrtl.uint<1>
+    )
+    ```
+
+    This operation may be used to mark unit tests in a FIRRTL design, which
+    other tools may later pick up and run automatically. It is intended to lower
+    to the `verif.simulation` operation. See `verif.simulation` for more
+    details.
+
+    Example:
+    ```mlir
+    firrtl.extmodule @MyTest(
+      in clock: !firrtl.clock,
+      in init: !firrtl.uint<1>,
+      out done: !firrtl.uint<1>,
+      out success: !firrtl.uint<1>
+    )
+    firrtl.simulation @myTestA, @MyTest {bound = 1000}
+    firrtl.simulation @myTestB, @MyTest {asserts = "error", userAttr = 9001}
+    ```
+  }];
+
+  let arguments = (ins
+    SymbolNameAttr:$sym_name,
+    FlatSymbolRefAttr:$moduleName,
+    DictionaryAttr:$parameters
+  );
+  let assemblyFormat = [{
+    $sym_name `,` $moduleName $parameters attr-dict-with-keyword
+  }];
+}
+
+def DomainOp : FIRRTLOp<"domain", [
+  DeclareOpInterfaceMethods<Symbol>,
+  HasParent<"firrtl::CircuitOp">,
+  NoTerminator,
+  SingleBlock
+]> {
+  let summary = "Define a domain type";
+  let description = [{
+    A `firrtl.domain` operation defines a type of domain that exists in this
+    circuit.  E.g., this can be used to declare a `ClockDomain` type when
+    modeling clocks in FIRRTL Dialect.
+  }];
+  let arguments = (ins SymbolNameAttr:$sym_name);
+  let results = (outs);
+  let regions = (region SizedRegion<1>:$body);
+  let assemblyFormat = [{
+    $sym_name attr-dict-with-keyword $body
   }];
 }
 

@@ -113,7 +113,7 @@ def DefineOp : ArcOp<"define", [
 
 def OutputOp : ArcOp<"output", [
   Terminator,
-  ParentOneOf<["DefineOp", "LutOp", "ClockDomainOp"]>,
+  ParentOneOf<["DefineOp", "LutOp", "ClockDomainOp", "ExecuteOp"]>,
   Pure,
   ReturnLike
 ]> {
@@ -123,7 +123,7 @@ def OutputOp : ArcOp<"output", [
     attr-dict ($outputs^ `:` qualified(type($outputs)))?
   }];
   let builders = [OpBuilder<(ins), [{
-    build($_builder, $_state, std::nullopt);
+    build($_builder, $_state, mlir::ValueRange());
   }]>];
   let hasVerifier = 1;
 }
@@ -138,7 +138,7 @@ def StateOp : ArcOp<"state", [
     CPred<[{getInitials().empty() ||
               llvm::equal(getInitials().getType(), getResults().getType())}]>>
 ]> {
-  let summary = "State transfer arc";
+  let summary = "Instantiates a state element with input from a transfer arc";
 
   let arguments = (ins
     FlatSymbolRefAttr:$arc,
@@ -597,6 +597,35 @@ def StateWriteOp : ArcOp<"state_write", [
   let assemblyFormat = [{
     $state `=` $value (`if` $condition^)? attr-dict `:` type($state)
   }];
+}
+
+//===----------------------------------------------------------------------===//
+// Procedural Ops
+//===----------------------------------------------------------------------===//
+
+def ExecuteOp : ArcOp<"execute", [
+  IsolatedFromAbove,
+  RecursiveMemoryEffects,
+]> {
+  let summary = "Execute an SSACFG region";
+  let description = [{
+    The `arc.execute` op allows an SSACFG region to be embedded in a parent
+    graph region, or another SSACFG region. Whenever execution reaches this op,
+    its body region is executed and the results yielded from the body are
+    produced as the `arc.execute` op's results. The op is isolated from above.
+    Any SSA values defined outside the op that are used inside the body have to
+    be captured as operands and then referred to as entry block arguments in the
+    body.
+  }];
+  let arguments = (ins Variadic<AnyType>:$inputs);
+  let results = (outs Variadic<AnyType>:$results);
+  let regions = (region MinSizedRegion<1>:$body);
+  let assemblyFormat = [{
+    (` ` `(` $inputs^ `:` type($inputs) `)`)?
+    (`->` `(` type($results)^ `)`)?
+    attr-dict-with-keyword $body
+  }];
+  let hasRegionVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//

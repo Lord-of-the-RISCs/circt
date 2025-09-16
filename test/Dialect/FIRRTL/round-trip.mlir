@@ -1,4 +1,4 @@
-// RUN: circt-opt %s | circt-opt | FileCheck %s
+// RUN: circt-opt --verify-roundtrip %s | FileCheck %s
 // Basic MLIR operation parser round-tripping
 
 firrtl.circuit "Basic" attributes {
@@ -155,25 +155,92 @@ firrtl.module @PropertyListOps() {
   %concat = firrtl.list.concat %l0, %l1 : !firrtl.list<integer>
 }
 
-// CHECK: firrtl.formal @myTestA, @Top {}
-firrtl.formal @myTestA, @Top {}
-// CHECK: firrtl.formal @myTestB, @Top {bound = 42 : i19}
-firrtl.formal @myTestB, @Top {bound = 42 : i19}
-// CHECK: firrtl.formal @myTestC, @Top {} attributes {foo}
-firrtl.formal @myTestC, @Top {} attributes {foo}
+firrtl.formal @myFormalTestA, @Top {}
+firrtl.formal @myFormalTestB, @Top {bound = 42 : i19}
+firrtl.formal @myFormalTestC, @Top {} attributes {foo}
 
-// CHECK-LABEL: firrtl.module @Contracts
+firrtl.simulation @mySimulationTestA, @SimulationTop {}
+firrtl.simulation @mySimulationTestB, @SimulationTop {bound = 42 : i19}
+firrtl.simulation @mySimulationTestC, @SimulationTop {} attributes {foo}
+
+firrtl.extmodule @SimulationTop(
+  in clock: !firrtl.clock,
+  in init: !firrtl.uint<1>,
+  out done: !firrtl.uint<1>,
+  out success: !firrtl.uint<1>
+)
+
 firrtl.module @Contracts(in %a: !firrtl.uint<42>, in %b: !firrtl.bundle<x: uint<1337>>) {
-  // CHECK: firrtl.contract {
-  // CHECK: }
   firrtl.contract {}
-
-  // CHECK: {{%.+}}:2 = firrtl.contract %a, %b : !firrtl.uint<42>, !firrtl.bundle<x: uint<1337>> {
-  // CHECK: ^bb0(%arg0: !firrtl.uint<42>, %arg1: !firrtl.bundle<x: uint<1337>>):
-  // CHECK: }
   firrtl.contract %a, %b : !firrtl.uint<42>, !firrtl.bundle<x: uint<1337>> {
   ^bb0(%arg0: !firrtl.uint<42>, %arg1: !firrtl.bundle<x: uint<1337>>):
   }
+}
+
+// Format string support
+// CHECK-LABEL: firrtl.module @FormatString
+firrtl.module @FormatString() {
+
+  // CHECK-NEXT: %time = firrtl.fstring.time : !firrtl.fstring
+  %time = firrtl.fstring.time : !firrtl.fstring
+
+}
+
+// CHECK-LABEL: firrtl.module @Fprintf
+firrtl.module @Fprintf(
+  in %clock : !firrtl.clock,
+  in %reset : !firrtl.reset,
+  in %a : !firrtl.uint<1>
+) {
+  // CHECK-NEXT: firrtl.fprintf %clock, %a, "test%d.txt"(%a), "%x, %b"(%a, %reset) {name = "foo"} : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.reset
+  firrtl.fprintf %clock, %a, "test%d.txt"(%a), "%x, %b"(%a, %reset) {name = "foo"} : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.reset
+}
+
+// CHECK-LABEL: firrtl.domain @ClockDomain
+firrtl.domain @ClockDomain {
+}
+
+firrtl.module @DomainsSubmodule(
+  in %A: !firrtl.domain of @ClockDomain,
+  in %a: !firrtl.uint<1> domains [%A]
+) {}
+
+// CHECK-LABEL: firrtl.module @Domains(
+// CHECK-SAME:    in %A: !firrtl.domain
+// CHECK-SAME:    in %B: !firrtl.domain
+// CHECK-SAME:    in %a: !firrtl.uint<1> domains [%A]
+// CHECK-SAME:    out %b: !firrtl.uint<1> domains [%B]
+firrtl.module @Domains(
+  in %A: !firrtl.domain of @ClockDomain,
+  in %B: !firrtl.domain of @ClockDomain,
+  in %a: !firrtl.uint<1> domains [%A],
+  out %b: !firrtl.uint<1> domains [%B]
+) {
+  // CHECK: %0 = firrtl.unsafe_domain_cast %a domains %B : !firrtl.uint<1>
+  %0 = firrtl.unsafe_domain_cast %a domains %B : !firrtl.uint<1>
+  firrtl.matchingconnect %b, %0 : !firrtl.uint<1>
+
+  // CHECK:      %foo_A, %foo_a = firrtl.instance foo @DomainsSubmodule(
+  // CHECK-SAME:   in A: !firrtl.domain of @ClockDomain
+  // CHECK-SAME:   in a: !firrtl.uint<1> domains [A]
+  %foo_A, %foo_a = firrtl.instance foo @DomainsSubmodule(
+    in A: !firrtl.domain of @ClockDomain,
+    in a: !firrtl.uint<1> domains [A]
+  )
+}
+
+// CHECK-LABEL: firrtl.module @AnonymousDomains
+// CHECK-SAME:    in %arg0: !firrtl.domain
+// CHECK-SAME:    in %a: !firrtl.uint<1> domains [%arg0]
+// CHECK-SAME:    portNames = ["", "a"]
+firrtl.module @AnonymousDomains(
+  in %arg0: !firrtl.domain of @ClockDomain,
+  in %a: !firrtl.uint<1> domains [%arg0]
+) attributes {
+  portNames = ["", "a"]
+} {
+  // CHECK: %0 = firrtl.unsafe_domain_cast %a domains %arg0 : !firrtl.uint<1>
+  %0 = firrtl.unsafe_domain_cast %a domains %arg0 : !firrtl.uint<1>
 }
 
 }

@@ -36,6 +36,23 @@ namespace circt {
 using namespace circt;
 using namespace sim;
 
+/// Check whether an op should be placed inside an ifdef guard that prevents it
+/// from affecting synthesis runs.
+static bool needsIfdefGuard(Operation *op) {
+  return isa<ClockedTerminateOp, ClockedPauseOp, TerminateOp, PauseOp>(op);
+}
+
+/// Check whether an op should be placed inside an always process triggered on a
+/// clock, and an if statement checking for a condition.
+static std::pair<Value, Value> needsClockAndConditionWrapper(Operation *op) {
+  return TypeSwitch<Operation *, std::pair<Value, Value>>(op)
+      .Case<ClockedTerminateOp, ClockedPauseOp>(
+          [](auto op) -> std::pair<Value, Value> {
+            return {op.getClock(), op.getCondition()};
+          })
+      .Default({});
+}
+
 namespace {
 
 struct SimConversionState {
@@ -65,13 +82,13 @@ public:
                   ConversionPatternRewriter &rewriter) const final {
     auto loc = op.getLoc();
     auto resultType = rewriter.getIntegerType(1);
-    auto str = rewriter.create<sv::ConstantStrOp>(loc, op.getFormatString());
-    auto reg = rewriter.create<sv::RegOp>(loc, resultType,
-                                          rewriter.getStringAttr("_pargs"));
-    rewriter.create<sv::InitialOp>(loc, [&] {
-      auto call = rewriter.create<sv::SystemFunctionOp>(
-          loc, resultType, "test$plusargs", ArrayRef<Value>{str});
-      rewriter.create<sv::BPAssignOp>(loc, reg, call);
+    auto str = sv::ConstantStrOp::create(rewriter, loc, op.getFormatString());
+    auto reg = sv::RegOp::create(rewriter, loc, resultType,
+                                 rewriter.getStringAttr("_pargs"));
+    sv::InitialOp::create(rewriter, loc, [&] {
+      auto call = sv::SystemFunctionOp::create(
+          rewriter, loc, resultType, "test$plusargs", ArrayRef<Value>{str});
+      sv::BPAssignOp::create(rewriter, loc, reg, call);
     });
 
     rewriter.replaceOpWithNewOp<sv::ReadInOutOp>(op, reg);
@@ -93,18 +110,18 @@ public:
     auto i1ty = rewriter.getIntegerType(1);
     auto type = op.getResult().getType();
 
-    auto regv = rewriter.create<sv::RegOp>(loc, type,
-                                           rewriter.getStringAttr("_pargs_v_"));
-    auto regf = rewriter.create<sv::RegOp>(loc, i1ty,
-                                           rewriter.getStringAttr("_pargs_f"));
+    auto wirev = sv::WireOp::create(rewriter, loc, type,
+                                    rewriter.getStringAttr("_pargs_v"));
+    auto wiref = sv::WireOp::create(rewriter, loc, i1ty,
+                                    rewriter.getStringAttr("_pargs_f"));
 
     state.usedSynthesisMacro = true;
-    rewriter.create<sv::IfDefOp>(
-        loc, "SYNTHESIS",
+    sv::IfDefOp::create(
+        rewriter, loc, "SYNTHESIS",
         [&]() {
-          auto cstFalse = rewriter.create<hw::ConstantOp>(loc, APInt(1, 0));
-          auto cstZ = rewriter.create<sv::ConstantZOp>(loc, type);
-          auto assignZ = rewriter.create<sv::AssignOp>(loc, regv, cstZ);
+          auto cstFalse = hw::ConstantOp::create(rewriter, loc, APInt(1, 0));
+          auto cstZ = sv::ConstantZOp::create(rewriter, loc, type);
+          auto assignZ = sv::AssignOp::create(rewriter, loc, wirev, cstZ);
           circt::sv::setSVAttributes(
               assignZ,
               sv::SVAttributeAttr::get(
@@ -112,63 +129,65 @@ public:
                   "This dummy assignment exists to avoid undriven lint "
                   "warnings (e.g., Verilator UNDRIVEN).",
                   /*emitAsComment=*/true));
-          rewriter.create<sv::AssignOp>(loc, regf, cstFalse);
+          sv::AssignOp::create(rewriter, loc, wiref, cstFalse);
         },
         [&]() {
-          rewriter.create<sv::InitialOp>(loc, [&] {
-            auto zero32 = rewriter.create<hw::ConstantOp>(loc, APInt(32, 0));
-            auto tmpResultType = rewriter.getIntegerType(32);
+          auto i32ty = rewriter.getIntegerType(32);
+          auto regf = sv::RegOp::create(rewriter, loc, i32ty,
+                                        rewriter.getStringAttr("_found"));
+          auto regv = sv::RegOp::create(rewriter, loc, type,
+                                        rewriter.getStringAttr("_value"));
+          sv::InitialOp::create(rewriter, loc, [&] {
             auto str =
-                rewriter.create<sv::ConstantStrOp>(loc, op.getFormatString());
-            auto call = rewriter.create<sv::SystemFunctionOp>(
-                loc, tmpResultType, "value$plusargs",
+                sv::ConstantStrOp::create(rewriter, loc, op.getFormatString());
+            auto call = sv::SystemFunctionOp::create(
+                rewriter, loc, i32ty, "value$plusargs",
                 ArrayRef<Value>{str, regv});
-            auto test = rewriter.create<comb::ICmpOp>(
-                loc, comb::ICmpPredicate::ne, call, zero32, true);
-            rewriter.create<sv::BPAssignOp>(loc, regf, test);
+            sv::BPAssignOp::create(rewriter, loc, regf, call);
           });
+          Value readRegF = sv::ReadInOutOp::create(rewriter, loc, regf);
+          Value readRegV = sv::ReadInOutOp::create(rewriter, loc, regv);
+          auto cstTrue = hw::ConstantOp::create(rewriter, loc, i32ty, 1);
+          // Squash any X coming from the regf to 0.
+          auto cmp = comb::ICmpOp::create(
+              rewriter, loc, comb::ICmpPredicate::ceq, readRegF, cstTrue);
+          sv::AssignOp::create(rewriter, loc, wiref, cmp);
+          sv::AssignOp::create(rewriter, loc, wirev, readRegV);
         });
 
-    Value readf = rewriter.create<sv::ReadInOutOp>(loc, regf);
-    Value readv = rewriter.create<sv::ReadInOutOp>(loc, regv);
-
-    auto cstTrue = rewriter.create<hw::ConstantOp>(loc, APInt(1, 1));
-    readf = rewriter.create<comb::ICmpOp>(loc, comb::ICmpPredicate::ceq, readf,
-                                          cstTrue);
+    Value readf = sv::ReadInOutOp::create(rewriter, loc, wiref);
+    Value readv = sv::ReadInOutOp::create(rewriter, loc, wirev);
 
     rewriter.replaceOp(op, {readf, readv});
     return success();
   }
 };
 
-template <typename FromOp, typename ToOp>
-class SimulatorStopLowering : public SimConversionPattern<FromOp> {
-public:
-  using SimConversionPattern<FromOp>::SimConversionPattern;
+static LogicalResult convert(ClockedTerminateOp op, PatternRewriter &rewriter) {
+  if (op.getSuccess())
+    rewriter.replaceOpWithNewOp<sv::FinishOp>(op, op.getVerbose());
+  else
+    rewriter.replaceOpWithNewOp<sv::FatalOp>(op, op.getVerbose());
+  return success();
+}
 
-  LogicalResult
-  matchAndRewrite(FromOp op, typename FromOp::Adaptor adaptor,
-                  ConversionPatternRewriter &rewriter) const final {
-    auto loc = op.getLoc();
+static LogicalResult convert(ClockedPauseOp op, PatternRewriter &rewriter) {
+  rewriter.replaceOpWithNewOp<sv::StopOp>(op, op.getVerbose());
+  return success();
+}
 
-    Value clockCast = rewriter.create<seq::FromClockOp>(loc, adaptor.getClk());
+static LogicalResult convert(TerminateOp op, PatternRewriter &rewriter) {
+  if (op.getSuccess())
+    rewriter.replaceOpWithNewOp<sv::FinishOp>(op, op.getVerbose());
+  else
+    rewriter.replaceOpWithNewOp<sv::FatalOp>(op, op.getVerbose());
+  return success();
+}
 
-    this->state.usedSynthesisMacro = true;
-    rewriter.create<sv::IfDefOp>(
-        loc, "SYNTHESIS", [&] {},
-        [&] {
-          rewriter.create<sv::AlwaysOp>(
-              loc, sv::EventControl::AtPosEdge, clockCast, [&] {
-                rewriter.create<sv::IfOp>(loc, adaptor.getCond(),
-                                          [&] { rewriter.create<ToOp>(loc); });
-              });
-        });
-
-    rewriter.eraseOp(op);
-
-    return success();
-  }
-};
+static LogicalResult convert(PauseOp op, PatternRewriter &rewriter) {
+  rewriter.replaceOpWithNewOp<sv::StopOp>(op, op.getVerbose());
+  return success();
+}
 
 class DPICallLowering : public SimConversionPattern<DPICallOp> {
 public:
@@ -188,49 +207,50 @@ public:
     SmallVector<Value> reads;
     for (auto [type, result] :
          llvm::zip(op.getResultTypes(), op.getResults())) {
-      temporaries.push_back(rewriter.create<sv::RegOp>(op.getLoc(), type));
+      temporaries.push_back(sv::RegOp::create(rewriter, op.getLoc(), type));
       reads.push_back(
-          rewriter.create<sv::ReadInOutOp>(op.getLoc(), temporaries.back()));
+          sv::ReadInOutOp::create(rewriter, op.getLoc(), temporaries.back()));
     }
 
     auto emitCall = [&]() {
-      auto call = rewriter.create<sv::FuncCallProceduralOp>(
-          op.getLoc(), op.getResultTypes(), op.getCalleeAttr(),
+      auto call = sv::FuncCallProceduralOp::create(
+          rewriter, op.getLoc(), op.getResultTypes(), op.getCalleeAttr(),
           adaptor.getInputs());
       for (auto [lhs, rhs] : llvm::zip(temporaries, call.getResults())) {
         if (isClockedCall)
-          rewriter.create<sv::PAssignOp>(op.getLoc(), lhs, rhs);
+          sv::PAssignOp::create(rewriter, op.getLoc(), lhs, rhs);
         else
-          rewriter.create<sv::BPAssignOp>(op.getLoc(), lhs, rhs);
+          sv::BPAssignOp::create(rewriter, op.getLoc(), lhs, rhs);
       }
     };
     if (isClockedCall) {
       Value clockCast =
-          rewriter.create<seq::FromClockOp>(loc, adaptor.getClock());
-      rewriter.create<sv::AlwaysOp>(
-          loc, ArrayRef<sv::EventControl>{sv::EventControl::AtPosEdge},
+          seq::FromClockOp::create(rewriter, loc, adaptor.getClock());
+      sv::AlwaysOp::create(
+          rewriter, loc,
+          ArrayRef<sv::EventControl>{sv::EventControl::AtPosEdge},
           ArrayRef<Value>{clockCast}, [&]() {
             if (!hasEnable)
               return emitCall();
-            rewriter.create<sv::IfOp>(op.getLoc(), adaptor.getEnable(),
-                                      emitCall);
+            sv::IfOp::create(rewriter, op.getLoc(), adaptor.getEnable(),
+                             emitCall);
           });
     } else {
       // Unclocked call is lowered into always_comb.
       // TODO: If there is a return value and no output argument, use an
       // unclocked call op.
-      rewriter.create<sv::AlwaysCombOp>(loc, [&]() {
+      sv::AlwaysCombOp::create(rewriter, loc, [&]() {
         if (!hasEnable)
           return emitCall();
         auto assignXToResults = [&] {
           for (auto lhs : temporaries) {
-            auto xValue = rewriter.create<sv::ConstantXOp>(
-                op.getLoc(), lhs.getType().getElementType());
-            rewriter.create<sv::BPAssignOp>(op.getLoc(), lhs, xValue);
+            auto xValue = sv::ConstantXOp::create(
+                rewriter, op.getLoc(), lhs.getType().getElementType());
+            sv::BPAssignOp::create(rewriter, op.getLoc(), lhs, xValue);
           }
         };
-        rewriter.create<sv::IfOp>(op.getLoc(), adaptor.getEnable(), emitCall,
-                                  assignXToResults);
+        sv::IfOp::create(rewriter, op.getLoc(), adaptor.getEnable(), emitCall,
+                         assignXToResults);
       });
     }
 
@@ -265,24 +285,25 @@ void LowerDPIFunc::lower(sim::DPIFuncOp func) {
   }
 
   auto svFuncDecl =
-      builder.create<sv::FuncOp>(func.getSymNameAttr(), func.getModuleType(),
-                                 func.getPerArgumentAttrsAttr(), inputLocsAttr,
-                                 outputLocsAttr, func.getVerilogNameAttr());
+      sv::FuncOp::create(builder, func.getSymNameAttr(), func.getModuleType(),
+                         func.getPerArgumentAttrsAttr(), inputLocsAttr,
+                         outputLocsAttr, func.getVerilogNameAttr());
   // DPI function is a declaration so it must be a private function.
   svFuncDecl.setPrivate();
   auto name = builder.getStringAttr(nameSpace.newName(
       func.getSymNameAttr().getValue(), "dpi_import_fragument"));
 
   // Add include guards to avoid duplicate declarations. See Issue 7458.
-  auto macroDecl = builder.create<sv::MacroDeclOp>(nameSpace.newName(
-      "__CIRCT_DPI_IMPORT", func.getSymNameAttr().getValue().upper()));
-  builder.create<emit::FragmentOp>(name, [&]() {
-    builder.create<sv::IfDefOp>(
-        macroDecl.getSymNameAttr(), []() {},
+  auto macroDecl = sv::MacroDeclOp::create(
+      builder, nameSpace.newName("__CIRCT_DPI_IMPORT",
+                                 func.getSymNameAttr().getValue().upper()));
+  emit::FragmentOp::create(builder, name, [&]() {
+    sv::IfDefOp::create(
+        builder, macroDecl.getSymNameAttr(), []() {},
         [&]() {
-          builder.create<sv::FuncDPIImportOp>(func.getSymNameAttr(),
-                                              StringAttr());
-          builder.create<sv::MacroDefOp>(macroDecl.getSymNameAttr(), "");
+          sv::FuncDPIImportOp::create(builder, func.getSymNameAttr(),
+                                      StringAttr());
+          sv::MacroDefOp::create(builder, macroDecl.getSymNameAttr(), "");
         });
   });
 
@@ -308,6 +329,96 @@ void LowerDPIFunc::addFragments(hw::HWModuleOp module,
         ArrayAttr::get(module.getContext(), fragments.takeVector()));
 }
 
+static bool moveOpsIntoIfdefGuardsAndProcesses(Operation *rootOp) {
+  bool usedSynthesisMacro = false;
+
+  rootOp->walk([&](Operation *op) {
+    auto loc = op->getLoc();
+
+    // Move the op into an ifdef guard if needed.
+    if (needsIfdefGuard(op)) {
+      // Try to reuse an ifdef guard immediately before the op.
+      Block *block = nullptr;
+      if (op->getPrevNode())
+        block = TypeSwitch<Operation *, Block *>(op->getPrevNode())
+                    .Case<sv::IfDefOp, sv::IfDefProceduralOp>(
+                        [&](auto guardOp) -> Block * {
+                          if (guardOp.getCond().getIdent().getAttr() ==
+                                  "SYNTHESIS" &&
+                              guardOp.hasElse())
+                            return guardOp.getElseBlock();
+                          return nullptr;
+                        })
+                    .Default([](auto) { return nullptr; });
+
+      // If there was no pre-existing guard, create one.
+      if (!block) {
+        OpBuilder builder(op);
+        if (op->getParentOp()->hasTrait<sv::ProceduralRegion>())
+          block = sv::IfDefProceduralOp::create(
+                      builder, loc, "SYNTHESIS", [] {}, [] {})
+                      .getElseBlock();
+        else
+          block = sv::IfDefOp::create(
+                      builder, loc, "SYNTHESIS", [] {}, [] {})
+                      .getElseBlock();
+        usedSynthesisMacro = true;
+      }
+
+      // Move the op into the guard block.
+      op->moveBefore(block, block->end());
+    }
+
+    // Check if the op requires an clock and condition wrapper.
+    auto [clock, condition] = needsClockAndConditionWrapper(op);
+
+    // Create an enclosing always process.
+    if (clock) {
+      // Try to reuse an always process immediately before the op.
+      Block *block = nullptr;
+      if (auto alwaysOp = dyn_cast_or_null<sv::AlwaysOp>(op->getPrevNode()))
+        if (alwaysOp.getNumConditions() == 1 &&
+            alwaysOp.getCondition(0).event == sv::EventControl::AtPosEdge)
+          if (auto clockOp = alwaysOp.getCondition(0)
+                                 .value.getDefiningOp<seq::FromClockOp>())
+            if (clockOp.getInput() == clock)
+              block = alwaysOp.getBodyBlock();
+
+      // If there was no pre-existing always process, create one.
+      if (!block) {
+        OpBuilder builder(op);
+        clock = seq::FromClockOp::create(builder, loc, clock);
+        block = sv::AlwaysOp::create(builder, loc, sv::EventControl::AtPosEdge,
+                                     clock, [] {})
+                    .getBodyBlock();
+      }
+
+      // Move the op into the process.
+      op->moveBefore(block, block->end());
+    }
+
+    // Create an enclosing if condition.
+    if (condition) {
+      // Try to reuse an if statement immediately before the op.
+      Block *block = nullptr;
+      if (auto ifOp = dyn_cast_or_null<sv::IfOp>(op->getPrevNode()))
+        if (ifOp.getCond() == condition)
+          block = ifOp.getThenBlock();
+
+      // If there was no pre-existing if statement, create one.
+      if (!block) {
+        OpBuilder builder(op);
+        block = sv::IfOp::create(builder, loc, condition, [] {}).getThenBlock();
+      }
+
+      // Move the op into the if body.
+      op->moveBefore(block, block->end());
+    }
+  });
+
+  return usedSynthesisMacro;
+}
+
 namespace {
 struct SimToSVPass : public circt::impl::LowerSimToSVBase<SimToSVPass> {
   void runOnOperation() override {
@@ -322,6 +433,9 @@ struct SimToSVPass : public circt::impl::LowerSimToSVBase<SimToSVPass> {
 
     std::atomic<bool> usedSynthesisMacro = false;
     auto lowerModule = [&](hw::HWModuleOp module) {
+      if (moveOpsIntoIfdefGuardsAndProcesses(module))
+        usedSynthesisMacro = true;
+
       SimConversionState state;
       ConversionTarget target(*context);
       target.addIllegalDialect<SimDialect>();
@@ -333,10 +447,10 @@ struct SimToSVPass : public circt::impl::LowerSimToSVBase<SimToSVPass> {
       RewritePatternSet patterns(context);
       patterns.add<PlusArgsTestLowering>(context, state);
       patterns.add<PlusArgsValueLowering>(context, state);
-      patterns.add<SimulatorStopLowering<sim::FinishOp, sv::FinishOp>>(context,
-                                                                       state);
-      patterns.add<SimulatorStopLowering<sim::FatalOp, sv::FatalOp>>(context,
-                                                                     state);
+      patterns.add<ClockedTerminateOp>(convert);
+      patterns.add<ClockedPauseOp>(convert);
+      patterns.add<TerminateOp>(convert);
+      patterns.add<PauseOp>(convert);
       patterns.add<DPICallLowering>(context, state);
       auto result = applyPartialConversion(module, target, std::move(patterns));
 
@@ -365,7 +479,7 @@ struct SimToSVPass : public circt::impl::LowerSimToSVBase<SimToSVPass> {
       } else {
         auto builder = ImplicitLocOpBuilder::atBlockBegin(
             UnknownLoc::get(context), circuit.getBody());
-        builder.create<sv::MacroDeclOp>("SYNTHESIS");
+        sv::MacroDeclOp::create(builder, "SYNTHESIS");
       }
     }
   }

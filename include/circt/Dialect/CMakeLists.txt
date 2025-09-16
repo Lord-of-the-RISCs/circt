@@ -6,10 +6,10 @@
 ##
 ##===----------------------------------------------------------------------===//
 
-add_subdirectory(AIG)
 add_subdirectory(Arc)
 add_subdirectory(Calyx)
 add_subdirectory(Comb)
+add_subdirectory(Datapath)
 add_subdirectory(DC)
 add_subdirectory(Debug)
 add_subdirectory(Emit)
@@ -34,8 +34,8 @@ if (CIRCT_INCLUDE_TESTS)
 endif()
 add_subdirectory(Seq)
 add_subdirectory(Sim)
-add_subdirectory(SMT)
 add_subdirectory(SSP)
 add_subdirectory(SV)
+add_subdirectory(Synth)
 add_subdirectory(SystemC)
 add_subdirectory(Verif)

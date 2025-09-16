@@ -6,92 +6,8 @@ from __future__ import annotations
 
 from .rtg import rtg
 from .rtgtest import rtgtest
-from .core import Value
-from .circt import ir
-
-from typing import Union
-
-
-class Imm5(Value):
-
-  def __init__(self, value: Union[ir.Value, int]) -> Imm5:
-    self._value = value
-
-  def _get_ssa_value(self) -> ir.Value:
-    if isinstance(self._value, int):
-      self = rtgtest.ImmediateOp(rtgtest.Imm5Attr.get(self._value))
-    return self._value
-
-  def get_type(self) -> ir.Type:
-    return type()
-
-  def type(*args: ir.Type) -> ir.Type:
-    return rtgtest.Imm5Type.get()
-
-
-class Imm12(Value):
-
-  def __init__(self, value: Union[ir.Value, int]) -> Imm12:
-    self._value = value
-
-  def _get_ssa_value(self) -> ir.Value:
-    if isinstance(self._value, int):
-      self = rtgtest.ImmediateOp(rtgtest.Imm12Attr.get(self._value))
-    return self._value
-
-  def type(*args: ir.Type) -> ir.Type:
-    return rtgtest.Imm12Type.get()
-
-
-class Imm13(Value):
-
-  def __init__(self, value: Union[ir.Value, int]) -> Imm13:
-    self._value = value
-
-  def _get_ssa_value(self) -> ir.Value:
-    if isinstance(self._value, int):
-      self = rtgtest.ImmediateOp(rtgtest.Imm13Attr.get(self._value))
-    return self._value
-
-  def get_type(self) -> ir.Type:
-    return type()
-
-  def type(*args: ir.Type) -> ir.Type:
-    return rtgtest.Imm12Type.get()
-
-
-class Imm21(Value):
-
-  def __init__(self, value: Union[ir.Value, int]) -> Imm21:
-    self._value = value
-
-  def _get_ssa_value(self) -> ir.Value:
-    if isinstance(self._value, int):
-      self = rtgtest.ImmediateOp(rtgtest.Imm21Attr.get(self._value))
-    return self._value
-
-  def get_type(self) -> ir.Type:
-    return type()
-
-  def type(*args: ir.Type) -> ir.Type:
-    return rtgtest.Imm21Type.get()
-
-
-class Imm32(Value):
-
-  def __init__(self, value: Union[ir.Value, int]) -> Imm32:
-    self._value = value
-
-  def _get_ssa_value(self) -> ir.Value:
-    if isinstance(self._value, int):
-      self = rtgtest.ImmediateOp(rtgtest.Imm32Attr.get(self._value))
-    return self._value
-
-  def get_type(self) -> ir.Type:
-    return type()
-
-  def type(*args: ir.Type) -> ir.Type:
-    return rtgtest.Imm32Type.get()
+from .core import Value, Type
+from .base import ir
 
 
 class IntegerRegister(Value):
@@ -244,8 +160,17 @@ class IntegerRegister(Value):
   def _get_ssa_value(self) -> ir.Value:
     return self._value
 
-  def get_type(self) -> ir.Type:
-    return rtgtest.IntegerRegisterType.get()
+  def get_type(self) -> Type:
+    return IntegerRegisterType()
 
-  def type(*args) -> ir.Type:
+
+class IntegerRegisterType(Type):
+  """
+  Represents the type of integer registers.
+  """
+
+  def __eq__(self, other) -> bool:
+    return isinstance(other, IntegerRegisterType)
+
+  def _codegen(self):
     return rtgtest.IntegerRegisterType.get()

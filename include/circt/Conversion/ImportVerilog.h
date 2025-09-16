@@ -14,6 +14,7 @@
 #define CIRCT_CONVERSION_IMPORTVERILOG_H
 
 #include "circt/Support/LLVM.h"
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -137,6 +138,9 @@ struct ImportVerilogOptions {
 
   /// A list of library files to include in the compilation.
   std::vector<std::string> libraryFiles;
+
+  /// A list of command files to process for compilation.
+  std::vector<std::string> commandFiles;
 };
 
 /// Parse files in a source manager as Verilog source code and populate the

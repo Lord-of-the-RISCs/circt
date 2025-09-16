@@ -17,6 +17,7 @@ include "FIRRTLDialect.td"
 include "FIRRTLEnums.td"
 include "FIRRTLOpInterfaces.td"
 include "FIRRTLTypes.td"
+include "circt/Dialect/HW/HWAttributesNaming.td"
 include "circt/Dialect/HW/HWTypes.td"
 include "mlir/IR/SymbolInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
@@ -112,13 +113,55 @@ def PrintFOp : FIRRTLOp<"printf"> {
   let summary = "Formatted Print Statement";
 
   let arguments = (ins ClockType:$clock, UInt1Type:$cond, StrAttr:$formatString,
-                       Variadic<FIRRTLBaseType>:$substitutions, StrAttr:$name);
+                       Variadic<PrintfOperandType>:$substitutions, StrAttr:$name);
   let results = (outs);
 
   let assemblyFormat = [{
     $clock `,` $cond `,` $formatString `` custom<PrintfAttrs>(attr-dict) ` `
     (`(` $substitutions^ `)`)? `:` type($clock) `,` type($cond) (`,` qualified(type($substitutions))^)?
   }];
+}
+
+def FPrintFOp : FIRRTLOp<"fprintf", [AttrSizedOperandSegments]> {
+  let summary = "Formatted File Print Statement";
+
+  let description = [{
+    This operation is similar to the "firrtl.printf" operation, but it prints
+    to a file instead of stdout.
+  }];
+
+  let arguments = (ins ClockType:$clock, UInt1Type:$cond, StrAttr:$outputFile,
+                       Variadic<PrintfOperandType>:$outputFileSubstitutions,
+                       StrAttr:$formatString, Variadic<PrintfOperandType>:$substitutions,
+                       StrAttr:$name);
+  let results = (outs);
+  let hasCustomAssemblyFormat = 1;
+}
+
+def FFlushOp : FIRRTLOp<"fflush"> {
+  let summary = "FFlush statement";
+  let description = [{
+    This operation flushes the output buffer of the specified file descriptor. If
+    no file descriptor is specified, the output buffer of the default output
+    file descriptor is flushed.
+  }];
+
+  let arguments = (ins ClockType:$clock, UInt1Type:$cond,
+                       OptionalAttr<StrAttr>: $outputFile,
+                       Variadic<PrintfOperandType>:$outputFileSubstitutions);
+  let results = (outs);
+
+  let assemblyFormat = [{
+      $clock `,` $cond (`,` $outputFile `(` $outputFileSubstitutions^ `)`)?
+      attr-dict `:` type($clock) `,` type($cond)
+      (`,` qualified(type($outputFileSubstitutions))^)?
+  }];
+  let hasVerifier = 1;
+  let builders = [
+    OpBuilder<(ins "Value":$clock, "Value":$cond), [{
+      build(odsBuilder, odsState, clock, cond, {}, ValueRange{});
+    }]>
+  ];
 }
 
 def SkipOp : FIRRTLOp<"skip", [Pure]> {
@@ -326,6 +369,7 @@ def RefForceOp : FIRRTLOp<"ref.force",[ForceRefTypeConstraint<"dest", "src">]> {
   let assemblyFormat =
     "$clock `,` $predicate `,` $dest `,` $src attr-dict `:` type($clock) `,` type($predicate) `,` qualified(type($dest)) `,` qualified(type($src))";
   let hasCanonicalizer = 1;
+  let hasVerifier = 1;
 }
 def RefForceInitialOp : FIRRTLOp<"ref.force_initial",[ForceRefTypeConstraint<"dest", "src">]> {
   let summary = "FIRRTL force_initial statement";
@@ -334,6 +378,7 @@ def RefForceInitialOp : FIRRTLOp<"ref.force_initial",[ForceRefTypeConstraint<"de
   let assemblyFormat =
     "$predicate `,` $dest `,` $src attr-dict `:` type($predicate) `,` qualified(type($dest)) `,` qualified(type($src))";
   let hasCanonicalizer = 1;
+  let hasVerifier = 1;
 }
 def RefReleaseOp : FIRRTLOp<"ref.release"> {
   let summary = "FIRRTL release statement";
@@ -342,6 +387,7 @@ def RefReleaseOp : FIRRTLOp<"ref.release"> {
   let assemblyFormat =
     "$clock `,` $predicate `,` $dest attr-dict `:` type($clock) `,` type($predicate) `,` qualified(type($dest))";
   let hasCanonicalizer = 1;
+  let hasVerifier = 1;
 }
 def RefReleaseInitialOp : FIRRTLOp<"ref.release_initial"> {
   let summary = "FIRRTL release_initial statement";
@@ -349,6 +395,7 @@ def RefReleaseInitialOp : FIRRTLOp<"ref.release_initial"> {
   let arguments = (ins UInt1Type:$predicate, RWProbe:$dest);
   let assemblyFormat = "$predicate `,` $dest attr-dict `:` type($predicate) `,` qualified(type($dest))";
   let hasCanonicalizer = 1;
+  let hasVerifier = 1;
 }
 
 //===----------------------------------------------------------------------===//
@@ -406,6 +453,29 @@ def LayerBlockOp : FIRRTLOp<
   }];
   let hasVerifier = 1;
   let hasCanonicalizeMethod = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Bind Op
+//===----------------------------------------------------------------------===//
+
+def BindOp
+    : FIRRTLOp<"bind", [DeclareOpInterfaceMethods<InnerRefUserOpInterface>]> {
+  let summary = "Indirect instantiation statement";
+  let description = [{
+    Indirectly instantiate a module from the context of another module. BindOp
+    pairs with a `firrtl.instance` which tracks all information except the
+    emission point for the bind.
+
+    This op exists to aid in the progressive lowering of FIRRTL surface level
+    constructs, such as layers, to system verilog (sv dialect).
+  }];
+  let arguments = (ins InnerRefAttr:$instance);
+  let assemblyFormat = "$instance attr-dict";
+  let builders = [OpBuilder<(ins "StringAttr":$mod, "StringAttr":$name), [{
+      auto instance = hw::InnerRefAttr::get(mod, name);
+      build(odsBuilder, odsState, instance);
+    }]>];
 }
 
 #endif // CIRCT_DIALECT_FIRRTL_FIRRTLSTATEMENTS_TD

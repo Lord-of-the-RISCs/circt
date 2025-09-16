@@ -247,8 +247,9 @@ bool ExportVerilog::isVerilogExpression(Operation *op) {
   // These are SV dialect expressions.
   if (isa<ReadInOutOp, AggregateConstantOp, ArrayIndexInOutOp,
           IndexedPartSelectInOutOp, StructFieldInOutOp, IndexedPartSelectOp,
-          ParamValueOp, XMROp, XMRRefOp, SampledOp, EnumConstantOp,
-          SystemFunctionOp, UnpackedArrayCreateOp, UnpackedOpenArrayCastOp>(op))
+          ParamValueOp, XMROp, XMRRefOp, SampledOp, EnumConstantOp, SFormatFOp,
+          SystemFunctionOp, STimeOp, TimeOp, UnpackedArrayCreateOp,
+          UnpackedOpenArrayCastOp>(op))
     return true;
 
   // These are Verif dialect expressions.
@@ -742,7 +743,8 @@ static bool isExpressionUnableToInline(Operation *op,
 
   // StructCreateOp needs to be assigning to a named temporary so that types
   // are inferred properly by verilog
-  if (isa<StructCreateOp, UnionCreateOp, UnpackedArrayCreateOp>(op))
+  if (isa<StructCreateOp, UnionCreateOp, UnpackedArrayCreateOp, ArrayInjectOp>(
+          op))
     return true;
 
   // Aggregate literal syntax only works in an assignment expression, where
@@ -767,7 +769,7 @@ static bool isExpressionUnableToInline(Operation *op,
     //     assign bar = {{a}, {b}, {c}, {d}}[idx];
     //
     // To handle these, we push the subexpression into a temporary.
-    if (isa<ExtractOp, ArraySliceOp, ArrayGetOp, StructExtractOp,
+    if (isa<ExtractOp, ArraySliceOp, ArrayGetOp, ArrayInjectOp, StructExtractOp,
             UnionExtractOp, IndexedPartSelectOp>(user))
       if (use.getOperandNumber() == 0 && // ignore index operands.
           !isOkToBitSelectFrom(use.get()))
@@ -821,7 +823,8 @@ enum class BlockStatementCount { Zero, One, TwoOrMore };
 static BlockStatementCount countStatements(Block &block) {
   unsigned numStatements = 0;
   block.walk([&](Operation *op) {
-    if (isVerilogExpression(op) || isa<ltl::LTLDialect>(op->getDialect()))
+    if (isVerilogExpression(op) ||
+        isa_and_nonnull<ltl::LTLDialect>(op->getDialect()))
       return WalkResult::advance();
     numStatements +=
         TypeSwitch<Operation *, unsigned>(op)
@@ -2314,6 +2317,7 @@ private:
   SubExprInfo visitSV(SystemFunctionOp op);
   SubExprInfo visitSV(ReadInterfaceSignalOp op);
   SubExprInfo visitSV(XMROp op);
+  SubExprInfo visitSV(SFormatFOp op);
   SubExprInfo visitSV(XMRRefOp op);
   SubExprInfo visitVerbatimExprOp(Operation *op, ArrayAttr symbols);
   SubExprInfo visitSV(VerbatimExprOp op) {
@@ -2351,6 +2355,10 @@ private:
   // Sampled value functions
   SubExprInfo visitSV(SampledOp op);
 
+  // Time system functions
+  SubExprInfo visitSV(TimeOp op);
+  SubExprInfo visitSV(STimeOp op);
+
   // Other
   using TypeOpVisitor::visitTypeOp;
   SubExprInfo visitTypeOp(ConstantOp op);
@@ -2372,6 +2380,7 @@ private:
   // Comb Dialect Operations
   using CombinationalVisitor::visitComb;
   SubExprInfo visitComb(MuxOp op);
+  SubExprInfo visitComb(ReverseOp op);
   SubExprInfo visitComb(AddOp op) {
     assert(op.getNumOperands() == 2 && "prelowering should handle variadics");
     return emitBinary(op, Addition, "+");
@@ -3220,6 +3229,44 @@ SubExprInfo ExprEmitter::visitSV(SampledOp op) {
   return info;
 }
 
+SubExprInfo ExprEmitter::visitSV(SFormatFOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  ps << "$sformatf(";
+  ps.scopedBox(PP::ibox0, [&]() {
+    ps.writeQuotedEscaped(op.getFormatString());
+    // TODO: if any of these breaks, it'd be "nice" to break
+    // after the comma, instead of:
+    // $sformatf("...", a + b,
+    //         longexpr_goes
+    //         + here, c);
+    // (without forcing breaking between all elements, like braced list)
+    for (auto operand : op.getSubstitutions()) {
+      ps << "," << PP::space;
+      emitSubExpr(operand, LowestPrecedence);
+    }
+  });
+  ps << ")";
+  return {Symbol, IsUnsigned};
+}
+
+SubExprInfo ExprEmitter::visitSV(TimeOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  ps << "$time";
+  return {Symbol, IsUnsigned};
+}
+
+SubExprInfo ExprEmitter::visitSV(STimeOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  ps << "$stime";
+  return {Symbol, IsUnsigned};
+}
+
 SubExprInfo ExprEmitter::visitComb(MuxOp op) {
   // The ?: operator is right associative.
 
@@ -3257,6 +3304,17 @@ SubExprInfo ExprEmitter::visitComb(MuxOp op) {
 
     return {Conditional, signedness};
   });
+}
+
+SubExprInfo ExprEmitter::visitComb(ReverseOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  ps << "{<<{";
+  emitSubExpr(op.getInput(), LowestPrecedence);
+  ps << "}}";
+
+  return {Symbol, IsUnsigned};
 }
 
 SubExprInfo ExprEmitter::printStructCreate(
@@ -4000,6 +4058,7 @@ private:
   LogicalResult visitSV(InitialOp op);
   LogicalResult visitSV(CaseOp op);
   LogicalResult visitSV(FWriteOp op);
+  LogicalResult visitSV(FFlushOp op);
   LogicalResult visitSV(VerbatimOp op);
   LogicalResult visitSV(MacroRefOp op);
 
@@ -4050,6 +4109,7 @@ private:
   LogicalResult visitSV(InterfaceSignalOp op);
   LogicalResult visitSV(InterfaceModportOp op);
   LogicalResult visitSV(AssignInterfaceSignalOp op);
+  LogicalResult visitSV(MacroErrorOp op);
   LogicalResult visitSV(MacroDefOp op);
 
   void emitBlockAsStatement(Block *block,
@@ -4062,6 +4122,7 @@ private:
   LogicalResult visitSV(FuncCallProceduralOp op);
   LogicalResult visitSV(FuncCallOp op);
   LogicalResult visitSV(ReturnOp op);
+  LogicalResult visitSV(IncludeOp op);
 
 public:
   ModuleEmitter &emitter;
@@ -4451,6 +4512,20 @@ LogicalResult StmtEmitter::visitSV(ReturnOp op) {
   return emitOutputLikeOp(op, ports);
 }
 
+LogicalResult StmtEmitter::visitSV(IncludeOp op) {
+  startStatement();
+  ps << "`include" << PP::nbsp;
+
+  if (op.getStyle() == IncludeStyle::System)
+    ps << "<" << op.getTarget() << ">";
+  else
+    ps << "\"" << op.getTarget() << "\"";
+
+  emitLocationInfo(op.getLoc());
+  setPendingNewline();
+  return success();
+}
+
 LogicalResult StmtEmitter::visitSV(FuncDPIImportOp importOp) {
   startStatement();
 
@@ -4468,6 +4543,25 @@ LogicalResult StmtEmitter::visitSV(FuncDPIImportOp importOp) {
   assert(state.pendingNewline);
   ps << PP::newline;
 
+  return success();
+}
+
+LogicalResult StmtEmitter::visitSV(FFlushOp op) {
+  if (hasSVAttributes(op))
+    emitError(op, "SV attributes emission is unimplemented for the op");
+
+  startStatement();
+  SmallPtrSet<Operation *, 8> ops;
+  ops.insert(op);
+
+  ps.addCallback({op, true});
+  ps << "$fflush(";
+  if (auto fd = op.getFd())
+    ps.scopedBox(PP::ibox0, [&]() { emitExpression(op.getFd(), ops); });
+
+  ps << ");";
+  ps.addCallback({op, false});
+  emitLocationInfoAndNewLine(ops);
   return success();
 }
 
@@ -5647,6 +5741,13 @@ LogicalResult StmtEmitter::visitSV(AssignInterfaceSignalOp op) {
   return success();
 }
 
+LogicalResult StmtEmitter::visitSV(MacroErrorOp op) {
+  startStatement();
+  ps << "`" << op.getMacroIdentifier();
+  setPendingNewline();
+  return success();
+}
+
 LogicalResult StmtEmitter::visitSV(MacroDefOp op) {
   auto decl = op.getReferencedMacro(&state.symbolCache);
   // TODO: source info!
@@ -5677,7 +5778,7 @@ void StmtEmitter::emitStatement(Operation *op) {
 
   // Ignore LTL expressions as they are emitted as part of verification
   // statements. Ignore debug ops as they are emitted as part of debug info.
-  if (isa<ltl::LTLDialect, debug::DebugDialect>(op->getDialect()))
+  if (isa_and_nonnull<ltl::LTLDialect, debug::DebugDialect>(op->getDialect()))
     return;
 
   // Handle HW statements, SV statements.
@@ -5827,6 +5928,11 @@ LogicalResult StmtEmitter::emitDeclaration(Operation *op) {
   auto type = value.getType();
   auto word = getVerilogDeclWord(op, emitter);
   auto isZeroBit = isZeroBitType(type);
+
+  // LocalParams always need the bitwidth, otherwise they are considered to have
+  // an unknown size.
+  bool singleBitDefaultType = !isa<LocalParamOp>(op);
+
   ps.scopedBox(isZeroBit ? PP::neverbox : PP::ibox2, [&]() {
     unsigned targetColumn = 0;
     unsigned column = 0;
@@ -5850,7 +5956,8 @@ LogicalResult StmtEmitter::emitDeclaration(Operation *op) {
     {
       llvm::raw_svector_ostream stringStream(typeString);
       emitter.printPackedType(stripUnpackedTypes(type), stringStream,
-                              op->getLoc());
+                              op->getLoc(), /*optionalAliasType=*/{},
+                              /*implicitIntType=*/true, singleBitDefaultType);
     }
     // Emit the type.
     if (maxTypeWidth > 0)
@@ -6653,6 +6760,19 @@ void SharedEmitterState::gatherFiles(bool separateModules) {
       file.emitReplicatedOps = emitReplicatedOps;
       file.addToFilelist = addToFilelist;
       file.isVerilog = outputPath.ends_with(".sv");
+
+      // Back-annotate the op with an OutputFileAttr if there wasn't one. If it
+      // was a directory, back-annotate the final file path. This is so output
+      // files are explicit in the final MLIR after export.
+      if (!attr || attr.isDirectory()) {
+        auto excludeFromFileListAttr =
+            BoolAttr::get(op->getContext(), !addToFilelist);
+        auto includeReplicatedOpsAttr =
+            BoolAttr::get(op->getContext(), emitReplicatedOps);
+        auto outputFileAttr = hw::OutputFileAttr::get(
+            destFile, excludeFromFileListAttr, includeReplicatedOpsAttr);
+        op->setAttr("output_file", outputFileAttr);
+      }
     };
 
     // Separate the operation into dedicated output file, or emit into the
@@ -6713,7 +6833,7 @@ void SharedEmitterState::gatherFiles(bool separateModules) {
           collectPorts(op);
           // External modules are _not_ emitted.
         })
-        .Case<VerbatimOp, IfDefOp, MacroDefOp, FuncDPIImportOp>(
+        .Case<VerbatimOp, IfDefOp, MacroDefOp, IncludeOp, FuncDPIImportOp>(
             [&](Operation *op) {
               // Emit into a separate file using the specified file name or
               // replicate the operation in each outputfile.
@@ -6753,6 +6873,7 @@ void SharedEmitterState::gatherFiles(bool separateModules) {
             separateFile(op);
           }
         })
+        .Case<MacroErrorOp>([&](auto op) { replicatedOps.push_back(op); })
         .Case<MacroDeclOp>([&](auto op) {
           symbolCache.addDefinition(op.getSymNameAttr(), op);
         })
@@ -6854,9 +6975,10 @@ static void emitOperation(VerilogEmitterState &state, Operation *op) {
       })
       .Case<emit::FileOp, emit::FileListOp, emit::FragmentOp>(
           [&](auto op) { FileEmitter(state).emit(op); })
-      .Case<MacroDefOp, FuncDPIImportOp>(
+      .Case<MacroErrorOp, MacroDefOp, FuncDPIImportOp>(
           [&](auto op) { ModuleEmitter(state).emitStatement(op); })
       .Case<FuncOp>([&](auto op) { ModuleEmitter(state).emitFunc(op); })
+      .Case<IncludeOp>([&](auto op) { ModuleEmitter(state).emitStatement(op); })
       .Default([&](auto *op) {
         state.encounteredError = true;
         op->emitError("unknown operation (ExportVerilog::emitOperation)");
@@ -7022,10 +7144,10 @@ struct ExportVerilogPass
   void runOnOperation() override {
     // Prepare the ops in the module for emission.
     mlir::OpPassManager preparePM("builtin.module");
-    preparePM.addPass(createLegalizeAnonEnumsPass());
-    preparePM.addPass(createHWLowerInstanceChoicesPass());
+    preparePM.addPass(createLegalizeAnonEnums());
+    preparePM.addPass(createHWLowerInstanceChoices());
     auto &modulePM = preparePM.nestAny();
-    modulePM.addPass(createPrepareForEmissionPass());
+    modulePM.addPass(createPrepareForEmission());
     if (failed(runPipeline(preparePM, getOperation())))
       return signalPassFailure();
 
@@ -7204,10 +7326,10 @@ struct ExportSplitVerilogPass
   void runOnOperation() override {
     // Prepare the ops in the module for emission.
     mlir::OpPassManager preparePM("builtin.module");
-    preparePM.addPass(createHWLowerInstanceChoicesPass());
+    preparePM.addPass(createHWLowerInstanceChoices());
 
     auto &modulePM = preparePM.nest<hw::HWModuleOp>();
-    modulePM.addPass(createPrepareForEmissionPass());
+    modulePM.addPass(createPrepareForEmission());
     if (failed(runPipeline(preparePM, getOperation())))
       return signalPassFailure();
 

@@ -62,6 +62,8 @@ class PathType;
 class BoolType;
 class DoubleType;
 class BaseTypeAliasType;
+class FStringType;
+class DomainType;
 
 /// A collection of bits indicating the recursive properties of a type.
 struct RecursiveTypeProperties {
@@ -132,7 +134,7 @@ public:
 
   /// Returns true if this is a 'const' type that can only hold compile-time
   /// constant values
-  bool isConst();
+  bool isConst() const;
 
 protected:
   using Type::Type;
@@ -147,7 +149,7 @@ public:
 
   /// Returns true if this is a 'const' type that can only hold compile-time
   /// constant values
-  bool isConst();
+  bool isConst() const;
 
   /// Return true if this is a "passive" type - one that contains no "flip"
   /// types recursively within itself.
@@ -161,7 +163,7 @@ public:
   FIRRTLBaseType getAnonymousType();
 
   /// Return a 'const' or non-'const' version of this type.
-  FIRRTLBaseType getConstType(bool isConst);
+  FIRRTLBaseType getConstType(bool isConst) const;
 
   /// Return this type with a 'const' modifiers dropped
   FIRRTLBaseType getAllConstDroppedType();
@@ -185,7 +187,7 @@ public:
   static bool classof(Type type) {
     return llvm::isa<FIRRTLDialect>(type.getDialect()) &&
            !llvm::isa<PropertyType, RefType, LHSType, OpenBundleType,
-                      OpenVectorType>(type);
+                      OpenVectorType, FStringType, DomainType>(type);
   }
 
   /// Returns true if this is a non-const "passive" that which is not analog.
@@ -309,7 +311,7 @@ public:
   int32_t getWidthOrSentinel() const;
 
   /// Return a 'const' or non-'const' version of this type.
-  IntType getConstType(bool isConst);
+  IntType getConstType(bool isConst) const;
 
   static bool classof(Type type) { return mlir::isa<SIntType, UIntType>(type); }
 };

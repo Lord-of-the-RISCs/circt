@@ -19,6 +19,7 @@
 #include "circt/Reduce/GenericReductions.h"
 #include "circt/Reduce/Tester.h"
 #include "circt/Support/Version.h"
+#include "mlir/Bytecode/BytecodeWriter.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlow.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
@@ -63,6 +64,11 @@ static cl::opt<bool>
     keepBest("keep-best", cl::init(true),
              cl::desc("Keep overwriting the output with better reductions"),
              cl::cat(mainCategory));
+
+static cl::opt<bool>
+    emitBytecode("emit-bytecode",
+                 cl::desc("Emit bytecode when generating MLIR output"),
+                 cl::init(false), cl::cat(mainCategory));
 
 static cl::opt<bool>
     skipInitial("skip-initial", cl::init(false),
@@ -142,10 +148,28 @@ static LogicalResult writeOutput(ModuleOp module) {
         << outputFilename << "\": " << errorMessage << "\n";
     return failure();
   }
-  module.print(output->os());
+  if (emitBytecode) {
+    if (failed(writeBytecodeToFile(
+            module, output->os(),
+            mlir::BytecodeWriterConfig(getCirctVersion())))) {
+      mlir::emitError(UnknownLoc::get(module.getContext()),
+                      "failed to emit bytecode to file \"")
+          << outputFilename << "\n";
+      return failure();
+    }
+  } else {
+    module.print(output->os());
+  }
+
   output->keep();
   return success();
 }
+
+struct Match {
+  Operation *op;
+  uint64_t id;
+  uint64_t benefit;
+};
 
 /// Execute the main chunk of work of the tool. This function reads the input
 /// module and iteratively applies the reduction strategies until no options
@@ -192,7 +216,7 @@ static LogicalResult execute(MLIRContext &context) {
     for (auto &arg : testerArgs)
       llvm::errs() << "  with argument `" << arg << "`\n";
   });
-  Tester tester(testerCommand, testerArgs, testMustFail);
+  Tester tester(testerCommand, testerArgs, testMustFail, emitBytecode);
   auto initialTest = tester.get(module.get());
   if (!skipInitial && !initialTest.isInteresting()) {
     mlir::emitError(UnknownLoc::get(&context), "input is not interesting");
@@ -244,31 +268,91 @@ static LogicalResult execute(MLIRContext &context) {
       size_t opIdx = 0;
       mlir::OwningOpRef<mlir::ModuleOp> newModule = module->clone();
       pattern.beforeReduction(*newModule);
-      SmallVector<std::pair<Operation *, uint64_t>, 16> opBenefits;
+      SmallVector<Match, 16> matches;
       SmallDenseSet<Operation *> opsTouched;
       pattern.notifyOpErasedCallback = [&](Operation *op) {
         opsTouched.insert(op);
       };
       newModule->walk([&](Operation *op) {
-        uint64_t benefit = pattern.match(op);
-        if (benefit > 0) {
-          opIdx++;
-          opBenefits.push_back(std::make_pair(op, benefit));
-        }
+        pattern.matches(op, [&](uint64_t benefit, uint64_t id) {
+          if (benefit > 0) {
+            opIdx++;
+            matches.push_back(Match{op, id, benefit});
+          }
+        });
       });
-      std::sort(opBenefits.begin(), opBenefits.end(),
-                [](auto a, auto b) { return a.second > b.second; });
-      for (size_t idx = rangeBase, num = 0;
-           num < rangeLength && idx < opBenefits.size(); ++idx) {
-        auto *op = opBenefits[idx].first;
-        if (opsTouched.contains(op))
-          continue;
-        if (pattern.match(op)) {
+
+      // Sort the matches by benefit. This will cause us to try the most
+      // beneficial matches first.
+      llvm::stable_sort(matches, [](auto &a, auto &b) {
+        if (a.benefit > b.benefit)
+          return true;
+        if (a.benefit < b.benefit)
+          return false;
+        return a.id < b.id;
+      });
+
+      // Drop all matches before `rangeBase`.
+      if (rangeBase < matches.size())
+        matches.erase(matches.begin(), matches.begin() + rangeBase);
+      else
+        matches.clear();
+
+      // Pick the next `rangeLength` of matches and apply the pattern. This may
+      // not work for all matches, which is why we do this in a loop until we
+      // have actually applied `rangeLength` matches.
+      size_t remaining = rangeLength;
+      while (remaining > 0 && !matches.empty()) {
+        // Group the matches by op to make applying them in batch easier.
+        remaining = std::min(remaining, matches.size());
+        std::stable_sort(matches.begin(), matches.begin() + remaining,
+                         [](auto &a, auto &b) { return a.op < b.op; });
+
+        // Apply the first `remaining` matches.
+        for (size_t idx = 0; idx < remaining;) {
+          // Pick the next op to apply the reduction to.
+          auto *op = matches[idx].op;
+          if (!opsTouched.insert(op).second) {
+            while (idx < remaining && matches[idx].op == op)
+              ++idx;
+            continue;
+          }
+
+          // Match the pattern against the op again. This will allow us to skip
+          // over matches in the list that no longer apply.
+          SmallDenseSet<uint64_t> possibleIds;
+          pattern.matches(op, [&](uint64_t benefit, uint64_t id) {
+            if (benefit > 0)
+              possibleIds.insert(id);
+          });
+
+          // Collect the matches for this op that are still possible.
+          SmallVector<uint64_t> ids;
+          while (idx < remaining && matches[idx].op == op) {
+            auto id = matches[idx].id;
+            if (possibleIds.contains(id))
+              ids.push_back(id);
+            ++idx;
+          }
+          if (ids.empty())
+            continue;
+
+          // Apply the pattern to these matches.
           op->walk([&](Operation *subop) { opsTouched.insert(subop); });
-          (void)pattern.rewrite(op);
-          ++num;
+          (void)pattern.rewriteMatches(op, ids);
+          assert(remaining >= ids.size());
+          remaining -= ids.size();
         }
+
+        // If we have not applied the number of matches we set out to, filter
+        // the list of remaining matches to contain only the ones we haven't
+        // tried yet.
+        if (remaining > 0)
+          llvm::erase_if(matches, [&](auto &match) {
+            return opsTouched.contains(match.op);
+          });
       }
+
       pattern.afterReduction(*newModule);
       pattern.notifyOpErasedCallback = nullptr;
       if (opIdx == 0) {
@@ -282,14 +366,14 @@ static LogicalResult execute(MLIRContext &context) {
       // Reduce the chunk size to achieve the minimum number of chunks requested
       // by the user.
       if (minChunks > 0)
-        rangeLength = std::min<size_t>(rangeLength,
-                                       std::max<size_t>(opIdx / minChunks, 1));
+        rangeLength = std::clamp<size_t>(llvm::divideCeil(opIdx, minChunks), 1,
+                                         rangeLength);
 
       // Show some progress indication.
       VERBOSE({
         size_t boundLength = std::min(rangeLength, opIdx);
         size_t numDone = rangeBase / boundLength + 1;
-        size_t numTotal = (opIdx + boundLength - 1) / boundLength;
+        size_t numTotal = llvm::divideCeil(opIdx, boundLength);
         clearSummary();
         llvm::errs() << "  [" << numDone << "/" << numTotal << "; "
                      << (numDone * 100 / numTotal) << "%; " << opIdx << " ops, "
@@ -362,7 +446,7 @@ static LogicalResult execute(MLIRContext &context) {
           // Stop increasing granularity if the number of chunks has increased
           // beyond the upper limit set by the user.
           if (rangeLength > 0 && maxChunks > 0 &&
-              (opIdx + rangeLength - 1) / rangeLength > maxChunks)
+              llvm::divideCeil(opIdx, rangeLength) > maxChunks)
             rangeLength = 0;
 
           if (rangeLength > 0) {
@@ -397,10 +481,16 @@ static LogicalResult execute(MLIRContext &context) {
 
   // Write the reduced test case to the output.
   clearSummary();
-  VERBOSE(llvm::errs() << "All reduction strategies exhausted\n");
-  VERBOSE(llvm::errs() << "Final size: " << bestSize << " ("
-                       << (100 - bestSize * 100 / initialTest.getSize())
-                       << "% reduction)\n");
+  VERBOSE({
+    llvm::errs() << "All reduction strategies exhausted\n";
+    llvm::errs() << "Final size: " << bestSize << " (";
+    if (bestSize > initialTest.getSize())
+      llvm::errs() << (bestSize * 100 / initialTest.getSize() - 100)
+                   << "% increase)\n";
+    else
+      llvm::errs() << (100 - bestSize * 100 / initialTest.getSize())
+                   << "% reduction)\n";
+  });
   return writeOutput(module.get());
 }
 
@@ -422,7 +512,7 @@ int main(int argc, char **argv) {
   // Parse the command line options provided by the user.
   cl::ParseCommandLineOptions(argc, argv, "CIRCT test case reduction tool\n");
 
-  // Register all the dialects and create a context to work wtih.
+  // Register all the dialects.
   mlir::DialectRegistry registry;
   registerAllDialects(registry);
   registry.insert<func::FuncDialect, scf::SCFDialect, cf::ControlFlowDialect,
@@ -430,7 +520,10 @@ int main(int argc, char **argv) {
   arc::registerReducePatternDialectInterface(registry);
   firrtl::registerReducePatternDialectInterface(registry);
   hw::registerReducePatternDialectInterface(registry);
+
+  // Create a context.
   mlir::MLIRContext context(registry);
+  context.allowUnregisteredDialects(true); // allow reduction of unknown ops
 
   // Do the actual processing and use `exit` to avoid the slow teardown of the
   // context.

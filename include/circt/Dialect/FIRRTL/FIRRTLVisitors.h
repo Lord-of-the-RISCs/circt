@@ -61,15 +61,17 @@ public:
             BitsPrimOp, HeadPrimOp, MuxPrimOp, PadPrimOp, ShlPrimOp, ShrPrimOp,
             TailPrimOp, VerbatimExprOp, HWStructCastOp, BitCastOp, RefSendOp,
             RefResolveOp, RefSubOp, RWProbeOp, XMRRefOp, XMRDerefOp,
+            UnsafeDomainCastOp,
             // Casts to deal with weird stuff
             UninferredResetCastOp, ConstCastOp, RefCastOp,
             // Property expressions.
             StringConstantOp, FIntegerConstantOp, BoolConstantOp,
             DoubleConstantOp, ListCreateOp, ListConcatOp, UnresolvedPathOp,
-            PathOp, IntegerAddOp, IntegerMulOp, IntegerShrOp>(
-            [&](auto expr) -> ResultType {
-              return thisCast->visitExpr(expr, args...);
-            })
+            PathOp, IntegerAddOp, IntegerMulOp, IntegerShrOp,
+            // Format String expressions
+            TimeOp, HierarchicalModuleNameOp>([&](auto expr) -> ResultType {
+          return thisCast->visitExpr(expr, args...);
+        })
         .Default([&](auto expr) -> ResultType {
           return thisCast->visitInvalidExpr(op, args...);
         });
@@ -123,6 +125,7 @@ public:
   HANDLE(OpenSubindexOp, Unhandled);
   HANDLE(ObjectSubfieldOp, Unhandled);
   HANDLE(ObjectAnyRefCastOp, Unhandled);
+  HANDLE(CatPrimOp, Unhandled);
 
   // Arithmetic and Logical Binary Primitives.
   HANDLE(AddPrimOp, Binary);
@@ -143,7 +146,6 @@ public:
   HANDLE(NEQPrimOp, Binary);
 
   // Misc Binary Primitives.
-  HANDLE(CatPrimOp, Binary);
   HANDLE(DShlPrimOp, Binary);
   HANDLE(DShlwPrimOp, Binary);
   HANDLE(DShrPrimOp, Binary);
@@ -205,6 +207,7 @@ public:
   HANDLE(RWProbeOp, Unhandled);
   HANDLE(XMRRefOp, Unhandled);
   HANDLE(XMRDerefOp, Unhandled);
+  HANDLE(UnsafeDomainCastOp, Unhandled);
 
   // Conversions.
   HANDLE(HWStructCastOp, Unhandled);
@@ -225,6 +228,10 @@ public:
   HANDLE(IntegerAddOp, Unhandled);
   HANDLE(IntegerMulOp, Unhandled);
   HANDLE(IntegerShrOp, Unhandled);
+
+  // Format string expressions
+  HANDLE(TimeOp, Unhandled);
+  HANDLE(HierarchicalModuleNameOp, Unhandled);
 #undef HANDLE
 };
 
@@ -236,14 +243,15 @@ public:
   ResultType dispatchStmtVisitor(Operation *op, ExtraArgs... args) {
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Operation *, ResultType>(op)
-        .template Case<
-            AttachOp, ConnectOp, MatchingConnectOp, RefDefineOp, ForceOp,
-            PrintFOp, SkipOp, StopOp, WhenOp, AssertOp, AssumeOp, CoverOp,
-            PropAssignOp, RefForceOp, RefForceInitialOp, RefReleaseOp,
-            RefReleaseInitialOp, FPGAProbeIntrinsicOp, VerifAssertIntrinsicOp,
-            VerifAssumeIntrinsicOp, UnclockedAssumeIntrinsicOp,
-            VerifCoverIntrinsicOp, VerifRequireIntrinsicOp,
-            VerifEnsureIntrinsicOp, LayerBlockOp, MatchOp, ViewIntrinsicOp>(
+        .template Case<AttachOp, ConnectOp, MatchingConnectOp, RefDefineOp,
+                       ForceOp, PrintFOp, FPrintFOp, FFlushOp, SkipOp, StopOp,
+                       WhenOp, AssertOp, AssumeOp, CoverOp, PropAssignOp,
+                       RefForceOp, RefForceInitialOp, RefReleaseOp,
+                       RefReleaseInitialOp, FPGAProbeIntrinsicOp,
+                       VerifAssertIntrinsicOp, VerifAssumeIntrinsicOp,
+                       UnclockedAssumeIntrinsicOp, VerifCoverIntrinsicOp,
+                       VerifRequireIntrinsicOp, VerifEnsureIntrinsicOp,
+                       LayerBlockOp, MatchOp, ViewIntrinsicOp, BindOp>(
             [&](auto opNode) -> ResultType {
               return thisCast->visitStmt(opNode, args...);
             })
@@ -275,6 +283,8 @@ public:
   HANDLE(RefDefineOp);
   HANDLE(ForceOp);
   HANDLE(PrintFOp);
+  HANDLE(FPrintFOp);
+  HANDLE(FFlushOp);
   HANDLE(SkipOp);
   HANDLE(StopOp);
   HANDLE(WhenOp);
@@ -296,6 +306,7 @@ public:
   HANDLE(LayerBlockOp);
   HANDLE(MatchOp);
   HANDLE(ViewIntrinsicOp);
+  HANDLE(BindOp);
 
 #undef HANDLE
 };

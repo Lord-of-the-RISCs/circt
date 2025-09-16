@@ -1,4 +1,4 @@
-//===- circt-lec.cpp - The circt-lec driver ---------------------*- C++ -*-===//
+//===----------------------------------------------------------------------===//
 //
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
@@ -13,16 +13,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "circt/Conversion/CombToSMT.h"
+#include "circt/Conversion/DatapathToSMT.h"
 #include "circt/Conversion/HWToSMT.h"
 #include "circt/Conversion/SMTToZ3LLVM.h"
 #include "circt/Conversion/VerifToSMT.h"
 #include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Datapath/DatapathDialect.h"
 #include "circt/Dialect/Emit/EmitDialect.h"
 #include "circt/Dialect/Emit/EmitPasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/OM/OMPasses.h"
-#include "circt/Dialect/SMT/SMTDialect.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
 #include "circt/Support/Passes.h"
 #include "circt/Support/Version.h"
@@ -31,6 +32,7 @@
 #include "mlir/Dialect/Func/Extensions/InlinerExtension.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/LLVMIR/Transforms/Passes.h"
+#include "mlir/Dialect/SMT/IR/SMTDialect.h"
 #include "mlir/IR/BuiltinDialect.h"
 #include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -41,6 +43,7 @@
 #include "mlir/Target/LLVMIR/Dialect/Builtin/BuiltinToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Dialect/LLVMIR/LLVMToLLVMIRTranslation.h"
 #include "mlir/Target/LLVMIR/Export.h"
+#include "mlir/Target/SMTLIB/ExportSMTLIB.h"
 #include "mlir/Transforms/Passes.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/InitLLVM.h"
@@ -227,9 +230,12 @@ static LogicalResult executeLEC(MLIRContext &context) {
     ConstructLECOptions opts;
     opts.firstModule = firstModuleName;
     opts.secondModule = secondModuleName;
+    if (outputFormat == OutputSMTLIB)
+      opts.insertMode = lec::InsertAdditionalModeEnum::None;
     pm.addPass(createConstructLEC(opts));
   }
   pm.addPass(createConvertHWToSMT());
+  pm.addPass(createConvertDatapathToSMT());
   pm.addPass(createConvertCombToSMT());
   pm.addPass(createConvertVerifToSMT());
   pm.addPass(createSimpleCanonicalizerPass());
@@ -254,8 +260,10 @@ static LogicalResult executeLEC(MLIRContext &context) {
 
   if (outputFormat == OutputSMTLIB) {
     auto timer = ts.nest("Print SMT-LIB output");
-    llvm::errs() << "Printing SMT-LIB not yet supported!\n";
-    return failure();
+    if (failed(smt::exportSMTLIB(module.get(), outputFile.value()->os())))
+      return failure();
+    outputFile.value()->keep();
+    return success();
   }
 
   if (outputFormat == OutputLLVM) {
@@ -282,6 +290,9 @@ static LogicalResult executeLEC(MLIRContext &context) {
   };
 
   std::unique_ptr<mlir::ExecutionEngine> engine;
+  std::function<llvm::Error(llvm::Module *)> transformer =
+      mlir::makeOptimizingTransformer(
+          /*optLevel*/ 3, /*sizeLevel=*/0, /*targetMachine=*/nullptr);
   {
     auto timer = ts.nest("Setting up the JIT");
     auto entryPoint = dyn_cast_or_null<LLVM::LLVMFuncOp>(
@@ -304,8 +315,7 @@ static LogicalResult executeLEC(MLIRContext &context) {
     SmallVector<StringRef, 4> sharedLibraries(sharedLibs.begin(),
                                               sharedLibs.end());
     mlir::ExecutionEngineOptions engineOptions;
-    engineOptions.transformer = mlir::makeOptimizingTransformer(
-        /*optLevel*/ 3, /*sizeLevel=*/0, /*targetMachine=*/nullptr);
+    engineOptions.transformer = transformer;
     engineOptions.jitCodeGenOptLevel = llvm::CodeGenOptLevel::Aggressive;
     engineOptions.sharedLibPaths = sharedLibraries;
     engineOptions.enableObjectDump = true;
@@ -363,10 +373,11 @@ int main(int argc, char **argv) {
   // clang-format off
   registry.insert<
     circt::comb::CombDialect,
+    circt::datapath::DatapathDialect,
     circt::emit::EmitDialect,
     circt::hw::HWDialect,
     circt::om::OMDialect,
-    circt::smt::SMTDialect,
+    mlir::smt::SMTDialect,
     circt::verif::VerifDialect,
     mlir::arith::ArithDialect,
     mlir::BuiltinDialect,

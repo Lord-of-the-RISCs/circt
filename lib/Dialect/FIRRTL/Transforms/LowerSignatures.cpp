@@ -48,12 +48,15 @@ struct AttrCache {
     sPortTypes = StringAttr::get(context, "portTypes");
     sPortLocations = StringAttr::get(context, "portLocations");
     sPortAnnotations = StringAttr::get(context, "portAnnotations");
+    sPortDomains = StringAttr::get(context, "domainInfo");
     sInternalPaths = StringAttr::get(context, "internalPaths");
+    aEmpty = ArrayAttr::get(context, {});
   }
   AttrCache(const AttrCache &) = default;
 
   StringAttr nameAttr, sPortDirections, sPortNames, sPortTypes, sPortLocations,
-      sPortAnnotations, sInternalPaths;
+      sPortAnnotations, sPortDomains, sInternalPaths;
+  ArrayAttr aEmpty;
 };
 
 struct FieldMapEntry : public PortInfo {
@@ -151,7 +154,8 @@ computeLoweringImpl(FModuleLike mod, PortConversion &newPorts, Convention conv,
               {{StringAttr::get(ctx, name), type,
                 isFlip ? Direction::Out : Direction::In,
                 symbolsForFieldIDRange(ctx, syms, fieldID, lastId), port.loc,
-                annosForFieldIDRange(ctx, annos, fieldID, lastId)},
+                annosForFieldIDRange(ctx, annos, fieldID, lastId),
+                port.domains},
                portID,
                newPorts.size(),
                fieldID});
@@ -193,7 +197,8 @@ computeLoweringImpl(FModuleLike mod, PortConversion &newPorts, Convention conv,
               {{StringAttr::get(ctx, name), type,
                 isFlip ? Direction::Out : Direction::In,
                 symbolsForFieldIDRange(ctx, syms, fieldID, lastId), port.loc,
-                annosForFieldIDRange(ctx, annos, fieldID, lastId)},
+                annosForFieldIDRange(ctx, annos, fieldID, lastId),
+                port.domains},
                portID,
                newPorts.size(),
                fieldID});
@@ -227,14 +232,13 @@ computeLoweringImpl(FModuleLike mod, PortConversion &newPorts, Convention conv,
         }
         return success();
       })
-      .Case<FEnumType>([&](FEnumType fenum) { return failure(); })
       .Default([&](FIRRTLType type) {
         // Properties and other types wind up here.
         newPorts.push_back(
             {{StringAttr::get(ctx, name), type,
               isFlip ? Direction::Out : Direction::In,
               symbolsForFieldIDRange(ctx, syms, fieldID, fieldID), port.loc,
-              annosForFieldIDRange(ctx, annos, fieldID, fieldID)},
+              annosForFieldIDRange(ctx, annos, fieldID, fieldID), port.domains},
              portID,
              newPorts.size(),
              fieldID});
@@ -279,10 +283,9 @@ static LogicalResult lowerModuleSignature(FModuleLike module, Convention conv,
       if (p.fieldID != 0) {
         auto &wire = bounceWires[p.portID];
         if (!wire)
-          wire = theBuilder
-                     .create<WireOp>(module.getPortType(p.portID),
-                                     module.getPortNameAttr(p.portID),
-                                     NameKindEnum::InterestingName)
+          wire = WireOp::create(theBuilder, module.getPortType(p.portID),
+                                module.getPortNameAttr(p.portID),
+                                NameKindEnum::InterestingName)
                      .getResult();
       } else {
         bounceWires[p.portID] = newArg;
@@ -292,9 +295,8 @@ static LogicalResult lowerModuleSignature(FModuleLike module, Convention conv,
     // zero-length vectors.
     for (auto idx = 0U; idx < oldNumArgs; ++idx) {
       if (!bounceWires[idx]) {
-        bounceWires[idx] = theBuilder
-                               .create<WireOp>(module.getPortType(idx),
-                                               module.getPortNameAttr(idx))
+        bounceWires[idx] = WireOp::create(theBuilder, module.getPortType(idx),
+                                          module.getPortNameAttr(idx))
                                .getResult();
       }
       body->getArgument(idx).replaceAllUsesWith(bounceWires[idx]);
@@ -337,6 +339,7 @@ static LogicalResult lowerModuleSignature(FModuleLike module, Convention conv,
   SmallVector<Attribute> newPortSyms;
   SmallVector<Attribute> newPortLocations;
   SmallVector<Attribute, 8> newPortAnnotations;
+  SmallVector<Attribute> newPortDomains;
   SmallVector<Attribute> newInternalPaths;
 
   bool hasInternalPaths = false;
@@ -348,6 +351,7 @@ static LogicalResult lowerModuleSignature(FModuleLike module, Convention conv,
     newPortSyms.push_back(p.sym);
     newPortLocations.push_back(p.loc);
     newPortAnnotations.push_back(p.annotations.getArrayAttr());
+    newPortDomains.push_back(p.domains ? p.domains : cache.aEmpty);
     if (internalPaths) {
       auto internalPath = cast<InternalPathAttr>(internalPaths[p.portID]);
       newInternalPaths.push_back(internalPath);
@@ -371,6 +375,9 @@ static LogicalResult lowerModuleSignature(FModuleLike module, Convention conv,
 
   newModuleAttrs.push_back(NamedAttribute(
       cache.sPortAnnotations, theBuilder.getArrayAttr(newPortAnnotations)));
+
+  newModuleAttrs.push_back(NamedAttribute(
+      cache.sPortDomains, theBuilder.getArrayAttr(newPortDomains)));
 
   assert(newInternalPaths.empty() ||
          newInternalPaths.size() == newPorts.size());
@@ -401,10 +408,10 @@ static void lowerModuleBody(FModuleOp mod,
       instPorts.push_back(p);
     }
     auto annos = inst.getAnnotations();
-    auto newOp = theBuilder.create<InstanceOp>(
-        instPorts, inst.getModuleName(), inst.getName(), inst.getNameKind(),
-        annos.getValue(), inst.getLayers(), inst.getLowerToBind(),
-        inst.getInnerSymAttr());
+    auto newOp = InstanceOp::create(
+        theBuilder, instPorts, inst.getModuleName(), inst.getName(),
+        inst.getNameKind(), annos.getValue(), inst.getLayers(),
+        inst.getLowerToBind(), inst.getDoNotPrint(), inst.getInnerSymAttr());
 
     auto oldDict = inst->getDiscardableAttrDictionary();
     auto newDict = newOp->getDiscardableAttrDictionary();
@@ -424,8 +431,8 @@ static void lowerModuleBody(FModuleOp mod,
         continue;
       }
       if (!bounce[p.portID]) {
-        bounce[p.portID] = theBuilder.create<WireOp>(
-            inst.getResult(p.portID).getType(),
+        bounce[p.portID] = WireOp::create(
+            theBuilder, inst.getResult(p.portID).getType(),
             theBuilder.getStringAttr(
                 inst.getName() + "." +
                 cast<StringAttr>(oldNames[p.portID]).getValue()));
@@ -482,9 +489,4 @@ void LowerSignaturesPass::runOnOperation() {
   }
   parallelForEach(&getContext(), circuit.getOps<FModuleOp>(),
                   [&portMap](FModuleOp mod) { lowerModuleBody(mod, portMap); });
-}
-
-/// This is the pass constructor.
-std::unique_ptr<mlir::Pass> circt::firrtl::createLowerSignaturesPass() {
-  return std::make_unique<LowerSignaturesPass>();
 }

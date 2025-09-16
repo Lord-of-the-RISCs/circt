@@ -32,9 +32,11 @@ public:
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Operation *, ResultType>(op)
         .template Case<
+            // Constants
+            ConstantOp,
             // Bags
             BagCreateOp, BagSelectRandomOp, BagDifferenceOp, BagUnionOp,
-            BagUniqueSizeOp,
+            BagUniqueSizeOp, BagConvertToSetOp,
             // Contexts
             OnContextOp, ContextSwitchOp,
             // Labels
@@ -42,7 +44,7 @@ public:
             // Registers
             FixedRegisterOp, VirtualRegisterOp,
             // RTG tests
-            TestOp, TargetOp, YieldOp,
+            TestOp, TargetOp, YieldOp, ValidateOp, TestSuccessOp, TestFailureOp,
             // Integers
             RandomNumberInRangeOp,
             // Sequences
@@ -50,7 +52,19 @@ public:
             RandomizeSequenceOp, EmbedSequenceOp, InterleaveSequencesOp,
             // Sets
             SetCreateOp, SetSelectRandomOp, SetDifferenceOp, SetUnionOp,
-            SetSizeOp>([&](auto expr) -> ResultType {
+            SetSizeOp, SetCartesianProductOp, SetConvertToBagOp,
+            // Arrays
+            ArrayCreateOp, ArrayExtractOp, ArrayInjectOp, ArraySizeOp,
+            // Tuples
+            TupleCreateOp, TupleExtractOp,
+            // Immediates
+            IntToImmediateOp, ConcatImmediateOp, SliceImmediateOp,
+            // Memories
+            MemoryAllocOp, MemoryBaseAddressOp, MemorySizeOp,
+            // Memory Blocks
+            MemoryBlockDeclareOp,
+            // Misc ops
+            CommentOp>([&](auto expr) -> ResultType {
           return thisCast->visitOp(expr, args...);
         })
         .Default([&](auto expr) -> ResultType {
@@ -82,6 +96,7 @@ public:
     return static_cast<ConcreteType *>(this)->visit##OPKIND##Op(op, args...);  \
   }
 
+  HANDLE(ConstantOp, Unhandled);
   HANDLE(SequenceOp, Unhandled);
   HANDLE(GetSequenceOp, Unhandled);
   HANDLE(SubstituteSequenceOp, Unhandled);
@@ -96,19 +111,39 @@ public:
   HANDLE(SetDifferenceOp, Unhandled);
   HANDLE(SetUnionOp, Unhandled);
   HANDLE(SetSizeOp, Unhandled);
+  HANDLE(SetCartesianProductOp, Unhandled);
+  HANDLE(SetConvertToBagOp, Unhandled);
   HANDLE(BagCreateOp, Unhandled);
   HANDLE(BagSelectRandomOp, Unhandled);
   HANDLE(BagDifferenceOp, Unhandled);
   HANDLE(BagUnionOp, Unhandled);
   HANDLE(BagUniqueSizeOp, Unhandled);
+  HANDLE(BagConvertToSetOp, Unhandled);
+  HANDLE(ArrayCreateOp, Unhandled);
+  HANDLE(ArrayExtractOp, Unhandled);
+  HANDLE(ArrayInjectOp, Unhandled);
+  HANDLE(ArraySizeOp, Unhandled);
+  HANDLE(TupleCreateOp, Unhandled);
+  HANDLE(TupleExtractOp, Unhandled);
+  HANDLE(CommentOp, Unhandled);
   HANDLE(LabelDeclOp, Unhandled);
   HANDLE(LabelUniqueDeclOp, Unhandled);
   HANDLE(LabelOp, Unhandled);
   HANDLE(TestOp, Unhandled);
   HANDLE(TargetOp, Unhandled);
   HANDLE(YieldOp, Unhandled);
+  HANDLE(ValidateOp, Unhandled);
+  HANDLE(TestSuccessOp, Unhandled);
+  HANDLE(TestFailureOp, Unhandled);
   HANDLE(FixedRegisterOp, Unhandled);
   HANDLE(VirtualRegisterOp, Unhandled);
+  HANDLE(IntToImmediateOp, Unhandled);
+  HANDLE(ConcatImmediateOp, Unhandled);
+  HANDLE(SliceImmediateOp, Unhandled);
+  HANDLE(MemoryBlockDeclareOp, Unhandled);
+  HANDLE(MemoryAllocOp, Unhandled);
+  HANDLE(MemoryBaseAddressOp, Unhandled);
+  HANDLE(MemorySizeOp, Unhandled);
 #undef HANDLE
 };
 
@@ -120,10 +155,11 @@ public:
   ResultType dispatchTypeVisitor(Type type, ExtraArgs... args) {
     auto *thisCast = static_cast<ConcreteType *>(this);
     return TypeSwitch<Type, ResultType>(type)
-        .template Case<SequenceType, SetType, BagType, DictType, LabelType,
-                       IndexType, IntegerType>([&](auto expr) -> ResultType {
-          return thisCast->visitType(expr, args...);
-        })
+        .template Case<ImmediateType, SequenceType, SetType, BagType, DictType,
+                       LabelType, IndexType, IntegerType>(
+            [&](auto expr) -> ResultType {
+              return thisCast->visitType(expr, args...);
+            })
         .template Case<ContextResourceTypeInterface>(
             [&](auto expr) -> ResultType {
               return thisCast->visitContextResourceType(expr, args...);
@@ -163,6 +199,7 @@ public:
                                                                     args...);  \
   }
 
+  HANDLE(ImmediateType, Unhandled);
   HANDLE(SequenceType, Unhandled);
   HANDLE(SetType, Unhandled);
   HANDLE(BagType, Unhandled);

@@ -16,6 +16,7 @@
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/FIRRTL/Namespace.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "circt/Dialect/HW/HierPathCache.h"
 #include "circt/Dialect/HW/InnerSymbolNamespace.h"
 #include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
@@ -102,7 +103,7 @@ public:
     else
       builder.setInsertionPointToStart(body);
 
-    Value xmr = builder.create<XMRRefOp>(type, symbol, suffix);
+    Value xmr = XMRRefOp::create(builder, type, symbol, suffix);
     xmrRefCache.insert({{type, symbol, suffix}, xmr});
 
     xmrRefPoint = builder.saveInsertionPoint();
@@ -130,7 +131,12 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     CircuitNamespace ns(getOperation());
     circuitNamespace = &ns;
 
-    llvm::EquivalenceClasses<Value, ValueComparator> eq;
+    hw::HierPathCache pc(
+        &ns, OpBuilder::InsertPoint(getOperation().getBodyBlock(),
+                                    getOperation().getBodyBlock()->begin()));
+    hierPathCache = &pc;
+
+    llvm::EquivalenceClasses<Value> eq;
     dataFlowClasses = &eq;
 
     InstanceGraph &instanceGraph = getAnalysis<InstanceGraph>();
@@ -186,7 +192,7 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
                 nameKind = NameKindEnum::InterestingName;
               }
             }
-            xmrDef = b.create<NodeOp>(xmrDef, opName, nameKind).getResult();
+            xmrDef = NodeOp::create(b, xmrDef, opName, nameKind).getResult();
 
             // Create a new entry for this RefSendOp. The path is currently
             // local.
@@ -324,9 +330,6 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
         if (result.wasInterrupted())
           return signalPassFailure();
 
-        // Clear any enabled layers.
-        module.setLayersAttr(ArrayAttr::get(module.getContext(), {}));
-
         // Since we walk operations pre-order and not along dataflow edges,
         // ref.sub may not be resolvable when we encounter them (they're not
         // just unification). This can happen when refs go through an output
@@ -370,14 +373,12 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     }
 
     LLVM_DEBUG({
-      for (auto I = dataFlowClasses->begin(), E = dataFlowClasses->end();
-           I != E; ++I) { // Iterate over all of the equivalence sets.
+      for (const auto &I :
+           *dataFlowClasses) { // Iterate over all of the equivalence sets.
         if (!I->isLeader())
           continue; // Ignore non-leader sets.
         // Print members in this set.
-        llvm::interleave(llvm::make_range(dataFlowClasses->member_begin(I),
-                                          dataFlowClasses->member_end()),
-                         llvm::dbgs(), "\n");
+        llvm::interleave(dataFlowClasses->members(*I), llvm::dbgs(), "\n");
         llvm::dbgs() << "\n dataflow at leader::" << I->getData() << "\n =>";
         auto iter = dataflowAt.find(I->getData());
         if (iter != dataflowAt.end()) {
@@ -410,8 +411,7 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     opsToRemove.clear();
     xmrPathSuffix.clear();
     circuitNamespace = nullptr;
-    pathCache.clear();
-    pathInsertPoint = {};
+    hierPathCache = nullptr;
   }
 
   /// Generate the ABI ref_<module> prefix string into `prefix`.
@@ -498,7 +498,9 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     if (!refSendPath.empty())
       // Compute the HierPathOp that stores the path.
       ref = FlatSymbolRefAttr::get(
-          getOrCreatePath(builder.getArrayAttr(refSendPath), builder)
+          hierPathCache
+              ->getOrCreatePath(builder.getArrayAttr(refSendPath),
+                                builder.getLoc())
               .getSymNameAttr());
 
     return success();
@@ -558,8 +560,8 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
       ImplicitLocOpBuilder builder(resolve.getLoc(), resolve);
       auto zeroUintType = UIntType::get(builder.getContext(), 0);
       auto zeroC = builder.createOrFold<BitCastOp>(
-          resolve.getType(), builder.create<ConstantOp>(
-                                 zeroUintType, getIntZerosAttr(zeroUintType)));
+          resolve.getType(), ConstantOp::create(builder, zeroUintType,
+                                                getIntZerosAttr(zeroUintType)));
       resolve.getResult().replaceAllUsesWith(zeroC);
       return success();
     }
@@ -570,7 +572,7 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     if (failed(resolveReference(resolve.getRef(), builder, ref, str)))
       return failure();
 
-    Value result = builder.create<XMRDerefOp>(resolve.getType(), ref, str);
+    Value result = XMRDerefOp::create(builder, resolve.getType(), ref, str);
     resolve.getResult().replaceAllUsesWith(result);
     return success();
   }
@@ -700,7 +702,8 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
         getRefABIPrefix(module, circuitRefPrefix);
       auto macroName =
           getRefABIMacroForPort(module, portIndex, circuitRefPrefix);
-      declBuilder.create<sv::MacroDeclOp>(macroName, ArrayAttr(), StringAttr());
+      sv::MacroDeclOp::create(declBuilder, macroName, ArrayAttr(),
+                              StringAttr());
       ports.emplace_back(macroName, declBuilder.getStringAttr(formatString),
                          ref ? declBuilder.getArrayAttr({ref}) : ArrayAttr{});
     }
@@ -712,10 +715,10 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
     // The macros will be exported to a `ref_<module-name>.sv` file.
     // In the IR, the file is inserted before the module.
     auto fileBuilder = ImplicitLocOpBuilder(module.getLoc(), module);
-    fileBuilder.create<emit::FileOp>(circuitRefPrefix + ".sv", [&] {
+    emit::FileOp::create(fileBuilder, circuitRefPrefix + ".sv", [&] {
       for (auto [macroName, formatString, symbols] : ports) {
-        fileBuilder.create<sv::MacroDefOp>(FlatSymbolRefAttr::get(macroName),
-                                           formatString, symbols);
+        sv::MacroDefOp::create(fileBuilder, FlatSymbolRefAttr::get(macroName),
+                               formatString, symbols);
       }
     });
 
@@ -810,9 +813,9 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
           portAnnotations.push_back(mem.getPortAnnotation(res.index()));
           oldResults.push_back(res.value());
         }
-        auto newMem = builder.create<MemOp>(
-            resultTypes, mem.getReadLatency(), mem.getWriteLatency(),
-            mem.getDepth(), RUWAttr::Undefined,
+        auto newMem = MemOp::create(
+            builder, resultTypes, mem.getReadLatency(), mem.getWriteLatency(),
+            mem.getDepth(), RUWBehavior::Undefined,
             builder.getArrayAttr(resultNames), mem.getNameAttr(),
             mem.getNameKind(), mem.getAnnotations(),
             builder.getArrayAttr(portAnnotations), mem.getInnerSymAttr(),
@@ -829,43 +832,6 @@ class LowerXMRPass : public circt::firrtl::impl::LowerXMRBase<LowerXMRPass> {
   }
 
   bool isZeroWidth(FIRRTLBaseType t) { return t.getBitWidthOrSentinel() == 0; }
-
-  /// Return a HierPathOp for the provided pathArray.  This will either return
-  /// an existing HierPathOp or it will create and return a new one.
-  hw::HierPathOp getOrCreatePath(ArrayAttr pathArray,
-                                 ImplicitLocOpBuilder &builder) {
-    assert(pathArray && !pathArray.empty());
-    // Return an existing HierPathOp if one exists with the same path.
-    auto pathIter = pathCache.find(pathArray);
-    if (pathIter != pathCache.end())
-      return pathIter->second;
-
-    // Reset the insertion point after this function returns.
-    OpBuilder::InsertionGuard guard(builder);
-
-    // Set the insertion point to either the known location where the pass
-    // inserts HierPathOps or to the start of the circuit.
-    if (pathInsertPoint.isSet())
-      builder.restoreInsertionPoint(pathInsertPoint);
-    else
-      builder.setInsertionPointToStart(getOperation().getBodyBlock());
-
-    // Create the new HierPathOp and insert it into the pathCache.
-    hw::HierPathOp path =
-        pathCache
-            .insert({pathArray,
-                     builder.create<hw::HierPathOp>(
-                         circuitNamespace->newName("xmrPath"), pathArray)})
-            .first->second;
-    path.setVisibility(SymbolTable::Visibility::Private);
-
-    // Save the insertion point so other unique HierPathOps will be created
-    // after this one.
-    pathInsertPoint = builder.saveInsertionPoint();
-
-    // Return the new path.
-    return path;
-  }
 
 private:
   /// Cached module namespaces.
@@ -887,15 +853,7 @@ private:
   /// no NextNodeOnPath, which denotes a leaf node on the path.
   SmallVector<XMRNode> refSendPathList;
 
-  /// llvm::EquivalenceClasses wants comparable elements. This comparator uses
-  /// uses pointer comparison on the Impl.
-  struct ValueComparator {
-    bool operator()(const Value &lhs, const Value &rhs) const {
-      return lhs.getImpl() < rhs.getImpl();
-    }
-  };
-
-  llvm::EquivalenceClasses<Value, ValueComparator> *dataFlowClasses;
+  llvm::EquivalenceClasses<Value> *dataFlowClasses;
   // Instance and module ref ports that needs to be removed.
   DenseMap<Operation *, llvm::BitVector> refPortsToRemoveMap;
 
@@ -907,17 +865,10 @@ private:
 
   CircuitNamespace *circuitNamespace;
 
-  /// A cache of already created HierPathOps.  This is used to avoid repeatedly
-  /// creating the same HierPathOp.
-  DenseMap<Attribute, hw::HierPathOp> pathCache;
-
-  /// The insertion point where the pass inserts HierPathOps.
-  OpBuilder::InsertPoint pathInsertPoint = {};
+  /// Utility to create HerPathOps at a predefined location in the circuit.
+  /// This handles caching and keeps the order consistent.
+  hw::HierPathCache *hierPathCache;
 
   /// Per-module helpers for creating operations within modules.
   DenseMap<FModuleOp, ModuleState> moduleStates;
 };
-
-std::unique_ptr<mlir::Pass> circt::firrtl::createLowerXMRPass() {
-  return std::make_unique<LowerXMRPass>();
-}

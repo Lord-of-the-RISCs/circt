@@ -1,4 +1,4 @@
-; RUN: firtool %s -disable-all-randomization -split-input-file | FileCheck %s
+; RUN: firtool %s -disable-all-randomization -split-input-file -lowering-options=emittedLineLength=1024 | FileCheck %s
 
 ; This is an end-to-end example of a test-bench (Foo) enabling verification,
 ; probing into a device-under-test (Bar), and reading from hardware which is
@@ -46,12 +46,6 @@ circuit Foo: %[[
   ; CHECK: );
   ; CHECK: endmodule
 
-  ; CHECK: FILE "testbench{{[/\]}}layers-Foo-Verification.sv"
-  ; CHECK: `ifndef layers_Foo_Verification
-  ; CHECK: `define layers_Foo_Verification
-  ; CHECK: bind Bar Bar_Verification verification ();
-  ; CHECK: `endif // layers_Foo_Verification
-
   ; CHECK: FILE "testbench{{[/\]}}VerificationHelper.sv"
   ; CHECK: module VerificationHelper();
   ; CHECK:   wire w = 1'h0;
@@ -61,7 +55,14 @@ circuit Foo: %[[
   ; CHECK: module Bar_Verification();
   ; CHECK:   wire c = 1'h0;
   ; CHECK:   wire c_probe = c;
+  ; CHECK:   VerificationHelper helper ();
   ; CHECK: endmodule
+
+  ; CHECK FILE "testbench{{[/\]}}layers-Bar-Verification.sv"
+  ; CHECK: `ifndef layers_Bar_Verification
+  ; CHECK:   `define layers_Bar_Verification
+  ; CHECK:   bind Bar Bar_Verification verification ();
+  ; CHECK: `endif // not def layers_Bar_Verification
 
   ; CHECK: FILE "testbench{{[/\]}}Foo.sv"
   ; CHECK: module Foo();
@@ -70,6 +71,12 @@ circuit Foo: %[[
   ; CHECK:   .a (d)
   ; CHECK:   );
   ; CHECK: endmodule
+
+  ; CHECK: FILE "testbench{{[/\]}}layers-Foo-Verification.sv"
+  ; CHECK: `ifndef layers_Foo_Verification
+  ; CHECK:   `define layers_Foo_Verification
+  ; CHECK:   `include "layers-Bar-Verification.sv"
+  ; CHECK: `endif // not def layers_Foo_Verification
 
 ; // -----
 
@@ -83,14 +90,11 @@ circuit TestHarness:
 
   layer Verification, bind:
 
-  ; CHECK: module DUT_Verification(
-  ; CHECK:   input        clock,
-  ; CHECK:   input [31:0] a
-  ; CHECK: );
+  ; CHECK: module DUT_Verification();
   ; CHECK:   reg  [31:0] pc_d;
   ; CHECK:   wire [31:0] pc_d_probe = pc_d;
-  ; CHECK:   always @(posedge clock)
-  ; CHECK:     pc_d <= a;
+  ; CHECK:   always @(posedge DUT.clock)
+  ; CHECK:     pc_d <= DUT.a;
   ; CHECK: endmodule
 
   ; CHECK: module DUT(
@@ -124,15 +128,11 @@ circuit TestHarness:
     layerblock Verification:
       define trace = x
 
-  ; CHECK: module TestHarness_Verification(
-  ; CHECK:   input [31:0] dut_trace,
-  ; CHECK:   input        clock,
-  ; CHECK:                reset
-  ; CHECK: );
+  ; CHECK: module TestHarness_Verification()
   ; CHECK:   `ifndef SYNTHESIS
-  ; CHECK:     always @(posedge clock) begin
-  ; CHECK:       if ((`PRINTF_COND_) & reset)
-  ; CHECK:         $fwrite(`PRINTF_FD_, "The last PC was: %x", dut_trace);
+  ; CHECK:     always @(posedge TestHarness.clock) begin
+  ; CHECK:       if ((`PRINTF_COND_) & TestHarness.reset)
+  ; CHECK:         $fwrite(32'h80000002, "The last PC was: %x", TestHarness.dut.verification.pc_d_probe);
   ; CHECK:     end // always @(posedge)
   ; CHECK:   `endif // not def SYNTHESIS
   ; CHECK: endmodule
@@ -164,16 +164,172 @@ circuit TestHarness:
     layerblock Verification:
       printf(clock, reset, "The last PC was: %x", read(dut.trace))
 
+; CHECK: FILE "layers-DUT-Verification.sv
+; CHECK: `ifndef layers_DUT_Verification
+; CHECK:   `define layers_DUT_Verification
+; CHECK:   bind DUT DUT_Verification verification ();
+; CHECK: `endif // not def layers_DUT_Verification
+
 ; CHECK: FILE "layers-TestHarness-Verification.sv"
 ; CHECK: `ifndef layers_TestHarness_Verification
-; CHECK: `define layers_TestHarness_Verification
-; CHECK: bind DUT DUT_Verification verification (
-; CHECK:   .clock (clock),
-; CHECK:   .a     (a)
-; CHECK: );
-; CHECK: bind TestHarness TestHarness_Verification verification (
-; CHECK:   .dut_trace (TestHarness.dut.verification.pc_d_probe),
-; CHECK:   .clock     (clock),
-; CHECK:   .reset     (reset)
-; CHECK: );
-; CHECK: `endif // layers_TestHarness_Verification
+; CHECK:   `define layers_TestHarness_Verification
+; CHECK:   `include "layers-DUT-Verification.sv"
+; CHECK:   bind TestHarness TestHarness_Verification verification ();
+; CHECK: `endif // not def layers_TestHarness_Verification
+
+; // -----
+
+; This example demonstrates forcing _out_ of a layer into the outer module, a
+; parent layer, or into another module.
+
+FIRRTL version 5.1.0
+circuit Foo: %[[
+  {"class": "firrtl.transforms.DontTouchAnnotation", "target": "~|ForceOutOfLayer>a"},
+  {"class": "firrtl.transforms.DontTouchAnnotation", "target": "~|Submodule>root"},
+  {"class": "firrtl.transforms.DontTouchAnnotation", "target": "~|Submodule>a"},
+  {"class": "firrtl.transforms.DontTouchAnnotation", "target": "~|Submodule>b"}
+]]
+
+  layer A, bind:
+  layer B, inline:
+
+  ; Test that forcing out of a layer into the root module works.
+  ;
+  ; CHECK:      module ForceOutOfLayer_A();
+  ; CHECK:        initial
+  ; CHECK-NEXT:     force ForceOutOfLayer.a = 2'h1;
+  ; CHECK:      endmodule
+  ;
+  ; CHECK:      module ForceOutOfLayer();
+  ; CHECK:        initial
+  ; CHECK-NEXT:     force ForceOutOfLayer.a = 2'h2;
+  ; CHECK:      endmodule
+  module ForceOutOfLayer:
+
+    wire a: UInt<2>
+    connect a, UInt<2>(0)
+
+    wire a_probe: RWProbe<UInt<2>>
+    define a_probe = rwprobe(a)
+
+    layerblock A:
+      force_initial(a_probe, UInt<2>(1))
+
+    layerblock B:
+      force_initial(a_probe, UInt<2>(2))
+
+  ; Test that forcing out of a layer into another works.  Test both forcing into
+  ; the other module and forcing into a layer in the other module.
+  ;
+  ; CHECK:      module ForceIntoSubmodule_A();
+  ; CHECK:        initial
+  ; CHECK-NEXT:     force ForceIntoSubmodule.submodule.root = 2'h1;
+  ; CHECK-NEXT:     force ForceIntoSubmodule.submodule.a.a = 2'h1;
+  ; CHECK:      endmodule
+  ;
+  ; CHECK:      module ForceIntoSubmodule();
+  ; CHECK:        initial
+  ; CHECK-NEXT:     force ForceIntoSubmodule.submodule.root = 2'h2;
+  ; CHECK-NEXT:     force ForceIntoSubmodule.submodule.b = 2'h2;
+  ; CHECK:      endmodule
+  module Submodule:
+    output root_probe: RWProbe<UInt<2>>
+    output a_probe: RWProbe<UInt<2>, A>
+    output b_probe: RWProbe<UInt<2>, B>
+
+    wire root: UInt<2>
+    connect root, UInt<2>(0)
+    define root_probe = rwprobe(root)
+
+    layerblock A:
+      wire a: UInt<2>
+      connect a, UInt<2>(0)
+      define a_probe = rwprobe(a)
+
+    layerblock B:
+      wire b: UInt<2>
+      connect b, UInt<2>(0)
+      define b_probe = rwprobe(b)
+
+  module ForceIntoSubmodule:
+    inst submodule of Submodule
+
+    layerblock A:
+      force_initial(submodule.root_probe, UInt<2>(1))
+      force_initial(submodule.a_probe, UInt<2>(1))
+
+    layerblock B:
+      force_initial(submodule.root_probe, UInt<2>(2))
+      force_initial(submodule.b_probe, UInt<2>(2))
+
+  public module Foo:
+    inst forceOutOfLayer of ForceOutOfLayer
+    inst forceIntoSubmodule of ForceIntoSubmodule
+
+; // -----
+
+; LowerXMR and LowerLayers should work with nested enablelayers.  Just test that
+; this doesn't error.
+
+FIRRTL version 5.1.0
+circuit Foo:
+
+  layer A, bind:
+
+  module Bar enablelayer A:
+    input a: UInt<1>
+    output b: UInt<1>
+
+    connect b, a
+
+  ; CHECK: module Foo(
+  public module Foo enablelayer A:
+    input a: UInt<1>
+    output b: UInt<1>
+
+    inst bar of Bar
+    connect bar.a, a
+    connect b, bar.b
+
+; // -----
+
+; Check that when bindfiles include eachother, the include directive uses a path
+; relative to the output directory (or absolute).
+
+FIRRTL version 5.1.0
+circuit Foo:
+
+  layer A, bind, "A":
+  layer B, bind, "B":
+
+  extmodule Baz:
+
+  public module Bar:
+    ; This instance of an extmodule prevents Foo/bar from being DCE'd.
+    inst baz of Baz
+
+  public module Foo:
+    inst bar of Bar
+
+; CHECK: FILE "A{{[/\]}}layers-Foo-A.sv"
+; CHECK: `include "layers-Bar-A.sv"
+
+; CHECK: FILE "B{{[/\]}}layers-Foo-B.sv"
+; CHECK: `include "layers-Bar-B.sv"
+
+; // -----
+
+; Check that bindfile for Top should include layers-Bar-A, not layers-Foo-A,
+; respecting the defname of an extmodule.
+
+FIRRTL version 5.1.0
+circuit Top:
+  layer A, bind:
+
+  extmodule Foo knownlayer A:
+    defname = Bar
+
+  public module Top:
+    inst foo of Foo
+
+; CHECK: `include "layers-Bar-A.sv"

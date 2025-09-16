@@ -12,7 +12,9 @@
 
 include "mlir/IR/EnumAttr.td"
 include "mlir/IR/OpAsmInterface.td"
+include "mlir/IR/RegionKindInterface.td"
 include "mlir/Interfaces/FunctionInterfaces.td"
+include "mlir/Interfaces/CallInterfaces.td"
 include "mlir/Interfaces/ControlFlowInterfaces.td"
 include "circt/Dialect/Emit/EmitOpInterfaces.td"
 
@@ -43,10 +45,9 @@ def OrderedOutputOp : SVOp<"ordered", [SingleBlock, NoTerminator, NoRegionArgume
 }
 
 def IfDefOp : SVOp<"ifdef", [
-    SingleBlock,
-    NoTerminator,
     NoRegionArguments,
     NonProceduralOp,
+    GraphRegionNoTerminator,
     DeclareOpInterfaceMethods<SymbolUserOpInterface>
 ]> {
   let summary = "'ifdef MACRO' block";
@@ -519,6 +520,24 @@ def FWriteOp : SVOp<"fwrite", [ProceduralOp]> {
   }];
 }
 
+def FFlushOp : SVOp<"fflush", [ProceduralOp]> {
+  let summary = "'$fflush' statement";
+
+  let description = [{
+    The $fflush system task flushes the output buffer of the specified file
+    descriptor. If no file descriptor is specified, all open files are flushed.
+
+    See IEEE 1800-2023 Section 21.3.6.
+  }];
+
+  let arguments = (ins Optional<I32>:$fd);
+  let results = (outs);
+
+  let assemblyFormat = [{
+     (`fd` $fd^)? attr-dict
+  }];
+}
+
 def VerbatimOp : SVOp<"verbatim"> {
   let summary = "Verbatim opaque text emitted inline.";
   let description = [{
@@ -836,6 +855,23 @@ def ForOp : SVOp<"for", [SingleBlock, NoTerminator, ProceduralOp,
 // Macros
 //===----------------------------------------------------------------------===//
 
+def MacroErrorOp : SVOp<"macro.error"> {
+  let summary = "Produce a compilation error using the preprocessor";
+  let description = [{
+    The `sv.macro.error` op represents a static error in System Verilog. Since
+    System Verilog lacks an error preprocessor directive, this is emitted as a
+    reference to an undefined macro definition.
+
+    We reserve the macro prefix _ERROR for emitting static assertions.
+  }];
+  let arguments = (ins OptionalAttr<StrAttr>:$message);
+  let assemblyFormat = "($message^)? attr-dict";
+  let extraClassDeclaration = [{
+    /// Build the bogus macro identifier for this error op. Do not define this
+    /// macro identifier. The identifier will be prefixed by `_ERROR`.
+    std::string getMacroIdentifier();
+  }];
+}
 
 def MacroDeclOp : SVOp<"macro.decl", [Symbol]> {
   let summary = "System verilog macro declaration";
@@ -899,9 +935,15 @@ def MacroDefOp : SVOp<"macro.def",
   let results = (outs);
 
   let builders = [
-    OpBuilder<(ins "StringRef":$macroName, "StringRef":$format_string),
-                "build($_builder, $_state, macroName, format_string,"
-                "odsBuilder.getArrayAttr({}));">
+    OpBuilder<(ins "FlatSymbolRefAttr":$macroName), [{
+      auto formatString = StringAttr::get($_builder.getContext());
+      auto symbols = $_builder.getArrayAttr({});
+      build($_builder, $_state, macroName, formatString, symbols);
+    }]>,
+    OpBuilder<(ins "StringRef":$macroName, "StringRef":$formatString), [{
+      auto symbols = $_builder.getArrayAttr({});
+      build($_builder, $_state, macroName, formatString, symbols);
+    }]>
   ];
 
   let assemblyFormat = [{
@@ -913,6 +955,22 @@ def MacroDefOp : SVOp<"macro.def",
   }];
 }
 
+def IncludeStyle
+    : I32EnumAttr<
+          "IncludeStyle",
+          "Double-quoted local include, or angle bracketed system include",
+          [I32EnumAttrCase<"Local", 0, "local">,
+           I32EnumAttrCase<"System", 1, "system">]> {
+  let genSpecializedAttr = 0;
+}
+
+def IncludeStyleAttr : EnumAttr<SVDialect, IncludeStyle, "include_style">;
+
+def IncludeOp : SVOp<"include"> {
+  let summary = "preprocessor `include directive";
+  let arguments = (ins IncludeStyleAttr:$style, StrAttr:$target);
+  let assemblyFormat = [{ $style $target attr-dict }];
+}
 
 //===----------------------------------------------------------------------===//
 // Function/Call

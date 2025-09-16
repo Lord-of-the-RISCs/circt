@@ -72,7 +72,7 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
   Problem problem(pipeline);
 
   DenseMap<SymbolRefAttr, Problem::OperatorType> operatorTypes;
-  SmallDenseMap<StringAttr, unsigned> oprIds;
+  SmallDenseMap<ssp::OperatorType, unsigned> oprIds;
 
   // Set operation operator types.
   auto returnOp =
@@ -148,8 +148,8 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
 
   // Create the scheduled pipeline.
   b.setInsertionPoint(pipeline);
-  auto schedPipeline = b.template create<pipeline::ScheduledPipelineOp>(
-      pipeline.getLoc(), pipeline.getDataOutputs().getTypes(),
+  auto schedPipeline = pipeline::ScheduledPipelineOp::create(
+      b, pipeline.getLoc(), pipeline.getDataOutputs().getTypes(),
       pipeline.getInputs(), pipeline.getInputNames(), pipeline.getOutputNames(),
       pipeline.getClock(), pipeline.getGo(), pipeline.getReset(),
       pipeline.getStall(), pipeline.getNameAttr());
@@ -180,8 +180,8 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
       // Create a StageOp in the new stage, and branch it to the newly created
       // stage.
       b.setInsertionPointToEnd(currentStage);
-      b.create<pipeline::StageOp>(pipeline.getLoc(), newStage, ValueRange{},
-                                  ValueRange{});
+      pipeline::StageOp::create(b, pipeline.getLoc(), newStage, ValueRange{},
+                                ValueRange{});
       currentStage = newStage;
     }
   }
@@ -198,10 +198,33 @@ ScheduleLinearPipelinePass::schedulePipeline(UnscheduledPipelineOp pipeline) {
 
   for (auto [startTime, ops] : stageMap) {
     Block *stage = schedPipeline.getStage(startTime);
+
+    // Caching of SourceOp passthrough values defined in this stage.
+    mlir::DenseMap<Value, Value> sourceOps;
+    auto getOrCreateSourceOp = [&](OpOperand &opOperand) -> Value {
+      Value v = opOperand.get();
+      auto it = sourceOps.find(v);
+      if (it == sourceOps.end()) {
+        b.setInsertionPoint(opOperand.getOwner());
+        it = sourceOps
+                 .try_emplace(v, SourceOp::create(b, v.getLoc(), v).getResult())
+                 .first;
+      }
+      return it->second;
+    };
+
     assert(stage && "Stage not found");
     Operation *stageTerminator = stage->getTerminator();
-    for (auto *op : ops)
+    for (auto *op : ops) {
       op->moveBefore(stageTerminator);
+
+      // If the operation references values defined outside of this stage,
+      // modify their uses to point to the corresponding SourceOp.
+      for (OpOperand &operand : op->getOpOperands()) {
+        if (operand.get().getParentBlock() != stage)
+          operand.set(getOrCreateSourceOp(operand));
+      }
+    }
   }
 
   // Remove the unscheduled pipeline

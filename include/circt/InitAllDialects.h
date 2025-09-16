@@ -14,11 +14,11 @@
 #ifndef CIRCT_INITALLDIALECTS_H_
 #define CIRCT_INITALLDIALECTS_H_
 
-#include "circt/Dialect/AIG/AIGDialect.h"
 #include "circt/Dialect/Arc/ArcDialect.h"
 #include "circt/Dialect/Calyx/CalyxDialect.h"
 #include "circt/Dialect/Comb/CombDialect.h"
 #include "circt/Dialect/DC/DCDialect.h"
+#include "circt/Dialect/Datapath/DatapathDialect.h"
 #include "circt/Dialect/Debug/DebugDialect.h"
 #include "circt/Dialect/ESI/ESIDialect.h"
 #include "circt/Dialect/Emit/EmitDialect.h"
@@ -41,13 +41,14 @@
 #ifdef CIRCT_INCLUDE_TESTS
 #include "circt/Dialect/RTGTest/IR/RTGTestDialect.h"
 #endif
-#include "circt/Dialect/SMT/SMTDialect.h"
 #include "circt/Dialect/SSP/SSPDialect.h"
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Dialect/Sim/SimDialect.h"
+#include "circt/Dialect/Synth/SynthDialect.h"
 #include "circt/Dialect/SystemC/SystemCDialect.h"
 #include "circt/Dialect/Verif/VerifDialect.h"
+#include "mlir/Dialect/SMT/IR/SMTDialect.h"
 #include "mlir/IR/Dialect.h"
 
 namespace circt {
@@ -56,11 +57,11 @@ namespace circt {
 inline void registerAllDialects(mlir::DialectRegistry &registry) {
   // clang-format off
   registry.insert<
-    aig::AIGDialect,
     arc::ArcDialect,
     calyx::CalyxDialect,
     chirrtl::CHIRRTLDialect,
     comb::CombDialect,
+    datapath::DatapathDialect,
     dc::DCDialect,
     debug::DebugDialect,
     emit::EmitDialect,
@@ -85,9 +86,10 @@ inline void registerAllDialects(mlir::DialectRegistry &registry) {
 #endif
     seq::SeqDialect,
     sim::SimDialect,
-    smt::SMTDialect,
+    mlir::smt::SMTDialect,
     ssp::SSPDialect,
     sv::SVDialect,
+    synth::SynthDialect,
     systemc::SystemCDialect,
     verif::VerifDialect
   >();

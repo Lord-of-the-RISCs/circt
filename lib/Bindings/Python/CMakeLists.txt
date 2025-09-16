@@ -20,10 +20,10 @@ set(PYTHON_BINDINGS_SOURCES
   MSFTModule.cpp
   OMModule.cpp
   RTGModule.cpp
-  RTGToolModule.cpp
   SeqModule.cpp
   SupportModule.cpp
   SVModule.cpp
+  SynthModule.cpp
   # Headers must be included explicitly so they are installed.
   CIRCTModules.h
   NanobindUtils.h
@@ -42,17 +42,22 @@ set(PYTHON_BINDINGS_LINK_LIBS
   CIRCTCAPIHandshake
   CIRCTCAPIHW
   CIRCTCAPIHWArith
+  CIRCTCAPIKanagawa
   CIRCTCAPILTL
   CIRCTCAPIMSFT
   CIRCTCAPIOM
+  CIRCTCAPIPipeline
   CIRCTCAPIRTG
-  CIRCTCAPIRtgTool
   CIRCTCAPISeq
-  CIRCTCAPISMT
   CIRCTCAPISV
+  CIRCTCAPISupport
   CIRCTCAPIVerif
   CIRCTCAPITransforms
+  CIRCTCAPISynth
   MLIRCAPIIndex
+  MLIRCAPISMT
+  MLIRCAPIExportSMTLIB
+  MLIRCAPISCF
   # needed for mlirFrozenRewritePatternSetDestroy
   # but not the actual passes
   MLIRCAPITransforms
@@ -75,6 +80,10 @@ declare_mlir_python_extension(CIRCTBindingsPythonExtension
     nanobind
 )
 
+if (CIRCT_INCLUDE_TESTS)
+  target_compile_definitions(CIRCTBindingsPythonExtension INTERFACE CIRCT_INCLUDE_TESTS)
+endif()
+
 add_dependencies(CIRCTBindingsPythonExtension circt-headers)
 
 ################################################################################
@@ -91,7 +100,6 @@ declare_mlir_python_sources(CIRCTBindingsPythonSources.Support
   ADD_TO_PARENT CIRCTBindingsPythonSources
   SOURCES
     support.py
-    rtgtool_support.py
 )
 
 ################################################################################
@@ -112,6 +120,14 @@ declare_mlir_dialect_python_bindings(
   SOURCES
     dialects/comb.py
   DIALECT_NAME comb)
+
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
+  TD_FILE dialects/SynthOps.td
+  SOURCES
+    dialects/synth.py
+  DIALECT_NAME synth)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -144,6 +160,18 @@ declare_mlir_dialect_python_bindings(
   SOURCES
     dialects/hw.py
   DIALECT_NAME hw)
+
+# We need the 'arith.py' file because 'scf.py' imports from it. We are not
+# calling the function that constructs arith ops and thus don't need to
+# register and link against the dialect.
+declare_mlir_dialect_python_bindings(
+  ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
+  ROOT_DIR "${MLIR_MAIN_SRC_DIR}/python/mlir"
+  TD_FILE dialects/ArithOps.td
+  SOURCES
+    dialects/arith.py
+  DIALECT_NAME arith
+  GEN_ENUM_BINDINGS)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -238,11 +266,11 @@ declare_mlir_dialect_python_bindings(
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
-  ROOT_DIR "${CMAKE_CURRENT_SOURCE_DIR}"
-  TD_FILE dialects/SMTOps.td
+  ROOT_DIR "${MLIR_MAIN_SRC_DIR}/python/mlir"
+  TD_FILE dialects/SCFOps.td
   SOURCES
-    dialects/smt.py
-  DIALECT_NAME smt)
+    dialects/scf.py
+  DIALECT_NAME scf)
 
 declare_mlir_dialect_python_bindings(
   ADD_TO_PARENT CIRCTBindingsPythonSources.Dialects
@@ -273,6 +301,7 @@ add_mlir_python_modules(CIRCTPythonModules
   INSTALL_PREFIX "python_packages/circt_core/circt"
   DECLARED_SOURCES
     MLIRPythonSources.Core
+    MLIRPythonSources.Dialects.smt
     CIRCTBindingsPythonExtension
     CIRCTBindingsPythonSources
   COMMON_CAPI_LINK_LIBS

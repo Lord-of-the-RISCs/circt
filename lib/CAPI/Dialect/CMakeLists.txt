@@ -12,19 +12,24 @@ set(LLVM_OPTIONAL_SOURCES
   HW.cpp
   HWArith.cpp
   Handshake.cpp
+  Kanagawa.cpp
   LLHD.cpp
   LTL.cpp
   MSFT.cpp
   Moore.cpp
   OM.cpp
+  Pipeline.cpp
   RTG.cpp
   RTGTest.cpp
   SV.cpp
   Seq.cpp
   SMT.cpp
   SSP.cpp
+  Synth.cpp
   Verif.cpp
 )
+
+
 
 add_circt_public_c_api_library(CIRCTCAPIArc
   Arc.cpp
@@ -133,12 +138,31 @@ add_circt_public_c_api_library(CIRCTCAPIOM
   CIRCTOMEvaluator
 )
 
+add_circt_public_c_api_library(CIRCTCAPIKanagawa
+  Kanagawa.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTKanagawa
+  CIRCTKanagawaTransforms
+)
+
+add_circt_public_c_api_library(CIRCTCAPIPipeline
+  Pipeline.cpp
+
+  LINK_LIBS PUBLIC
+  MLIRCAPIIR
+  CIRCTPipelineOps
+  CIRCTPipelineTransforms
+)
+
 add_circt_public_c_api_library(CIRCTCAPIRTG
   RTG.cpp
 
   LINK_LIBS PUBLIC
   MLIRCAPIIR
   CIRCTRTGDialect
+  CIRCTRTGTransforms
 )
 
 if(CIRCT_INCLUDE_TESTS)
@@ -236,10 +260,13 @@ add_circt_public_c_api_library(CIRCTCAPIEmit
   CIRCTEmit
 )
 
-add_circt_public_c_api_library(CIRCTCAPISMT
-  SMT.cpp
+add_circt_public_c_api_library(CIRCTCAPISynth
+  Synth.cpp
 
   LINK_LIBS PUBLIC
   MLIRCAPIIR
-  CIRCTSMT
+  CIRCTSynth
+  CIRCTSynthAnalysis
+  CIRCTSynthTransforms
+  CIRCTCAPISupport
 )

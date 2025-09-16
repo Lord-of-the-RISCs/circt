@@ -16,6 +16,7 @@
 #include "circt/Conversion/Passes.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
+#include "circt/Dialect/Verif/VerifPasses.h"
 #include "circt/Support/LLVM.h"
 #include "mlir/Pass/PassManager.h"
 #include "llvm/Support/CommandLine.h"
@@ -53,9 +54,6 @@ public:
 
   StringRef getOutputFilename() const { return outputFilename; }
   StringRef getBlackBoxRootPath() const { return blackBoxRootPath; }
-  StringRef getChiselInterfaceOutputDirectory() const {
-    return chiselInterfaceOutDirectory;
-  }
   StringRef getReplaceSequentialMemoriesFile() const { return replSeqMemFile; }
   StringRef getOutputAnnotationFilename() const {
     return outputAnnotationFilename;
@@ -98,12 +96,10 @@ public:
   bool shouldReplaceSequentialMemories() const { return replSeqMem; }
   bool shouldDisableLayerSink() const { return disableLayerSink; }
   bool shouldDisableOptimization() const { return disableOptimization; }
-  bool shouldAdvancedLayerSink() const { return advancedLayerSink; }
   bool shouldLowerMemories() const { return lowerMemories; }
   bool shouldDedup() const { return !noDedup; }
   bool shouldEnableDebugInfo() const { return enableDebugInfo; }
   bool shouldIgnoreReadEnableMemories() const { return ignoreReadEnableMem; }
-  bool shouldExportChiselInterface() const { return exportChiselInterface; }
   bool shouldConvertVecOfBundle() const { return vbToBV; }
   bool shouldEtcDisableInstanceExtraction() const {
     return etcDisableInstanceExtraction;
@@ -131,11 +127,21 @@ public:
   }
   bool shouldExtractTestCode() const { return extractTestCode; }
   bool shouldFixupEICGWrapper() const { return fixupEICGWrapper; }
-  bool shouldAddCompanionAssume() const { return addCompanionAssume; }
   bool shouldDisableCSEinClasses() const { return disableCSEinClasses; }
   bool shouldSelectDefaultInstanceChoice() const {
     return selectDefaultInstanceChoice;
   }
+
+  verif::SymbolicValueLowering getSymbolicValueLowering() const {
+    return symbolicValueLowering;
+  }
+  bool shouldDisableWireElimination() const { return disableWireElimination; }
+
+  bool getLintStaticAsserts() const { return lintStaticAsserts; }
+
+  bool getLintXmrsInDesign() const { return lintXmrsInDesign; }
+
+  bool getEmitAllBindFiles() const { return emitAllBindFiles; }
 
   // Setters, used by the CAPI
   FirtoolOptions &setOutputFilename(StringRef name) {
@@ -200,16 +206,6 @@ public:
     return *this;
   }
 
-  FirtoolOptions &setExportChiselInterface(bool value) {
-    exportChiselInterface = value;
-    return *this;
-  }
-
-  FirtoolOptions &setChiselInterfaceOutDirectory(StringRef value) {
-    chiselInterfaceOutDirectory = value;
-    return *this;
-  }
-
   FirtoolOptions &setVbToBV(bool value) {
     vbToBV = value;
     return *this;
@@ -227,11 +223,6 @@ public:
 
   FirtoolOptions &setDisableAggressiveMergeConnections(bool value) {
     disableAggressiveMergeConnections = value;
-    return *this;
-  }
-
-  FirtoolOptions &setAdvancedLayerSink(bool value) {
-    advancedLayerSink = value;
     return *this;
   }
 
@@ -361,11 +352,6 @@ public:
     return *this;
   }
 
-  FirtoolOptions &setAddCompanionAssume(bool value) {
-    addCompanionAssume = value;
-    return *this;
-  }
-
   FirtoolOptions &setDisableCSEinClasses(bool value) {
     disableCSEinClasses = value;
     return *this;
@@ -376,12 +362,40 @@ public:
     return *this;
   }
 
+  FirtoolOptions &setSymbolicValueLowering(verif::SymbolicValueLowering mode) {
+    symbolicValueLowering = mode;
+    return *this;
+  }
+
+  FirtoolOptions &setDisableWireElimination(bool value) {
+    disableWireElimination = value;
+    return *this;
+  }
+
+  FirtoolOptions &setLintStaticAsserts(bool value) {
+    lintStaticAsserts = value;
+    return *this;
+  }
+
+  FirtoolOptions &setLintXmrsInDesign(bool value) {
+    lintXmrsInDesign = value;
+    return *this;
+  }
+
+  FirtoolOptions &setEmitAllBindFiles(bool value) {
+    emitAllBindFiles = value;
+    return *this;
+  }
+
 private:
   std::string outputFilename;
+
+  // LowerFIRRTLAnnotations
   bool disableAnnotationsUnknown;
   bool disableAnnotationsClassless;
   bool lowerAnnotationsNoRefTypePorts;
   bool allowAddingPortsOnPublic;
+
   bool probesToSignals;
   firrtl::PreserveAggregate::PreserveMode preserveAggregate;
   firrtl::PreserveValues::PreserveMode preserveMode;
@@ -389,13 +403,10 @@ private:
   BuildMode buildMode;
   bool disableLayerSink;
   bool disableOptimization;
-  bool exportChiselInterface;
-  std::string chiselInterfaceOutDirectory;
   bool vbToBV;
   bool noDedup;
   firrtl::CompanionMode companionMode;
   bool disableAggressiveMergeConnections;
-  bool advancedLayerSink;
   bool lowerMemories;
   std::string blackBoxRootPath;
   bool replSeqMem;
@@ -422,9 +433,13 @@ private:
   bool stripFirDebugInfo;
   bool stripDebugInfo;
   bool fixupEICGWrapper;
-  bool addCompanionAssume;
   bool disableCSEinClasses;
   bool selectDefaultInstanceChoice;
+  verif::SymbolicValueLowering symbolicValueLowering;
+  bool disableWireElimination;
+  bool lintStaticAsserts;
+  bool lintXmrsInDesign;
+  bool emitAllBindFiles;
 };
 
 void registerFirtoolCLOptions();
@@ -433,11 +448,11 @@ LogicalResult populatePreprocessTransforms(mlir::PassManager &pm,
                                            const FirtoolOptions &opt);
 
 LogicalResult populateCHIRRTLToLowFIRRTL(mlir::PassManager &pm,
-                                         const FirtoolOptions &opt,
-                                         StringRef inputFilename);
+                                         const FirtoolOptions &opt);
 
 LogicalResult populateLowFIRRTLToHW(mlir::PassManager &pm,
-                                    const FirtoolOptions &opt);
+                                    const FirtoolOptions &opt,
+                                    StringRef inputFilename);
 
 LogicalResult populateHWToSV(mlir::PassManager &pm, const FirtoolOptions &opt);
 

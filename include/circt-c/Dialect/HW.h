@@ -124,6 +124,11 @@ MLIR_CAPI_EXPORTED MlirType hwModuleTypeGetOutputType(MlirType type,
 /// Get an HW module type's output name at a specific index.
 MLIR_CAPI_EXPORTED MlirStringRef hwModuleTypeGetOutputName(MlirType type,
                                                            intptr_t index);
+
+/// Get an HW module type's port info at a specific index.
+MLIR_CAPI_EXPORTED void hwModuleTypeGetPort(MlirType type, intptr_t index,
+                                            HWModulePort *ret);
+
 /// Creates an HW struct type in the context associated with the elements.
 MLIR_CAPI_EXPORTED MlirType hwStructTypeGet(MlirContext ctx,
                                             intptr_t numElements,
@@ -191,6 +196,8 @@ MLIR_CAPI_EXPORTED MlirAttribute hwParamVerbatimAttrGet(MlirAttribute text);
 MLIR_CAPI_EXPORTED bool hwAttrIsAOutputFileAttr(MlirAttribute);
 MLIR_CAPI_EXPORTED MlirAttribute hwOutputFileGetFromFileName(
     MlirAttribute text, bool excludeFromFileList, bool includeReplicatedOp);
+MLIR_CAPI_EXPORTED MlirStringRef
+hwOutputFileGetFileName(MlirAttribute outputFile);
 
 //===----------------------------------------------------------------------===//
 // InstanceGraph API.

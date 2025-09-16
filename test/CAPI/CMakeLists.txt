@@ -13,7 +13,6 @@ target_link_libraries(circt-capi-ir-test
   CIRCTCAPISV
   CIRCTCAPIFSM
   CIRCTCAPIExportFIRRTL
-  CIRCTCAPIExportSMTLIB
   CIRCTCAPIExportVerilog
 )
 
@@ -64,40 +63,11 @@ add_llvm_executable(circt-capi-arc-test
 )
 llvm_update_compile_flags(circt-capi-arc-test)
 
-add_llvm_executable(circt-capi-smtlib-test
-  PARTIAL_SOURCES_INTENDED
-  smtlib.c
-)
-llvm_update_compile_flags(circt-capi-smtlib-test)
-
-target_link_libraries(circt-capi-smtlib-test
-  PRIVATE
-
-  MLIRCAPIIR
-  MLIRCAPIFunc
-  CIRCTCAPISMT
-  CIRCTCAPIExportSMTLIB
-)
-
 target_link_libraries(circt-capi-arc-test
   PRIVATE
 
   MLIRCAPIIR
   CIRCTCAPIArc
-)
-
-add_llvm_executable(circt-capi-rtg-pipelines-test
-  PARTIAL_SOURCES_INTENDED
-  rtg-pipelines.c
-)
-llvm_update_compile_flags(circt-capi-rtg-pipelines-test)
-
-target_link_libraries(circt-capi-rtg-pipelines-test
-  PRIVATE
-
-  MLIRCAPIIR
-  CIRCTCAPIRTG
-  CIRCTCAPIRtgTool
 )
 
 add_llvm_executable(circt-capi-rtg-test
@@ -125,4 +95,36 @@ target_link_libraries(circt-capi-rtgtest-test
 
   MLIRCAPIIR
   CIRCTCAPIRTGTest
+)
+
+add_llvm_executable(circt-capi-synth-test
+  PARTIAL_SOURCES_INTENDED
+  synth.c
+)
+
+llvm_update_compile_flags(circt-capi-synth-test)
+
+target_link_libraries(circt-capi-synth-test
+  PRIVATE
+
+  MLIRCAPIIR
+  CIRCTCAPIHW
+  CIRCTCAPISeq
+  CIRCTCAPISynth
+)
+
+add_llvm_executable(circt-capi-support-test
+  PARTIAL_SOURCES_INTENDED
+  support.c
+)
+llvm_update_compile_flags(circt-capi-support-test)
+
+target_link_libraries(circt-capi-support-test
+  PRIVATE
+
+  MLIRCAPIIR
+  CIRCTCAPIHW
+  CIRCTCAPISeq
+  CIRCTCAPISupport
+  CIRCTCAPISynth
 )

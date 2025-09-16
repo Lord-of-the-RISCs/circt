@@ -12,7 +12,7 @@
 // Check if printing with very short line length, removing info locators (@[...]), no line is longer than 5x line length.
 // RUN: circt-translate --export-firrtl %s --target-line-length=10 | sed -e 's/ @\[.*\]//' | FileCheck %s --implicit-check-not "{{^(.{50})}}" --check-prefix PRETTY
 
-// CHECK-LABEL: FIRRTL version 4.2.0
+// CHECK-LABEL: FIRRTL version 5.1.0
 // CHECK-LABEL: circuit Foo :
 // PRETTY-LABEL: circuit Foo :
 firrtl.circuit "Foo" {
@@ -114,8 +114,10 @@ firrtl.circuit "Foo" {
     firrtl.stop %someClock, %ui1, 42 {name = "foo"} : !firrtl.clock, !firrtl.uint<1>
     // CHECK: skip
     firrtl.skip
-    // CHECK: printf(someClock, ui1, "some\n magic\"stuff\"", ui1, someReset) : foo
+    // CHECK: printf(someClock, ui1, "some\n magic\"stuff\"") : foo
     firrtl.printf %someClock, %ui1, "some\n magic\"stuff\"" {name = "foo"} (%ui1, %someReset) : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.reset
+    // CHECK: fprintf(someClock, ui1, "test%d.txt", ui1, "some\n magic\"stuff\"") : foo
+    firrtl.fprintf %someClock, %ui1, "test%d.txt"(%ui1), "some\n magic\"stuff\"" (%ui1, %someReset) {name = "foo"} : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.reset
     // CHECK: assert(someClock, ui1, ui1, "msg") : foo
     // CHECK: assume(someClock, ui1, ui1, "msg") : foo
     // CHECK: cover(someClock, ui1, ui1, "msg") : foo
@@ -754,10 +756,16 @@ firrtl.circuit "Foo" {
   } {}
 
   // CHECK:      extmodule ExtModuleWithEnabledLayers
+  // CHECK-NEXT:     knownlayer GroupA
+  // CHECK-NEXT:     knownlayer GroupA.GroupB
   // CHECK-NEXT:     enablelayer GroupA
   // CHECK-NEXT:     enablelayer GroupA.GroupB :
   firrtl.extmodule @ExtModuleWithEnabledLayers() attributes {
     layers = [
+      @GroupA,
+      @GroupA::@GroupB
+    ],
+    knownLayers = [
       @GroupA,
       @GroupA::@GroupB
     ]
@@ -869,15 +877,107 @@ firrtl.circuit "Foo" {
     firrtl.int.generic "circt_verif_assert"  %8 : (!firrtl.uint<1>) -> ()
   }
 
-  // CHECK-LABEL: formal someTestName of Foo :
+  // CHECK-LABEL: formal someFormalTest of Foo :
   // CHECK-NEXT: a_int = 42
   // CHECK-NEXT: b_string = "hello"
   // CHECK-NEXT: c_array = [42, "hello", [9001], {foo = 1337}]
   // CHECK-NEXT: d_map = {a = 42, b = "hello", c = [9001], d = {foo = 1337}}
-  firrtl.formal @someTestName, @Foo {
+  firrtl.formal @someFormalTest, @Foo {
     a_int = 42,
     b_string = "hello",
     c_array = [42, "hello", [9001], {foo = 1337}],
     d_map = {a = 42, b = "hello", c = [9001], d = {foo = 1337}}
   }
+
+  // CHECK-LABEL: simulation someSimulationTest of SimulationTop :
+  // CHECK-NEXT: a_int = 42
+  // CHECK-NEXT: b_string = "hello"
+  // CHECK-NEXT: c_array = [42, "hello", [9001], {foo = 1337}]
+  // CHECK-NEXT: d_map = {a = 42, b = "hello", c = [9001], d = {foo = 1337}}
+  firrtl.simulation @someSimulationTest, @SimulationTop {
+    a_int = 42,
+    b_string = "hello",
+    c_array = [42, "hello", [9001], {foo = 1337}],
+    d_map = {a = 42, b = "hello", c = [9001], d = {foo = 1337}}
+  }
+
+  firrtl.extmodule @SimulationTop(
+    in clock: !firrtl.clock,
+    in init: !firrtl.uint<1>,
+    out done: !firrtl.uint<1>,
+    out success: !firrtl.uint<1>
+  )
+
+  // CHECK-LABEL: module Printf
+  firrtl.module @Printf(in %clock: !firrtl.clock, in %i8: !firrtl.uint<8>) attributes {convention = #firrtl<convention scalarized>} {
+    %c1_ui1 = firrtl.constant 1 : !firrtl.const.uint<1>
+
+    // CHECK: printf(clock, UInt<1>(1), "%b, %0b, %8b", i8, i8, i8)
+    firrtl.printf %clock, %c1_ui1, "%b, %0b, %8b" (%i8, %i8, %i8) : !firrtl.clock, !firrtl.const.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>, !firrtl.uint<8>
+    // CHECK: printf(clock, UInt<1>(1), "%d, %0d, %8d", i8, i8, i8)
+    firrtl.printf %clock, %c1_ui1, "%d, %0d, %8d" (%i8, %i8, %i8) : !firrtl.clock, !firrtl.const.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>, !firrtl.uint<8>
+    // CHECK: printf(clock, UInt<1>(1), "%x, %0x, %8x", i8, i8, i8)
+    firrtl.printf %clock, %c1_ui1, "%x, %0x, %8x" (%i8, %i8, %i8) : !firrtl.clock, !firrtl.const.uint<1>, !firrtl.uint<8>, !firrtl.uint<8>, !firrtl.uint<8>
+
+    // CHECK: printf(clock, UInt<1>(1), "%c", i8)
+    firrtl.printf %clock, %c1_ui1, "%c" (%i8) : !firrtl.clock, !firrtl.const.uint<1>, !firrtl.uint<8>
+
+    // CHECK: printf(clock, UInt<1>(1), "%%")
+    firrtl.printf %clock, %c1_ui1, "%%" : !firrtl.clock, !firrtl.const.uint<1>
+
+    // CHECK: fprintf(clock, UInt<1>(1), "test.txt", "%%")
+    firrtl.fprintf %clock, %c1_ui1, "test.txt", "%%" : !firrtl.clock, !firrtl.const.uint<1>
+
+    // CHECK: fflush(clock, UInt<1>(1))
+    firrtl.fflush %clock, %c1_ui1 : !firrtl.clock, !firrtl.const.uint<1>
+
+    // CHECK{LITERAL}: fflush(clock, UInt<1>(1), "test%d{{SimulationTime}}.txt", UInt<1>(1))
+    %time = firrtl.fstring.time : !firrtl.fstring
+    firrtl.fflush %clock, %c1_ui1, "test%d{{}}.txt"(%c1_ui1, %time) : !firrtl.clock, !firrtl.const.uint<1>, !firrtl.const.uint<1>, !firrtl.fstring
+  }
+
+  // CHECK-LABEL: module Concat :
+  firrtl.module @Concat(in %x: !firrtl.uint<1>, in %y: !firrtl.sint<1>, in %z: !firrtl.uint<1>) {
+    %cat_0_tmp = firrtl.cat  : () -> !firrtl.uint<0>
+    %cat_1_tmp = firrtl.cat %x : (!firrtl.uint<1>) -> !firrtl.uint<1>
+    %cat_1_signed_tmp = firrtl.cat %y : (!firrtl.sint<1>) -> !firrtl.uint<1>
+    %cat_2_tmp = firrtl.cat %x, %z : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<2>
+    %cat_3_tmp = firrtl.cat %x, %z, %x : (!firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<3>
+    // CHECK:      node cat_0_node = UInt<0>(0)
+    // CHECK-NEXT: node cat_1_node = x
+    // CHECK-NEXT: node cat_1_signed_node = cat(y, SInt<0>(0))
+    // CHECK-NEXT: node cat_2_node = cat(x, z)
+    // CHECK-NEXT: node cat_3_node = cat(x, cat(z, x))
+    %cat_0_node = firrtl.node %cat_0_tmp : !firrtl.uint<0>
+    %cat_1_node = firrtl.node %cat_1_tmp : !firrtl.uint<1>
+    %cat_1_signed_node = firrtl.node %cat_1_signed_tmp : !firrtl.uint<1>
+    %cat_2_node = firrtl.node %cat_2_tmp : !firrtl.uint<2>
+    %cat_3_node = firrtl.node %cat_3_tmp : !firrtl.uint<3>
+  }
+
+  // CHECK-LABEL: domain ClockDomain :
+  firrtl.domain @ClockDomain {}
+
+  // CHECK-LABEL: module Domains :
+  firrtl.module @Domains(
+    // CHECK-NEXT: input A : Domain of ClockDomain
+    // CHECK-NEXT: input B : Domain of ClockDomain
+    // CHECK-NEXT: input a : UInt<1> domains [A]
+    // CHECK-NEXT: input ab : UInt<1> domains [A, B]
+    in %A: !firrtl.domain of @ClockDomain,
+    in %B: !firrtl.domain of @ClockDomain,
+    in %a: !firrtl.uint<1> domains [%A],
+    in %ab: !firrtl.uint<1> domains [%A, %B]
+  ) {
+    // CHECK: node noDomains = unsafe_domain_cast(a)
+    %0 = firrtl.unsafe_domain_cast %a : !firrtl.uint<1>
+    %noDomains = firrtl.node %0 : !firrtl.uint<1>
+    // CHECK-NEXT: node oneDomain = unsafe_domain_cast(a, A)
+    %1 = firrtl.unsafe_domain_cast %a domains %A : !firrtl.uint<1>
+    %oneDomain = firrtl.node %1 : !firrtl.uint<1>
+    // CHECK-NEXT: node twoDomains = unsafe_domain_cast(a, A, B)
+    %2 = firrtl.unsafe_domain_cast %a domains %A, %B : !firrtl.uint<1>
+    %twoDomains = firrtl.node %2 : !firrtl.uint<1>
+  }
+
 }

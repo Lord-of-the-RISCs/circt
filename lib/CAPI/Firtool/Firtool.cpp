@@ -135,16 +135,6 @@ void circtFirtoolOptionsSetDisableOptimization(
   unwrap(options)->setDisableOptimization(value);
 }
 
-void circtFirtoolOptionsSetExportChiselInterface(
-    CirctFirtoolFirtoolOptions options, bool value) {
-  unwrap(options)->setExportChiselInterface(value);
-}
-
-void circtFirtoolOptionsSetChiselInterfaceOutDirectory(
-    CirctFirtoolFirtoolOptions options, MlirStringRef value) {
-  unwrap(options)->setChiselInterfaceOutDirectory(unwrap(value));
-}
-
 void circtFirtoolOptionsSetVbToBv(CirctFirtoolFirtoolOptions options,
                                   bool value) {
   unwrap(options)->setVbToBV(value);
@@ -340,16 +330,17 @@ circtFirtoolPopulatePreprocessTransforms(MlirPassManager pm,
 
 MlirLogicalResult
 circtFirtoolPopulateCHIRRTLToLowFIRRTL(MlirPassManager pm,
-                                       CirctFirtoolFirtoolOptions options,
-                                       MlirStringRef inputFilename) {
-  return wrap(firtool::populateCHIRRTLToLowFIRRTL(*unwrap(pm), *unwrap(options),
-                                                  unwrap(inputFilename)));
+                                       CirctFirtoolFirtoolOptions options) {
+  return wrap(
+      firtool::populateCHIRRTLToLowFIRRTL(*unwrap(pm), *unwrap(options)));
 }
 
 MlirLogicalResult
 circtFirtoolPopulateLowFIRRTLToHW(MlirPassManager pm,
-                                  CirctFirtoolFirtoolOptions options) {
-  return wrap(firtool::populateLowFIRRTLToHW(*unwrap(pm), *unwrap(options)));
+                                  CirctFirtoolFirtoolOptions options,
+                                  MlirStringRef inputFilename) {
+  return wrap(firtool::populateLowFIRRTLToHW(*unwrap(pm), *unwrap(options),
+                                             unwrap(inputFilename)));
 }
 
 MlirLogicalResult

@@ -66,6 +66,12 @@ void LowerToBMCPass::runOnOperation() {
     return signalPassFailure();
   }
 
+  if (bound < ignoreAssertionsUntil) {
+    hwModule->emitError(
+        "number of ignored cycles must be less than or equal to bound");
+    return signalPassFailure();
+  }
+
   // Create necessary function declarations and globals
   auto *ctx = &getContext();
   OpBuilder builder(ctx);
@@ -76,27 +82,27 @@ void LowerToBMCPass::runOnOperation() {
 
   // Lookup or declare printf function.
   auto printfFunc =
-      LLVM::lookupOrCreateFn(moduleOp, "printf", ptrTy, voidTy, true);
+      LLVM::lookupOrCreateFn(builder, moduleOp, "printf", ptrTy, voidTy, true);
   if (failed(printfFunc)) {
     moduleOp->emitError("failed to lookup or create printf");
     return signalPassFailure();
   }
 
   // Replace the top-module with a function performing the BMC
-  auto entryFunc = builder.create<func::FuncOp>(
-      loc, topModule, builder.getFunctionType({}, {}));
+  auto entryFunc = func::FuncOp::create(builder, loc, topModule,
+                                        builder.getFunctionType({}, {}));
   builder.createBlock(&entryFunc.getBody());
 
   {
     OpBuilder::InsertionGuard guard(builder);
     auto *terminator = hwModule.getBody().front().getTerminator();
     builder.setInsertionPoint(terminator);
-    builder.create<verif::YieldOp>(loc, terminator->getOperands());
+    verif::YieldOp::create(builder, loc, terminator->getOperands());
     terminator->erase();
   }
 
-  // Double the bound given to the BMC op, as a clock cycle takes 2 BMC
-  // iterations
+  // Double the bound given to the BMC op unless in rising clocks only mode, as
+  // a clock cycle involves two negations
   verif::BoundedModelCheckingOp bmcOp;
   auto numRegs = hwModule->getAttrOfType<IntegerAttr>("num_regs");
   auto initialValues = hwModule->getAttrOfType<ArrayAttr>("initial_values");
@@ -108,9 +114,16 @@ void LowerToBMCPass::runOnOperation() {
         return signalPassFailure();
       }
     }
-    bmcOp = builder.create<verif::BoundedModelCheckingOp>(
-        loc, 2 * bound, cast<IntegerAttr>(numRegs).getValue().getZExtValue(),
-        initialValues);
+    bmcOp = verif::BoundedModelCheckingOp::create(
+        builder, loc, risingClocksOnly ? bound : 2 * bound,
+        cast<IntegerAttr>(numRegs).getValue().getZExtValue(), initialValues);
+    // Annotate the op with how many cycles to ignore - again, we may need to
+    // double this to account for rising and falling edges
+    if (ignoreAssertionsUntil)
+      bmcOp->setAttr("ignore_asserts_until",
+                     builder.getI32IntegerAttr(
+                         risingClocksOnly ? ignoreAssertionsUntil
+                                          : 2 * ignoreAssertionsUntil));
   } else {
     hwModule->emitOpError("no num_regs or initial_values attribute found - "
                           "please run externalize "
@@ -146,15 +159,16 @@ void LowerToBMCPass::runOnOperation() {
   {
     OpBuilder::InsertionGuard guard(builder);
     // Initialize clock to 0 if it exists, otherwise just yield nothing
+    // We initialize to 1 if we're in rising clocks only mode
     auto *initBlock = builder.createBlock(&bmcOp.getInit());
     builder.setInsertionPointToStart(initBlock);
     if (hasClk) {
-      auto initVal =
-          builder.create<hw::ConstantOp>(loc, builder.getI1Type(), 0);
-      auto toClk = builder.create<seq::ToClockOp>(loc, initVal);
-      builder.create<verif::YieldOp>(loc, ValueRange{toClk});
+      auto initVal = hw::ConstantOp::create(builder, loc, builder.getI1Type(),
+                                            risingClocksOnly ? 1 : 0);
+      auto toClk = seq::ToClockOp::create(builder, loc, initVal);
+      verif::YieldOp::create(builder, loc, ValueRange{toClk});
     } else {
-      builder.create<verif::YieldOp>(loc, ValueRange{});
+      verif::YieldOp::create(builder, loc, ValueRange{});
     }
 
     // Toggle clock in loop region if it exists, otherwise just yield nothing
@@ -162,15 +176,22 @@ void LowerToBMCPass::runOnOperation() {
     builder.setInsertionPointToStart(loopBlock);
     if (hasClk) {
       loopBlock->addArgument(seq::ClockType::get(ctx), loc);
-      auto fromClk =
-          builder.create<seq::FromClockOp>(loc, loopBlock->getArgument(0));
-      auto cNeg1 = builder.create<hw::ConstantOp>(loc, builder.getI1Type(), -1);
-      auto nClk = builder.create<comb::XorOp>(loc, fromClk, cNeg1);
-      auto toClk = builder.create<seq::ToClockOp>(loc, nClk);
-      // Only yield clock value
-      builder.create<verif::YieldOp>(loc, ValueRange{toClk});
+      if (risingClocksOnly) {
+        // In rising clocks only mode we don't need to toggle the clock
+        verif::YieldOp::create(builder, loc,
+                               ValueRange{loopBlock->getArgument(0)});
+      } else {
+        auto fromClk =
+            seq::FromClockOp::create(builder, loc, loopBlock->getArgument(0));
+        auto cNeg1 =
+            hw::ConstantOp::create(builder, loc, builder.getI1Type(), -1);
+        auto nClk = comb::XorOp::create(builder, loc, fromClk, cNeg1);
+        auto toClk = seq::ToClockOp::create(builder, loc, nClk);
+        // Only yield clock value
+        verif::YieldOp::create(builder, loc, ValueRange{toClk});
+      }
     } else {
-      builder.create<verif::YieldOp>(loc, ValueRange{});
+      verif::YieldOp::create(builder, loc, ValueRange{});
     }
   }
   bmcOp.getCircuit().takeBody(hwModule.getBody());
@@ -182,8 +203,8 @@ void LowerToBMCPass::runOnOperation() {
 
     OpBuilder b = OpBuilder::atBlockEnd(moduleOp.getBody());
     auto arrayTy = LLVM::LLVMArrayType::get(b.getI8Type(), str.size() + 1);
-    auto global = b.create<LLVM::GlobalOp>(
-        loc, arrayTy, /*isConstant=*/true, LLVM::linkage::Linkage::Private,
+    auto global = LLVM::GlobalOp::create(
+        b, loc, arrayTy, /*isConstant=*/true, LLVM::linkage::Linkage::Private,
         "resultString",
         StringAttr::get(b.getContext(), Twine(str).concat(Twine('\00'))));
     SymbolTable symTable(moduleOp);
@@ -192,7 +213,7 @@ void LowerToBMCPass::runOnOperation() {
     }
 
     return success(
-        builder.create<LLVM::AddressOfOp>(loc, global)->getResult(0));
+        LLVM::AddressOfOp::create(builder, loc, global)->getResult(0));
   };
 
   auto successStrAddr =
@@ -205,21 +226,22 @@ void LowerToBMCPass::runOnOperation() {
     return signalPassFailure();
   }
 
-  auto formatString = builder.create<LLVM::SelectOp>(
-      loc, bmcOp.getResult(), successStrAddr.value(), failureStrAddr.value());
-  builder.create<LLVM::CallOp>(loc, printfFunc.value(),
-                               ValueRange{formatString});
-  builder.create<func::ReturnOp>(loc);
+  auto formatString =
+      LLVM::SelectOp::create(builder, loc, bmcOp.getResult(),
+                             successStrAddr.value(), failureStrAddr.value());
+  LLVM::CallOp::create(builder, loc, printfFunc.value(),
+                       ValueRange{formatString});
+  func::ReturnOp::create(builder, loc);
 
   if (insertMainFunc) {
     builder.setInsertionPointToEnd(getOperation().getBody());
     Type i32Ty = builder.getI32Type();
-    auto mainFunc = builder.create<func::FuncOp>(
-        loc, "main", builder.getFunctionType({i32Ty, ptrTy}, {i32Ty}));
+    auto mainFunc = func::FuncOp::create(
+        builder, loc, "main", builder.getFunctionType({i32Ty, ptrTy}, {i32Ty}));
     builder.createBlock(&mainFunc.getBody(), {}, {i32Ty, ptrTy}, {loc, loc});
-    builder.create<func::CallOp>(loc, entryFunc, ValueRange{});
+    func::CallOp::create(builder, loc, entryFunc, ValueRange{});
     // TODO: don't use LLVM here
-    Value constZero = builder.create<LLVM::ConstantOp>(loc, i32Ty, 0);
-    builder.create<func::ReturnOp>(loc, constZero);
+    Value constZero = LLVM::ConstantOp::create(builder, loc, i32Ty, 0);
+    func::ReturnOp::create(builder, loc, constZero);
   }
 }

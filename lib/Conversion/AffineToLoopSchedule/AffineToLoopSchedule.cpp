@@ -87,6 +87,9 @@ ModuloProblem AffineToLoopSchedule::getModuloProblem(CyclicProblem &prob) {
       if (latency.has_value())
         modProb.setLatency(opr.value(), latency.value());
     }
+    auto rsrc = prob.getLinkedResourceTypes(op);
+    if (rsrc.has_value())
+      modProb.setLinkedResourceTypes(op, rsrc.value());
     modProb.insertOperation(op);
   }
 
@@ -323,8 +326,14 @@ LogicalResult AffineToLoopSchedule::populateOperatorTypes(
           Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
-          problem.setLimit(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
+
+          auto memRsrc = problem.getOrInsertResourceType(
+              "mem_" + std::to_string(hash_value(memRef)) + "_rsrc");
+          problem.setLimit(memRsrc, 1);
+          problem.setLinkedResourceTypes(
+              memOp, SmallVector<Problem::ResourceType>{memRsrc});
+
           return WalkResult::advance();
         })
         .Case<AffineLoadOp, memref::LoadOp>([&](Operation *memOp) {
@@ -337,8 +346,14 @@ LogicalResult AffineToLoopSchedule::populateOperatorTypes(
           Problem::OperatorType memOpr = problem.getOrInsertOperatorType(
               "mem_" + std::to_string(hash_value(memRef)));
           problem.setLatency(memOpr, 1);
-          problem.setLimit(memOpr, 1);
           problem.setLinkedOperatorType(memOp, memOpr);
+
+          auto memRsrc = problem.getOrInsertResourceType(
+              "mem_" + std::to_string(hash_value(memRef)) + "_rsrc");
+          problem.setLimit(memRsrc, 1);
+          problem.setLinkedResourceTypes(
+              memOp, SmallVector<Problem::ResourceType>{memRsrc});
+
           return WalkResult::advance();
         })
         .Case<MulIOp>([&](Operation *mcOp) {
@@ -368,7 +383,7 @@ LogicalResult AffineToLoopSchedule::solveSchedulingProblem(
   LLVM_DEBUG(forOp.getBody()->walk<WalkOrder::PreOrder>([&](Operation *op) {
     llvm::dbgs() << "Scheduling inputs for " << *op;
     auto opr = problem.getLinkedOperatorType(op);
-    llvm::dbgs() << "\n  opr = " << opr;
+    llvm::dbgs() << "\n  opr = " << opr->getAttr();
     llvm::dbgs() << "\n  latency = " << problem.getLatency(*opr);
     for (auto dep : problem.getDependences(op))
       if (dep.isAuxiliary())
@@ -417,8 +432,8 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   Value lowerBound = lowerAffineLowerBound(innerLoop, builder);
   Value upperBound = lowerAffineUpperBound(innerLoop, builder);
   int64_t stepValue = innerLoop.getStep().getSExtValue();
-  auto step = builder.create<arith::ConstantOp>(
-      IntegerAttr::get(builder.getIndexType(), stepValue));
+  auto step = arith::ConstantOp::create(
+      builder, IntegerAttr::get(builder.getIndexType(), stepValue));
 
   // Create the pipeline op, with the same result types as the inner loop. An
   // iter arg is created for the induction variable.
@@ -436,16 +451,16 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   if (auto tripCount = getConstantTripCount(forOp))
     tripCountAttr = builder.getI64IntegerAttr(*tripCount);
 
-  auto pipeline = builder.create<LoopSchedulePipelineOp>(
-      resultTypes, ii, tripCountAttr, iterArgs);
+  auto pipeline = LoopSchedulePipelineOp::create(builder, resultTypes, ii,
+                                                 tripCountAttr, iterArgs);
 
   // Create the condition, which currently just compares the induction variable
   // to the upper bound.
   Block &condBlock = pipeline.getCondBlock();
   builder.setInsertionPointToStart(&condBlock);
-  auto cmpResult = builder.create<arith::CmpIOp>(
-      builder.getI1Type(), arith::CmpIPredicate::ult, condBlock.getArgument(0),
-      upperBound);
+  auto cmpResult = arith::CmpIOp::create(builder, builder.getI1Type(),
+                                         arith::CmpIPredicate::ult,
+                                         condBlock.getArgument(0), upperBound);
   condBlock.getTerminator()->insertOperands(0, {cmpResult});
 
   // Add the non-yield operations to their start time groups.
@@ -554,8 +569,9 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
   // Create stages along with maps
   for (auto startTime : startTimes) {
     auto group = startGroups[startTime];
-    llvm::sort(group,
-               [&](Operation *a, Operation *b) { return dom.dominates(a, b); });
+    llvm::sort(group, [&](Operation *a, Operation *b) {
+      return dom.properlyDominates(a, b);
+    });
     auto stageTypes = registerTypes[startTime];
     // Add the induction variable increment in the first stage.
     if (startTime == 0)
@@ -566,7 +582,7 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
     auto startTimeAttr = builder.getIntegerAttr(
         builder.getIntegerType(64, /*isSigned=*/true), startTime);
     auto stage =
-        builder.create<LoopSchedulePipelineStageOp>(stageTypes, startTimeAttr);
+        LoopSchedulePipelineStageOp::create(builder, stageTypes, startTimeAttr);
     auto &stageBlock = stage.getBodyBlock();
     auto *stageTerminator = stageBlock.getTerminator();
     builder.setInsertionPointToStart(&stageBlock);
@@ -605,7 +621,7 @@ LogicalResult AffineToLoopSchedule::createLoopSchedulePipeline(
     // Add the induction variable increment to the first stage.
     if (startTime == 0) {
       auto incResult =
-          builder.create<arith::AddIOp>(stagesBlock.getArgument(0), step);
+          arith::AddIOp::create(builder, stagesBlock.getArgument(0), step);
       stageTerminator->insertOperands(stageTerminator->getNumOperands(),
                                       incResult->getResults());
     }

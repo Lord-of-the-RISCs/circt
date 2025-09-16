@@ -19,21 +19,25 @@
 #include "circt-c/Dialect/HW.h"
 #include "circt-c/Dialect/HWArith.h"
 #include "circt-c/Dialect/Handshake.h"
+#include "circt-c/Dialect/Kanagawa.h"
 #include "circt-c/Dialect/LTL.h"
 #include "circt-c/Dialect/MSFT.h"
 #include "circt-c/Dialect/OM.h"
+#include "circt-c/Dialect/Pipeline.h"
 #include "circt-c/Dialect/RTG.h"
+#include "circt-c/Dialect/Synth.h"
 #include "circt-c/Transforms.h"
 #ifdef CIRCT_INCLUDE_TESTS
 #include "circt-c/Dialect/RTGTest.h"
 #endif
-#include "circt-c/Dialect/SMT.h"
 #include "circt-c/Dialect/SV.h"
 #include "circt-c/Dialect/Seq.h"
 #include "circt-c/Dialect/Verif.h"
 #include "circt-c/ExportVerilog.h"
 #include "mlir-c/Bindings/Python/Interop.h"
 #include "mlir-c/Dialect/Index.h"
+#include "mlir-c/Dialect/SCF.h"
+#include "mlir-c/Dialect/SMT.h"
 #include "mlir-c/IR.h"
 #include "mlir-c/Transforms.h"
 #include "mlir/Bindings/Python/NanobindAdaptors.h"
@@ -54,7 +58,12 @@ static void registerPasses() {
   registerFSMPasses();
   registerHWArithPasses();
   registerHWPasses();
+  mlirRegisterRTGPasses();
+  registerRTGPipelines();
   registerHandshakePasses();
+  registerKanagawaPasses();
+  registerPipelinePasses();
+  registerSynthesisPipeline();
   mlirRegisterCIRCTConversionPasses();
   mlirRegisterCIRCTTransformsPasses();
   mlirRegisterTransformsCSE();
@@ -74,6 +83,7 @@ NB_MODULE(_circt, m) {
         MlirContext context = mlirPythonCapsuleToContext(wrappedCapsule.ptr());
 
         // Collect CIRCT dialects to register.
+
         MlirDialectHandle comb = mlirGetDialectHandle__comb__();
         mlirDialectHandleRegisterDialect(comb, context);
         mlirDialectHandleLoadDialect(comb, context);
@@ -106,9 +116,17 @@ NB_MODULE(_circt, m) {
         mlirDialectHandleRegisterDialect(index, context);
         mlirDialectHandleLoadDialect(index, context);
 
+        MlirDialectHandle scf = mlirGetDialectHandle__scf__();
+        mlirDialectHandleRegisterDialect(scf, context);
+        mlirDialectHandleLoadDialect(scf, context);
+
         MlirDialectHandle om = mlirGetDialectHandle__om__();
         mlirDialectHandleRegisterDialect(om, context);
         mlirDialectHandleLoadDialect(om, context);
+
+        MlirDialectHandle pipeline = mlirGetDialectHandle__pipeline__();
+        mlirDialectHandleRegisterDialect(pipeline, context);
+        mlirDialectHandleLoadDialect(pipeline, context);
 
         MlirDialectHandle rtg = mlirGetDialectHandle__rtg__();
         mlirDialectHandleRegisterDialect(rtg, context);
@@ -128,6 +146,10 @@ NB_MODULE(_circt, m) {
         mlirDialectHandleRegisterDialect(sv, context);
         mlirDialectHandleLoadDialect(sv, context);
 
+        MlirDialectHandle synth = mlirGetDialectHandle__synth__();
+        mlirDialectHandleRegisterDialect(synth, context);
+        mlirDialectHandleLoadDialect(synth, context);
+
         MlirDialectHandle fsm = mlirGetDialectHandle__fsm__();
         mlirDialectHandleRegisterDialect(fsm, context);
         mlirDialectHandleLoadDialect(fsm, context);
@@ -135,6 +157,10 @@ NB_MODULE(_circt, m) {
         MlirDialectHandle handshake = mlirGetDialectHandle__handshake__();
         mlirDialectHandleRegisterDialect(handshake, context);
         mlirDialectHandleLoadDialect(handshake, context);
+
+        MlirDialectHandle kanagawa = mlirGetDialectHandle__kanagawa__();
+        mlirDialectHandleRegisterDialect(kanagawa, context);
+        mlirDialectHandleLoadDialect(kanagawa, context);
 
         MlirDialectHandle ltl = mlirGetDialectHandle__ltl__();
         mlirDialectHandleRegisterDialect(ltl, context);
@@ -161,6 +187,8 @@ NB_MODULE(_circt, m) {
     mlirExportSplitVerilog(mod, cDirectory);
   });
 
+  nb::module_ synth = m.def_submodule("_synth", "synth API");
+  circt::python::populateDialectSynthSubmodule(synth);
   nb::module_ esi = m.def_submodule("_esi", "ESI API");
   circt::python::populateDialectESISubmodule(esi);
   nb::module_ msft = m.def_submodule("_msft", "MSFT API");
@@ -173,8 +201,6 @@ NB_MODULE(_circt, m) {
   circt::python::populateDialectOMSubmodule(om);
   nb::module_ rtg = m.def_submodule("_rtg", "RTG API");
   circt::python::populateDialectRTGSubmodule(rtg);
-  nb::module_ rtgtool = m.def_submodule("_rtgtool", "RTGTool API");
-  circt::python::populateDialectRTGToolSubmodule(rtgtool);
 #ifdef CIRCT_INCLUDE_TESTS
   nb::module_ rtgtest = m.def_submodule("_rtgtest", "RTGTest API");
   circt::python::populateDialectRTGTestSubmodule(rtgtest);

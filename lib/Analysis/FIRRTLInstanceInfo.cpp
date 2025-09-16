@@ -16,6 +16,7 @@
 #include "circt/Analysis/FIRRTLInstanceInfo.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Support/Debug.h"
 #include "circt/Support/InstanceGraph.h"
 #include "llvm/ADT/PostOrderIterator.h"
@@ -140,10 +141,14 @@ InstanceInfo::InstanceInfo(Operation *op, mlir::AnalysisManager &am) {
           attributes.underDut.mergeIn(parentAttrs.underDut);
 
         // Update underLayer.
-        auto instanceOp = useIt->getInstance();
-        bool underLayer = (isa<InstanceOp>(instanceOp) &&
-                           cast<InstanceOp>(instanceOp).getLowerToBind()) ||
-                          instanceOp->getParentOfType<LayerBlockOp>();
+        bool underLayer = false;
+        if (auto instanceOp = useIt->getInstance<InstanceOp>()) {
+          if (instanceOp.getLowerToBind() || instanceOp.getDoNotPrint() ||
+              instanceOp->getParentOfType<LayerBlockOp>() ||
+              instanceOp->getParentOfType<sv::IfDefOp>())
+            underLayer = true;
+        }
+
         if (!isGCCompanion) {
           if (underLayer)
             attributes.underLayer.mergeIn(true);

@@ -16,7 +16,6 @@
 
 #include "circt/Conversion/ExportVerilog.h"
 #include "circt/Conversion/Passes.h"
-#include "circt/Dialect/AIG/AIGPasses.h"
 #include "circt/Dialect/Arc/ArcPasses.h"
 #include "circt/Dialect/Calyx/CalyxPasses.h"
 #include "circt/Dialect/Comb/CombPasses.h"
@@ -33,11 +32,14 @@
 #include "circt/Dialect/Moore/MoorePasses.h"
 #include "circt/Dialect/OM/OMPasses.h"
 #include "circt/Dialect/Pipeline/PipelinePasses.h"
+#include "circt/Dialect/RTG/Transforms/RTGPassPipelines.h"
 #include "circt/Dialect/RTG/Transforms/RTGPasses.h"
 #include "circt/Dialect/SSP/SSPPasses.h"
 #include "circt/Dialect/SV/SVPasses.h"
 #include "circt/Dialect/Seq/SeqPasses.h"
 #include "circt/Dialect/Sim/SimPasses.h"
+#include "circt/Dialect/Synth/Transforms/SynthPasses.h"
+#include "circt/Dialect/Synth/Transforms/SynthesisPipeline.h"
 #include "circt/Dialect/SystemC/SystemCPasses.h"
 #include "circt/Dialect/Verif/VerifPasses.h"
 #include "circt/Tools/circt-bmc/Passes.h"
@@ -60,7 +62,6 @@ inline void registerAllPasses() {
   registerBMCTransformsPasses();
 
   // Standard Passes
-  aig::registerPasses();
   arc::registerPasses();
   calyx::registerPasses();
   comb::registerPasses();
@@ -77,13 +78,17 @@ inline void registerAllPasses() {
   msft::registerPasses();
   om::registerPasses();
   pipeline::registerPasses();
-  rtg::registerPasses();
+  rtg::registerRTGPasses();
   seq::registerPasses();
   sim::registerPasses();
   ssp::registerPasses();
   sv::registerPasses();
   systemc::registerPasses();
   verif::registerPasses();
+  synth::registerPasses();
+
+  // Register pass pipelines
+  rtg::registerPipelines();
 }
 
 } // namespace circt

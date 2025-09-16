@@ -34,16 +34,9 @@ def CPUType : RTGTestTypeDef<"CPU", [ContextResourceTypeInterface]> {
   let assemblyFormat = "";
 }
 
-let dialect = RTGTestDialect in {
-def Imm5Type  : ImmTypeBase<5>;
-def Imm12Type : ImmTypeBase<12>;
-def Imm13Type : ImmTypeBase<13>;
-def Imm21Type : ImmTypeBase<21>;
-def Imm32Type : ImmTypeBase<32>;
-}
-
 def IntegerRegisterType : TypeDef<RTGTestDialect, "IntegerRegister", [
-  RegisterTypeInterface
+  RegisterTypeInterface,
+  DeclareTypeInterfaceMethods<ValidationTypeInterface>,
 ]> {
   let summary = "represents an integer register";
 

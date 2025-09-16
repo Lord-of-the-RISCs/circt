@@ -25,14 +25,20 @@ def LowerToBMC : Pass<"lower-to-bmc", "::mlir::ModuleOp"> {
     Option<"bound", "bound", "unsigned",
            /*default=*/"",
            "Cycle bound.">,
+    Option<"ignoreAssertionsUntil", "ignore-asserts-until", "unsigned",
+           /*default=*/"0",
+           "Specifies an initial window of cycles where assertions should be ignored (starting from 0).">,
     Option<"insertMainFunc", "insert-main", "bool",
            /*default=*/"false",
            "Whether a main function should be inserted for AOT compilation.">,
+    Option<"risingClocksOnly", "rising-clocks-only", "bool",
+           /*default=*/"false",
+           "Only consider the circuit and property on rising clock edges.">,
   ];
 
   let dependentDialects = [
     "mlir::func::FuncDialect", "mlir::LLVM::LLVMDialect",
-    "circt::verif::VerifDialect"
+    "circt::verif::VerifDialect", "circt::comb::CombDialect"
   ];
 }
 

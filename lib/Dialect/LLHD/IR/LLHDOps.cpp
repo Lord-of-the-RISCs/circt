@@ -55,7 +55,7 @@ OpFoldResult llhd::ConstantTimeOp::fold(FoldAdaptor adaptor) {
 }
 
 void llhd::ConstantTimeOp::build(OpBuilder &builder, OperationState &result,
-                                 unsigned time, const StringRef &timeUnit,
+                                 uint64_t time, const StringRef &timeUnit,
                                  unsigned delta, unsigned epsilon) {
   auto *ctx = builder.getContext();
   auto attr = TimeAttr::get(ctx, time, timeUnit, delta, epsilon);
@@ -70,15 +70,15 @@ static Value getValueAtIndex(OpBuilder &builder, Location loc, Value val,
                              unsigned index) {
   return TypeSwitch<Type, Value>(val.getType())
       .Case<hw::StructType>([&](hw::StructType ty) -> Value {
-        return builder.create<hw::StructExtractOp>(
-            loc, val, ty.getElements()[index].name);
+        return hw::StructExtractOp::create(builder, loc, val,
+                                           ty.getElements()[index].name);
       })
       .Case<hw::ArrayType>([&](hw::ArrayType ty) -> Value {
-        Value idx = builder.create<hw::ConstantOp>(
-            loc,
+        Value idx = hw::ConstantOp::create(
+            builder, loc,
             builder.getIntegerType(llvm::Log2_64_Ceil(ty.getNumElements())),
             index);
-        return builder.create<hw::ArrayGetOp>(loc, val, idx);
+        return hw::ArrayGetOp::create(builder, loc, val, idx);
       });
 }
 
@@ -123,7 +123,7 @@ DenseMap<Attribute, MemorySlot> SignalOp::destructure(
 
   for (auto [index, type] : indices) {
     Value init = getValueAtIndex(builder, getLoc(), getInit(), index);
-    auto sigOp = builder.create<SignalOp>(getLoc(), getNameAttr(), init);
+    auto sigOp = SignalOp::create(builder, getLoc(), getNameAttr(), init);
     newAllocators.push_back(sigOp);
     slotMap.try_emplace<MemorySlot>(
         IntegerAttr::get(IndexType::get(getContext()), index),
@@ -208,8 +208,8 @@ static LogicalResult canonicalizeSigPtrArraySliceOp(Op op,
     auto sliceOp = op.getInput().template getDefiningOp<Op>();
     rewriter.modifyOpInPlace(op, [&]() {
       op.getInputMutable().assign(sliceOp.getInput());
-      Value newIndex = rewriter.create<hw::ConstantOp>(
-          op->getLoc(), a.getValue() + indexAttr.getValue());
+      Value newIndex = hw::ConstantOp::create(
+          rewriter, op->getLoc(), a.getValue() + indexAttr.getValue());
       op.getLowIndexMutable().assign(newIndex);
     });
 
@@ -391,16 +391,17 @@ DeletionKind PrbOp::rewire(const DestructurableMemorySlot &slot,
   SmallVector<Value> probed;
   getSortedPtrs(subslots, elements);
   for (auto [_, val] : elements)
-    probed.push_back(builder.create<PrbOp>(getLoc(), val));
+    probed.push_back(PrbOp::create(builder, getLoc(), val));
 
-  Value repl = TypeSwitch<Type, Value>(getType())
-                   .Case<hw::StructType>([&](auto ty) {
-                     return builder.create<hw::StructCreateOp>(
-                         getLoc(), getType(), probed);
-                   })
-                   .Case<hw::ArrayType>([&](auto ty) {
-                     return builder.create<hw::ArrayCreateOp>(getLoc(), probed);
-                   });
+  Value repl =
+      TypeSwitch<Type, Value>(getType())
+          .Case<hw::StructType>([&](auto ty) {
+            return hw::StructCreateOp::create(builder, getLoc(), getType(),
+                                              probed);
+          })
+          .Case<hw::ArrayType>([&](auto ty) {
+            return hw::ArrayCreateOp::create(builder, getLoc(), probed);
+          });
 
   replaceAllUsesWith(repl);
   return DeletionKind::Delete;
@@ -411,6 +412,13 @@ PrbOp::ensureOnlySafeAccesses(const MemorySlot &slot,
                               SmallVectorImpl<MemorySlot> &mustBeSafelyUsed,
                               const DataLayout &dataLayout) {
   return success();
+}
+
+void PrbOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  if (mayHaveSSADominance(*getOperation()->getParentRegion()))
+    effects.emplace_back(MemoryEffects::Read::get(), &getSignalMutable());
 }
 
 //===----------------------------------------------------------------------===//
@@ -460,9 +468,9 @@ DeletionKind DrvOp::rewire(const DestructurableMemorySlot &slot,
   getSortedPtrs(subslots, driven);
 
   for (auto [idx, sig] : driven)
-    builder.create<DrvOp>(getLoc(), sig,
-                          getValueAtIndex(builder, getLoc(), getValue(), idx),
-                          getTime(), getEnable());
+    DrvOp::create(builder, getLoc(), sig,
+                  getValueAtIndex(builder, getLoc(), getValue(), idx),
+                  getTime(), getEnable());
 
   return DeletionKind::Delete;
 }
@@ -479,13 +487,104 @@ DrvOp::ensureOnlySafeAccesses(const MemorySlot &slot,
 //===----------------------------------------------------------------------===//
 
 LogicalResult ProcessOp::canonicalize(ProcessOp op, PatternRewriter &rewriter) {
-  if (op.getBody().hasOneBlock()) {
-    auto &block = op.getBody().front();
-    if (block.getOperations().size() == 1 && isa<HaltOp>(block.getTerminator()))
-      rewriter.eraseOp(op);
+  if (!op.getBody().hasOneBlock())
+    return failure();
+
+  auto &block = op.getBody().front();
+  auto haltOp = dyn_cast<HaltOp>(block.getTerminator());
+  if (!haltOp)
+    return failure();
+
+  if (op.getNumResults() == 0 && block.getOperations().size() == 1) {
+    rewriter.eraseOp(op);
+    return success();
   }
 
+  // Only constants and halt terminator are expected in a single block.
+  if (!llvm::all_of(block.without_terminator(), [](auto &bodyOp) {
+        return bodyOp.template hasTrait<OpTrait::ConstantLike>();
+      }))
+    return failure();
+
+  auto yieldOperands = haltOp.getYieldOperands();
+  llvm::SmallDenseMap<Value, unsigned> uniqueOperands;
+  llvm::SmallDenseMap<unsigned, unsigned> origToNewPos;
+  llvm::BitVector operandsToErase(yieldOperands.size());
+
+  for (auto [operandNo, operand] : llvm::enumerate(yieldOperands)) {
+    auto *defOp = operand.getDefiningOp();
+    if (defOp && defOp->hasTrait<OpTrait::ConstantLike>()) {
+      // If the constant is available outside the process, use it directly;
+      // otherwise move it outside.
+      if (!defOp->getParentRegion()->isProperAncestor(&op.getBody())) {
+        defOp->moveBefore(op);
+      }
+      rewriter.replaceAllUsesWith(op.getResult(operandNo), operand);
+      operandsToErase.set(operandNo);
+      continue;
+    }
+
+    // Identify duplicate operands to merge and compute updated result
+    // positions for the process operation.
+    if (!uniqueOperands.contains(operand)) {
+      const auto newPos = uniqueOperands.size();
+      uniqueOperands.insert(std::make_pair(operand, newPos));
+      origToNewPos.insert(std::make_pair(operandNo, newPos));
+    } else {
+      auto firstOccurrencePos = uniqueOperands.lookup(operand);
+      origToNewPos.insert(std::make_pair(operandNo, firstOccurrencePos));
+      operandsToErase.set(operandNo);
+    }
+  }
+
+  const auto countOperandsToErase = operandsToErase.count();
+  if (countOperandsToErase == 0)
+    return failure();
+
+  // Remove the process operation if all its results have been replaced with
+  // constants.
+  if (countOperandsToErase == op.getNumResults()) {
+    rewriter.eraseOp(op);
+    return success();
+  }
+
+  haltOp->eraseOperands(operandsToErase);
+
+  SmallVector<Type> resultTypes = llvm::to_vector(haltOp->getOperandTypes());
+  auto newProcessOp = ProcessOp::create(rewriter, op.getLoc(), resultTypes,
+                                        op->getOperands(), op->getAttrs());
+  newProcessOp.getBody().takeBody(op.getBody());
+
+  // Update old results with new values, accounting for pruned halt operands.
+  for (auto oldResult : op.getResults()) {
+    auto newResultPos = origToNewPos.find(oldResult.getResultNumber());
+    if (newResultPos == origToNewPos.end())
+      continue;
+    auto newResult = newProcessOp.getResult(newResultPos->getSecond());
+    rewriter.replaceAllUsesWith(oldResult, newResult);
+  }
+
+  rewriter.eraseOp(op);
   return success();
+}
+
+//===----------------------------------------------------------------------===//
+// CombinationalOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult CombinationalOp::canonicalize(CombinationalOp op,
+                                            PatternRewriter &rewriter) {
+  // Inline the combinational region if it consists of a single block and
+  // contains no side-effecting operations.
+  if (op.getBody().hasOneBlock() && isMemoryEffectFree(op)) {
+    auto &block = op.getBody().front();
+    auto *terminator = block.getTerminator();
+    rewriter.inlineBlockBefore(&block, op, ValueRange{});
+    rewriter.replaceOp(op, terminator->getOperands());
+    rewriter.eraseOp(terminator);
+    return success();
+  }
+  return failure();
 }
 
 //===----------------------------------------------------------------------===//
@@ -496,10 +595,10 @@ static LogicalResult verifyYieldResults(Operation *op,
                                         ValueRange yieldOperands) {
   // Determine the result values of the parent.
   auto *parentOp = op->getParentOp();
-  TypeRange resultTypes =
-      TypeSwitch<Operation *, TypeRange>(parentOp)
-          .Case<ProcessOp>([](auto op) { return op.getResultTypes(); })
-          .Case<FinalOp>([](auto) { return TypeRange{}; });
+  TypeRange resultTypes = TypeSwitch<Operation *, TypeRange>(parentOp)
+                              .Case<ProcessOp, CombinationalOp>(
+                                  [](auto op) { return op.getResultTypes(); })
+                              .Case<FinalOp>([](auto) { return TypeRange{}; });
 
   // Check that the number of yield operands matches the process.
   if (yieldOperands.size() != resultTypes.size())
@@ -529,6 +628,14 @@ LogicalResult WaitOp::verify() {
 //===----------------------------------------------------------------------===//
 
 LogicalResult HaltOp::verify() {
+  return verifyYieldResults(*this, getYieldOperands());
+}
+
+//===----------------------------------------------------------------------===//
+// YieldOp
+//===----------------------------------------------------------------------===//
+
+LogicalResult YieldOp::verify() {
   return verifyYieldResults(*this, getYieldOperands());
 }
 

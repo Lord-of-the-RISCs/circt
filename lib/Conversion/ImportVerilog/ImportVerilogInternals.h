@@ -13,7 +13,9 @@
 #include "circt/Conversion/ImportVerilog.h"
 #include "circt/Dialect/Debug/DebugOps.h"
 #include "circt/Dialect/HW/HWOps.h"
+#include "circt/Dialect/LTL/LTLOps.h"
 #include "circt/Dialect/Moore/MooreOps.h"
+#include "circt/Dialect/Verif/VerifOps.h"
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "slang/ast/ASTVisitor.h"
@@ -77,10 +79,9 @@ struct HierPathInfo {
 struct Context {
   Context(const ImportVerilogOptions &options,
           slang::ast::Compilation &compilation, mlir::ModuleOp intoModuleOp,
-          const slang::SourceManager &sourceManager,
-          SmallDenseMap<slang::BufferID, StringRef> &bufferFilePaths)
+          const slang::SourceManager &sourceManager)
       : options(options), compilation(compilation), intoModuleOp(intoModuleOp),
-        sourceManager(sourceManager), bufferFilePaths(bufferFilePaths),
+        sourceManager(sourceManager),
         builder(OpBuilder::atBlockEnd(intoModuleOp.getBody())),
         symbolTable(intoModuleOp) {}
   Context(const Context &) = delete;
@@ -118,6 +119,10 @@ struct Context {
                                 Type requiredType = {});
   Value convertLvalueExpression(const slang::ast::Expression &expr);
 
+  // Convert an assertion expression AST node to MLIR ops.
+  Value convertAssertionExpression(const slang::ast::AssertionExpr &expr,
+                                   Location loc);
+
   // Traverse the whole AST to collect hierarchical names.
   LogicalResult
   collectHierarchicalValues(const slang::ast::Expression &expr,
@@ -127,6 +132,13 @@ struct Context {
   // Convert a slang timing control into an MLIR timing control.
   LogicalResult convertTimingControl(const slang::ast::TimingControl &ctrl,
                                      const slang::ast::Statement &stmt);
+
+  /// Helper function to convert a value to a MLIR I1 value.
+  Value convertToI1(Value value);
+
+  // Convert a slang timing control for LTL
+  Value convertLTLTimingControl(const slang::ast::TimingControl &ctrl,
+                                const Value &seqOrPro);
 
   /// Helper function to convert a value to its "truthy" boolean value.
   Value convertToBool(Value value);
@@ -149,6 +161,12 @@ struct Context {
   Value materializeSVInt(const slang::SVInt &svint,
                          const slang::ast::Type &type, Location loc);
 
+  /// Helper function to materialize an unpacked array of `SVInt`s as an SSA
+  /// value.
+  Value materializeFixedSizeUnpackedArrayType(
+      const slang::ConstantValue &constant,
+      const slang::ast::FixedSizeUnpackedArrayType &astType, Location loc);
+
   /// Helper function to materialize a `ConstantValue` as an SSA value. Returns
   /// null if the constant cannot be materialized.
   Value materializeConstant(const slang::ConstantValue &constant,
@@ -159,9 +177,14 @@ struct Context {
   /// failure if an error occurs. Returns a null value if the formatted string
   /// is trivially empty. Otherwise returns the formatted string.
   FailureOr<Value> convertFormatString(
-      slang::span<const slang::ast::Expression *const> arguments, Location loc,
+      std::span<const slang::ast::Expression *const> arguments, Location loc,
       moore::IntFormat defaultFormat = moore::IntFormat::Decimal,
       bool appendNewline = false);
+
+  /// Convert system function calls only have arity-0.
+  FailureOr<Value>
+  convertSystemCallArity0(const slang::ast::SystemSubroutine &subroutine,
+                          Location loc);
 
   /// Convert system function calls only have arity-1.
   FailureOr<Value>
@@ -175,7 +198,6 @@ struct Context {
   slang::ast::Compilation &compilation;
   mlir::ModuleOp intoModuleOp;
   const slang::SourceManager &sourceManager;
-  SmallDenseMap<slang::BufferID, StringRef> &bufferFilePaths;
 
   /// The builder used to create IR operations.
   OpBuilder builder;
@@ -235,6 +257,9 @@ struct Context {
   /// example to populate the list of observed signals in an implicit event
   /// control `@*`.
   std::function<void(moore::ReadOp)> rvalueReadCallback;
+
+  /// The time scale currently in effect.
+  slang::TimeScale timeScale;
 };
 
 } // namespace ImportVerilog

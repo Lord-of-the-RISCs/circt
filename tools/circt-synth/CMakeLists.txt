@@ -1,23 +1,27 @@
 add_circt_tool(circt-synth circt-synth.cpp)
 target_link_libraries(circt-synth
   PRIVATE
-  CIRCTAIG
-  CIRCTAIGToComb
-  CIRCTAIGTransforms
+  CIRCTSynth
+  CIRCTSynthToComb
+  CIRCTSynthAnalysis
   CIRCTComb
-  CIRCTCombToAIG
+  CIRCTCombToDatapath
+  CIRCTCombTransforms
+  CIRCTDatapath
+  CIRCTDatapathToComb
   CIRCTDebug
   CIRCTEmit
   CIRCTHW
-  CIRCTHWTransforms
   CIRCTLTL
   CIRCTOM
   CIRCTSeq
   CIRCTSim
-  CIRCTSupport
   CIRCTSV
+  CIRCTSVTransforms
+  CIRCTSynthTransforms
   CIRCTTransforms
   CIRCTVerif
+  MLIRBytecodeWriter
   MLIRIR
   MLIRParser
   LLVMSupport

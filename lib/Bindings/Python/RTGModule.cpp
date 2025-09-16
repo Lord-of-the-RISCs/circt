@@ -23,6 +23,13 @@ using namespace mlir::python::nanobind_adaptors;
 void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
   m.doc() = "RTG dialect Python native extension";
 
+  //===--------------------------------------------------------------------===//
+  // Types
+  //===--------------------------------------------------------------------===//
+
+  // Sequence Types
+  //===--------------------------------------------------------------------===//
+
   mlir_type_subclass(m, "SequenceType", rtgTypeIsASequence)
       .def_classmethod(
           "get",
@@ -48,13 +55,8 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
           },
           nb::arg("self"), nb::arg("ctxt") = nullptr);
 
-  mlir_type_subclass(m, "LabelType", rtgTypeIsALabel)
-      .def_classmethod(
-          "get",
-          [](nb::object cls, MlirContext ctxt) {
-            return cls(rtgLabelTypeGet(ctxt));
-          },
-          nb::arg("self"), nb::arg("ctxt") = nullptr);
+  // Common Datastructure Types
+  //===--------------------------------------------------------------------===//
 
   mlir_type_subclass(m, "SetType", rtgTypeIsASet)
       .def_classmethod(
@@ -98,6 +100,101 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
               std::vector<std::pair<MlirAttribute, MlirType>>(),
           nb::arg("ctxt") = nullptr);
 
+  mlir_type_subclass(m, "ArrayType", rtgTypeIsAArray)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, MlirType elementType, MlirContext ctxt) {
+            return cls(rtgArrayTypeGet(elementType));
+          },
+          nb::arg("self"), nb::arg("element_type"), nb::arg("ctxt") = nullptr)
+      .def_property_readonly("element_type", [](MlirType self) {
+        return rtgArrayTypeGetElementType(self);
+      });
+
+  mlir_type_subclass(m, "TupleType", rtgTypeIsATuple)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, const std::vector<MlirType> &fieldTypes,
+             MlirContext ctxt) {
+            return cls(
+                rtgTupleTypeGet(ctxt, fieldTypes.size(), fieldTypes.data()));
+          },
+          nb::arg("self"), nb::arg("field_types") = std::vector<MlirType>(),
+          nb::arg("ctxt") = nullptr)
+      .def_property_readonly("fields", [](MlirType self) {
+        std::vector<MlirType> fields;
+        for (intptr_t i = 0; i < rtgTypeGetNumFields(self); ++i)
+          fields.push_back(rtgTupleTypeGetFieldType(self, i));
+        return fields;
+      });
+
+  // Types for ISA targets
+  //===--------------------------------------------------------------------===//
+
+  mlir_type_subclass(m, "LabelType", rtgTypeIsALabel)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, MlirContext ctxt) {
+            return cls(rtgLabelTypeGet(ctxt));
+          },
+          nb::arg("self"), nb::arg("ctxt") = nullptr);
+
+  mlir_type_subclass(m, "ImmediateType", rtgTypeIsAImmediate)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, uint32_t width, MlirContext ctx) {
+            return cls(rtgImmediateTypeGet(ctx, width));
+          },
+          nb::arg("self"), nb::arg("width"), nb::arg("ctx") = nullptr)
+      .def_property_readonly("width", [](MlirType self) {
+        return rtgImmediateTypeGetWidth(self);
+      });
+
+  mlir_type_subclass(m, "MemoryBlockType", rtgTypeIsAMemoryBlock)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, uint32_t addressWidth, MlirContext ctxt) {
+            return cls(rtgMemoryBlockTypeGet(ctxt, addressWidth));
+          },
+          nb::arg("self"), nb::arg("address_width"), nb::arg("ctxt") = nullptr)
+      .def_property_readonly("address_width", [](MlirType self) {
+        return rtgMemoryBlockTypeGetAddressWidth(self);
+      });
+
+  mlir_type_subclass(m, "MemoryType", rtgTypeIsAMemory)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, uint32_t addressWidth, MlirContext ctxt) {
+            return cls(rtgMemoryTypeGet(ctxt, addressWidth));
+          },
+          nb::arg("self"), nb::arg("address_width"), nb::arg("ctxt") = nullptr)
+      .def_property_readonly("address_width", [](MlirType self) {
+        return rtgMemoryTypeGetAddressWidth(self);
+      });
+
+  //===--------------------------------------------------------------------===//
+  // Attributes
+  //===--------------------------------------------------------------------===//
+
+  mlir_attribute_subclass(m, "DefaultContextAttr", rtgAttrIsADefaultContextAttr)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, MlirType type, MlirContext ctxt) {
+            return cls(rtgDefaultContextAttrGet(ctxt, type));
+          },
+          nb::arg("self"), nb::arg("type"), nb::arg("ctxt") = nullptr);
+
+  mlir_attribute_subclass(m, "AnyContextAttr", rtgAttrIsAAnyContextAttr)
+      .def_classmethod(
+          "get",
+          [](nb::object cls, MlirType type, MlirContext ctxt) {
+            return cls(rtgAnyContextAttrGet(ctxt, type));
+          },
+          nb::arg("self"), nb::arg("type"), nb::arg("ctxt") = nullptr);
+
+  // Attributes for ISA targets
+  //===--------------------------------------------------------------------===//
+
   nb::enum_<RTGLabelVisibility>(m, "LabelVisibility")
       .value("LOCAL", RTG_LABEL_VISIBILITY_LOCAL)
       .value("GLOBAL", RTG_LABEL_VISIBILITY_GLOBAL)
@@ -116,11 +213,18 @@ void circt::python::populateDialectRTGSubmodule(nb::module_ &m) {
         return rtgLabelVisibilityAttrGetValue(self);
       });
 
-  mlir_attribute_subclass(m, "DefaultContextAttr", rtgAttrIsADefaultContextAttr)
+  mlir_attribute_subclass(m, "ImmediateAttr", rtgAttrIsAImmediate)
       .def_classmethod(
           "get",
-          [](nb::object cls, MlirType type, MlirContext ctxt) {
-            return cls(rtgDefaultContextAttrGet(ctxt, type));
+          [](nb::object cls, uint32_t width, uint64_t value, MlirContext ctx) {
+            return cls(rtgImmediateAttrGet(ctx, width, value));
           },
-          nb::arg("self"), nb::arg("type"), nb::arg("ctxt") = nullptr);
+          nb::arg("self"), nb::arg("width"), nb::arg("value"),
+          nb::arg("ctx") = nullptr)
+      .def_property_readonly(
+          "width",
+          [](MlirAttribute self) { return rtgImmediateAttrGetWidth(self); })
+      .def_property_readonly("value", [](MlirAttribute self) {
+        return rtgImmediateAttrGetValue(self);
+      });
 }

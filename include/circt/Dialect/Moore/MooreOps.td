@@ -41,6 +41,13 @@ class TypeDomainsMatch<list<string> values> :
     cast<moore::UnpackedType>($_self.getType()).getDomain()
   }], "domain">;
 
+class TypeIsSimpleBitVectorOf<string sbvType, string packedType> :
+  TypesMatchWith<
+    sbvType # " type is simple bit vector equivalent of " # packedType,
+    sbvType, packedType, [{
+      cast<PackedType>($_self).getSimpleBitVector()
+    }]>;
+
 //===----------------------------------------------------------------------===//
 // Structure
 //===----------------------------------------------------------------------===//
@@ -94,7 +101,7 @@ def OutputOp : MooreOp<"output", [
 
   let arguments = (ins Variadic<AnyType>:$outputs);
   let builders = [
-    OpBuilder<(ins), [{ build($_builder, $_state, std::nullopt); }]>
+    OpBuilder<(ins), [{ build($_builder, $_state, mlir::ValueRange()); }]>
   ];
   let assemblyFormat = [{
     attr-dict ($outputs^ `:` type($outputs))?
@@ -474,6 +481,19 @@ def DetectEventOp : MooreOp<"detect_event", [
   }];
 }
 
+def WaitDelayOp : MooreOp<"wait_delay"> {
+  let summary = "Suspend execution for a given amount of time";
+  let description = [{
+    The `moore.wait_delay` op suspends execution of the current process for the
+    amount of time specified by its operand. Corresponds to the `#` delay
+    control in SystemVerilog.
+
+    See IEEE 1800-2017 § 9.4.1 "Delay control".
+  }];
+  let arguments = (ins TimeType:$delay);
+  let assemblyFormat = [{ $delay attr-dict }];
+}
+
 //===----------------------------------------------------------------------===//
 // Constants
 //===----------------------------------------------------------------------===//
@@ -490,6 +510,14 @@ def ConstantOp : MooreOp<"constant", [Pure, ConstantLike]> {
     OpBuilder<(ins "IntType":$type, "const APInt &":$value)>,
     OpBuilder<(ins "IntType":$type, "int64_t":$value, CArg<"bool", "true">:$isSigned)>,
   ];
+}
+
+def ConstantTimeOp : MooreOp<"constant_time", [Pure, ConstantLike]> {
+  let summary = "A constant time value in femtoseconds";
+  let arguments = (ins UI64Attr:$value);
+  let results = (outs TimeType:$result);
+  let assemblyFormat = "$value `fs` attr-dict";
+  let hasFolder = 1;
 }
 
 def StringConstantOp : MooreOp<"string_constant", [Pure]> {
@@ -525,7 +553,7 @@ def RealLiteralOp : MooreOp<"real_constant", [Pure]> {
 }
 
 //===----------------------------------------------------------------------===//
-// Casting and Resizing
+// Casting
 //===----------------------------------------------------------------------===//
 
 def ConversionOp : MooreOp<"conversion", [Pure]> {
@@ -559,6 +587,90 @@ def ConversionOp : MooreOp<"conversion", [Pure]> {
   let hasFolder = 1;
 }
 
+def PackedToSBVOp : MooreOp<"packed_to_sbv", [
+  Pure,
+  TypeIsSimpleBitVectorOf<"input", "result">,
+]> {
+  let summary = "Convert a packed type to its simple bit vector equivalent";
+  let arguments = (ins PackedTypeWithKnownSize:$input);
+  let results = (outs IntType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input)
+  }];
+}
+
+def SBVToPackedOp : MooreOp<"sbv_to_packed", [
+  Pure,
+  TypeIsSimpleBitVectorOf<"result", "input">,
+]> {
+  let summary = "Convert a simple bit vector to an equivalent packed type";
+  let arguments = (ins IntType:$input);
+  let results = (outs PackedTypeWithKnownSize:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($result)
+  }];
+}
+
+def LogicToIntOp : MooreOp<"logic_to_int", [
+  Pure,
+  TypesMatchWith<"result matches input with two-valued domain",
+    "input", "result", "cast<IntType>($_self).getTwoValued()">
+]> {
+  let summary = "Convert a four-valued to a two-valued integer";
+  let arguments = (ins FourValuedIntType:$input);
+  let results = (outs TwoValuedIntType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input)
+  }];
+  let hasFolder = 1;
+}
+
+def IntToLogicOp : MooreOp<"int_to_logic", [
+  Pure,
+  TypesMatchWith<"result matches input with four-valued domain",
+    "input", "result", "cast<IntType>($_self).getFourValued()">
+]> {
+  let summary = "Convert a two-valued to a four-valued integer";
+  let arguments = (ins TwoValuedIntType:$input);
+  let results = (outs FourValuedIntType:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input)
+  }];
+  let hasFolder = 1;
+}
+
+def ToBuiltinBoolOp : MooreOp<"to_builtin_bool", [Pure]> {
+  let summary = "Convert a `!moore.l1` or `!moore.i1` to a builtin `i1`";
+  let description = [{
+    Maps `X` and `Z` to 0, and passes through 1 and 0 unchanged.
+  }];
+  let arguments = (ins AnySingleBitType:$input);
+  let results = (outs I1:$result);
+  let assemblyFormat = [{
+    $input attr-dict `:` type($input)
+  }];
+}
+
+def TimeToLogicOp : MooreOp<"time_to_logic", [Pure]> {
+  let summary = "Convert a time type to an integer number of femtoseconds";
+  let arguments = (ins TimeType:$input);
+  let results = (outs FourValuedI64:$result);
+  let assemblyFormat = "$input attr-dict";
+  let hasFolder = 1;
+}
+
+def LogicToTimeOp : MooreOp<"logic_to_time", [Pure]> {
+  let summary = "Convert an integer number of femtoseconds to a time type";
+  let arguments = (ins FourValuedI64:$input);
+  let results = (outs TimeType:$result);
+  let assemblyFormat = "$input attr-dict";
+  let hasFolder = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// Resizing
+//===----------------------------------------------------------------------===//
+
 def TruncOp : MooreOp<"trunc", [
   Pure,
   TypeDomainsMatch<["input", "result"]>,
@@ -577,6 +689,7 @@ def TruncOp : MooreOp<"trunc", [
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($result)
   }];
+  let hasFolder = 1;
 }
 
 class ExtOpBase<string mnemonic> : MooreOp<mnemonic, [
@@ -592,6 +705,7 @@ class ExtOpBase<string mnemonic> : MooreOp<mnemonic, [
   let assemblyFormat = [{
     $input attr-dict `:` type($input) `->` type($result)
   }];
+  let hasFolder = 1;
 }
 
 def ZExtOp : ExtOpBase<"zext"> {
@@ -613,6 +727,28 @@ def SExtOp : ExtOpBase<"sext"> {
 //===----------------------------------------------------------------------===//
 // Expressions
 //===----------------------------------------------------------------------===//
+
+def UArrayCmpPredicateAttr : I64EnumAttr<
+    "UArrayCmpPredicate", "",
+    [
+      I64EnumAttrCase<"eq", 0>,
+      I64EnumAttrCase<"ne", 1>
+    ]> {
+  let cppNamespace = "circt::moore";
+}
+
+def StringCmpPredicateAttr : I64EnumAttr<
+    "StringCmpPredicate", "",
+    [
+      I64EnumAttrCase<"eq", 0>,
+      I64EnumAttrCase<"ne", 1>,
+      I64EnumAttrCase<"lt", 2>,
+      I64EnumAttrCase<"le", 3>,
+      I64EnumAttrCase<"gt", 4>,
+      I64EnumAttrCase<"ge", 5>
+    ]> {
+  let cppNamespace = "circt::moore";
+}
 
 def NegOp : MooreOp<"neg", [Pure, SameOperandsAndResultType]> {
   let summary = "Arithmetic negation";
@@ -724,7 +860,6 @@ def SubOp : BinaryOpBase<"sub"> {
 
     See IEEE 1800-2017 § 11.4.3 "Arithmetic operators".
   }];
-
   let hasFolder = 1;
 }
 
@@ -736,6 +871,7 @@ def MulOp : BinaryOpBase<"mul", [Commutative]> {
 
     See IEEE 1800-2017 § 11.4.3 "Arithmetic operators".
   }];
+  let hasFolder = 1;
 }
 
 class DivOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
@@ -748,6 +884,7 @@ class DivOpBase<string mnemonic> : BinaryOpBase<mnemonic> {
 
     See IEEE 1800-2017 § 11.4.3 "Arithmetic operators".
   }];
+  let hasFolder = 1;
 }
 
 def DivUOp : DivOpBase<"divu">;
@@ -888,6 +1025,63 @@ class ShiftOpBase<string mnemonic> : MooreOp<mnemonic, [
 def ShlOp : ShiftOpBase<"shl"> { let summary = "Logical left shift"; }
 def ShrOp : ShiftOpBase<"shr"> { let summary = "Logical right shift"; }
 def AShrOp : ShiftOpBase<"ashr"> { let summary = "Arithmetic right shift"; }
+
+def UArrayCmpOp : MooreOp<"uarray_cmp", [
+  Pure,
+  Commutative,
+  SameTypeOperands,
+]> {
+  let description = [{
+    Performs an elementwise comparison of two unpacked arrays
+    using the specified predicate (for example, "eq" for equality or "ne" for inequality)
+    and returns a single bit result.
+    Its first argument is an attribute that defines which type of comparison is
+    performed. The following comparisons are supported:
+
+    -   equal (mnemonic: `"eq"`; integer value: `0`)
+    -   not equal (mnemonic: `"ne"`; integer value: `1`)
+
+    The result is `1` if the comparison is true and `0` otherwise.
+  }];
+  let arguments = (ins 
+    UArrayCmpPredicateAttr:$predicate,
+    UnpackedArrayType:$lhs,
+    UnpackedArrayType:$rhs
+  );
+  let results = (outs BitType:$result);
+  let assemblyFormat = [{
+    $predicate $lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)
+  }];  
+}
+
+def StringCmpOp : MooreOp<"string_cmp", [
+  Pure,
+  SameTypeOperands
+]> {
+  let description = [{
+    Compares two string operands using the specified
+    predicate and returns a single bit result. Supported predicates:
+    - eq : equal
+    - ne : not equal
+    - lt : less than
+    - le : less or equal
+    - gt : greater than
+    - ge : greater or equal
+
+    The equality operator yields 1 if its operands are equal and 0 otherwise.
+    Relational operators compare two strings lexicographically,
+    returning 1 when the specified condition holds and 0 when it does not.
+  }];
+  let arguments = (ins
+    StringCmpPredicateAttr:$predicate,
+    StringType:$lhs,
+    StringType:$rhs
+  );
+  let results = (outs BitType:$result);
+  let assemblyFormat = [{
+    $predicate $lhs `,` $rhs attr-dict `:` type($lhs) `->` type($result)
+  }];
+}
 
 class LogicalEqOpBase<string mnemonic> : MooreOp<mnemonic, [
   Pure,
@@ -1513,12 +1707,59 @@ def FormatIntOp : MooreOp<"fmt.int", [Pure]> {
   }];
 }
 
+def FmtFlt:I32EnumAttrCase<"Float", 0, "float">;
+def FmtExp:I32EnumAttrCase<"Exponential", 1, "exponential">;
+def FmtGen:I32EnumAttrCase<"General", 2, "general">;
+
+def RealFormatAttr : I32EnumAttr<"RealFormat", "Real format",
+                               [FmtFlt, FmtExp, FmtGen]> {
+  let cppNamespace = "circt::moore";
+}
+
+def FormatRealOp : MooreOp<"fmt.real", [Pure]> {
+  let summary = "Format a real number value";
+  let description = [{
+  Format a real value as a string according to the specified format.
+
+  See IEEE 1800-2017 § 21.2.1.2 "Format specifications".
+  }];
+  let arguments = (ins
+  RealType:$value,
+  RealFormatAttr:$format
+  );
+  let results = (outs FormatStringType:$result);
+  let assemblyFormat = [{
+      $format $value `,`
+      attr-dict `:` type($value)
+  }];
+}
+
 //===----------------------------------------------------------------------===//
 // Builtin System Tasks and Functions
 //===----------------------------------------------------------------------===//
 
 class Builtin<string mnemonic, list<Trait> traits = []> :
     MooreOp<"builtin." # mnemonic, traits>;
+
+//===----------------------------------------------------------------------===//
+// Pseudo-Random Generators
+//===----------------------------------------------------------------------===//
+
+def UrandomBIOp : Builtin<"urandom"> {
+  let summary = "Generate a pseudo-random unsigned integer (optionally seeded)";
+  let description = [{
+    Corresponds to the `$urandom` system function. Returns a 32-bit
+    pseudo-random integer. The seed is optional; when provided, it initializes
+    the generator. If not provided, treat it as 0 in semantics/lowering.
+
+    See IEEE 1800-2023 § 18.13 "Random number system functions and methods".
+  }];
+
+  // Optional positional attribute for the seed
+  let arguments = (ins Optional<TwoValuedI32>:$seed);
+  let results = (outs TwoValuedI32:$result);
+  let assemblyFormat = "($seed^)? attr-dict";
+}
 
 //===----------------------------------------------------------------------===//
 // Simulation Control Builtins

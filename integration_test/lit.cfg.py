@@ -93,8 +93,11 @@ if config.python_executable != "":
 
 # Enable yosys if it has been detected.
 if config.yosys_path != "":
-  tool_dirs.append(os.path.dirname(config.yosys_path))
+  yosys_dir = os.path.dirname(config.yosys_path)
+  tool_dirs.append(yosys_dir)
   tools.append('yosys')
+  yosys_abc_path = os.path.join(yosys_dir, "yosys-abc")
+  config.substitutions.append(('%yosys-abc', f'"{yosys_abc_path}"'))
   config.available_features.add('yosys')
 
 # Enable Icarus Verilog as a fallback if no other ieee-sim was detected.
@@ -213,7 +216,7 @@ if config.z3_path != "":
   config.available_features.add('z3')
 
 # Enable libz3 if it has been detected.
-if config.z3_library != "":
+if config.z3_library not in ("", "Z3_LIBRARIES-NOTFOUND"):
   tools.append(ToolSubst(f"%libz3", config.z3_library))
   config.available_features.add('libz3')
 

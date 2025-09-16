@@ -11,6 +11,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "circt/Conversion/ExportAIGER.h"
+#include "circt/Conversion/ImportAIGER.h"
 #include "circt/Dialect/Arc/ModelInfoExport.h"
 #include "circt/Dialect/Calyx/CalyxEmitter.h"
 #include "circt/Dialect/ESI/ESIDialect.h"
@@ -18,8 +20,8 @@
 #include "circt/Dialect/FIRRTL/FIRParser.h"
 #include "circt/Dialect/MSFT/ExportTcl.h"
 #include "circt/Target/DebugInfo.h"
-#include "circt/Target/ExportSMTLIB.h"
 #include "circt/Target/ExportSystemC.h"
+#include "mlir/Target/SMTLIB/ExportSMTLIB.h"
 
 #ifndef CIRCT_INITALLTRANSLATIONS_H
 #define CIRCT_INITALLTRANSLATIONS_H
@@ -35,9 +37,11 @@ inline void registerAllTranslations() {
     calyx::registerToCalyxTranslation();
     firrtl::registerFromFIRFileTranslation();
     firrtl::registerToFIRFileTranslation();
-    ExportSMTLIB::registerExportSMTLIBTranslation();
+    mlir::smt::registerExportSMTLIBTranslation();
     ExportSystemC::registerExportSystemCTranslation();
     debug::registerTranslations();
+    aiger::registerImportAIGERTranslation();
+    aiger::registerExportAIGERTranslation();
     return true;
   }();
   (void)initOnce;

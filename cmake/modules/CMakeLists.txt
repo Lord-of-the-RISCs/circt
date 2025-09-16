@@ -49,11 +49,15 @@ set(CIRCT_CONFIG_TOOLS_DIR)
 set(CIRCT_CONFIG_INCLUDE_EXPORTS)
 set(CIRCT_CONFIG_INCLUDE_DIRS)
 
-# Copy AddCIRCT to the build tree.
-configure_file(
-  ${CMAKE_CURRENT_SOURCE_DIR}/AddCIRCT.cmake
-  ${circt_cmake_builddir}/AddCIRCT.cmake
-  COPYONLY
+# For compatibility with projects that add '<build>/lib/cmake/circt' to
+# their CMAKE_MODULE_PATH, place API modules next to it.
+# Copy without source permissions because the source could be read-only,
+# but we need to write into the copied folder.
+file(COPY .
+  DESTINATION ${circt_cmake_builddir}
+  NO_SOURCE_PERMISSIONS
+  FILES_MATCHING PATTERN *.cmake
+  PATTERN CMakeFiles EXCLUDE
 )
 
 # Generate CIRCTConfig.cmake for the install tree.
