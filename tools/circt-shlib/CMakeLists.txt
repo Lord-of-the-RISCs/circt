@@ -26,6 +26,11 @@ if(ortools_FOUND)
 set(ORTOOLS_LIB ortools::ortools)
 endif()
 
+set(SLANG_LIB "")
+if(CIRCT_SLANG_FRONTEND_ENABLED)
+set(SLANG_LIB slang_slang)
+endif()
+
 add_circt_library(
   CIRCT
   SHARED
@@ -37,6 +42,7 @@ add_circt_library(
   MLIR
   ${Z3_LIBRARIES}
   ${ORTOOLS_LIB}
+  ${SLANG_LIB}
 )
 target_link_libraries(CIRCT PRIVATE ${LLVM_PTHREAD_LIB})
 
